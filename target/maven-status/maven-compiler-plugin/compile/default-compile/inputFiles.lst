@@ -1,3 +1,14 @@
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ArrowSchemaMapper.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\GroupPredicateEvaluator.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ParquetToArrowReader.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\RowAppender.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\RowGroupPruner.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\flight\DeltaFlightProducer.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\flight\DeltaFlightServerApp.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\flight\query\FlightQueryRequest.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\flight\query\PredicateCodec.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\flight\ScanTicket.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\flight\TicketRegistry.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\action\AddFile.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\action\CommitInfoAction.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\action\MetadataAction.java
@@ -8,3 +19,10 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\CommitLogReader.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\Snapshot.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\SnapshotManager.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\ComparisonOp.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\FileStatsPruner.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\PartitionPruner.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\Predicate.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\PredicateEvaluation.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\QueryPlanner.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\ScanPlan.java

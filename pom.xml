@@ -15,24 +15,68 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <jackson.version>2.17.1</jackson.version>
     <junit.version>5.10.2</junit.version>
+    <parquet.version>1.13.1</parquet.version>
+    <arrow.version>16.1.0</arrow.version>
+    <hadoop.version>3.3.6</hadoop.version>
   </properties>
 
   <!--
-    Dependencies added so far are limited to what Layer 1 (log parsing) needs:
-    Jackson for the commit-log JSON lines, JUnit for tests.
-
-    Later layers will add, when we get to them:
-      - parquet-mr / hadoop-client (checkpoint + data file reads, Layer 1/3)
-      - arrow-java (vector types, Layer 3)
-      - arrow-flight-core (Layer 4)
-    Deliberately not added yet so the module only depends on what the
-    current layer actually uses.
+    Layer 1 (log) needs only Jackson. Layers 2-4 add:
+      - parquet-column / parquet-hadoop / parquet-common: footer + row-group
+        reads, and the Group-based record API used for residual filtering
+      - hadoop-client: parquet-hadoop's InputFile/Configuration plumbing
+        pulls this in transitively regardless; declaring it explicitly pins
+        the version rather than leaving it to transitive resolution.
+        (This is the standard, if heavy, cost of using parquet-mr from Java —
+        Arrow's own C++-backed Dataset API avoids it but isn't a "build it
+        yourself" path, which is the point of this project.)
+      - arrow-vector / arrow-memory-netty: the decoded columnar output
+      - arrow-flight-core: the serving layer
   -->
   <dependencies>
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
       <version>${jackson.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-column</artifactId>
+      <version>${parquet.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-hadoop</artifactId>
+      <version>${parquet.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-common</artifactId>
+      <version>${parquet.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-netty</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>flight-core</artifactId>
+      <version>${arrow.version}</version>
     </dependency>
 
     <dependency>
