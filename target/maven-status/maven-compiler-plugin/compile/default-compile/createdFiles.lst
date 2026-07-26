@@ -1,0 +1,10 @@
+com\labuk\deltaflight\log\Snapshot.class
+com\labuk\deltaflight\log\action\MetadataAction.class
+com\labuk\deltaflight\log\CommitLogReader.class
+com\labuk\deltaflight\log\action\AddFile.class
+com\labuk\deltaflight\log\action\RemoveFile.class
+com\labuk\deltaflight\log\action\ProtocolAction.class
+com\labuk\deltaflight\log\action\SingleAction.class
+com\labuk\deltaflight\log\SnapshotManager.class
+com\labuk\deltaflight\log\CommitFileNames.class
+com\labuk\deltaflight\log\action\CommitInfoAction.class
