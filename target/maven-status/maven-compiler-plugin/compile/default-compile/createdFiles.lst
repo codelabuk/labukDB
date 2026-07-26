@@ -14,6 +14,7 @@ com\labuk\deltaflight\decode\ArrowSchemaMapper.class
 com\labuk\deltaflight\planner\Predicate$Or.class
 com\labuk\deltaflight\flight\query\PredicateCodec.class
 com\labuk\deltaflight\planner\PartitionPruner.class
+com\labuk\deltaflight\tools\RealTableSmokeCheck.class
 com\labuk\deltaflight\flight\TicketRegistry.class
 com\labuk\deltaflight\planner\Predicate.class
 com\labuk\deltaflight\log\action\MetadataAction.class

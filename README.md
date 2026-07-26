@@ -17,14 +17,23 @@ Understanding the mechanics, not shipping fastest. See the module map below
 
 ## Status
 
-**Layers 1-4 (log, planner, decode, flight) — this commit.** Not
-sandbox-compiled: this environment can't reach Maven Central
-(`repo.maven.apache.org` is blocked by the network policy here) and has no
-`javac`, so nothing has been built or run here. Written carefully against
-each library's real public API, but you are the first real compiler pass —
-run `mvn test` locally before trusting any of it, and expect at least minor
-version-API mismatches in the Flight/Parquet plumbing specifically (see
-below).
+**Compiled and tested locally — real results, not sandbox output.** All 28
+source files compile clean. 29/29 tests pass across `log/`, `planner/`, and
+`flight/` (the Flight API guesses were correct — `FlightInfo`'s builder and
+`NoOpFlightProducer` compiled as written). The `decode/` integration tests
+initially failed with `MemoryUtil` / `InaccessibleObjectException` — that's
+Arrow's off-heap memory library needing `--add-opens` on Java 9+, now wired
+into Surefire's `argLine` in `pom.xml` so `mvn test` handles it
+automatically. Two things fixed along the way, worth knowing if you ever
+rebuild this from scratch:
+
+1. The Flight artifact ID is `flight-core`, not `arrow-flight-core` —
+   Arrow's Flight modules dropped the `arrow-` prefix that `arrow-vector`
+   and `arrow-memory-netty` use. Inconsistent upstream naming, not a
+   version issue.
+2. Running the built jar directly (not through Maven) needs the same
+   `--add-opens` flag on the `java` command line — Surefire's `argLine`
+   only covers `mvn test`. See `DeltaFlightServerApp` below.
 
 ### Layer 1 — `log/`
 Commit-log parsing (`CommitLogReader`, the `action/` model) and snapshot
@@ -92,14 +101,26 @@ multiple row groups).
   causes a file to be opened).
 - `DeltaFlightServerApp` — bootstrap `main()`.
 
-**Highest-risk-of-not-compiling code in this commit.** `FlightInfo`'s
-builder API and `NoOpFlightProducer`'s exact method signatures have shifted
-across Arrow versions more than the rest of this codebase; if `mvn compile`
-fails here first, that's the expected place, not a sign something else is
-wrong. `ListFlights`, `DoPut`, `DoAction`, `DoExchange` are unimplemented
-(inherited as "unimplemented" from `NoOpFlightProducer`) — genuinely out of
-scope for a read-only single-table-at-a-time engine right now, not an
-oversight.
+**Confirmed to compile as written** — `FlightInfo.builder(...)` and
+`NoOpFlightProducer` matched arrow.version 16.1.0's actual API. Not yet
+covered by its own test suite though (unlike log/planner/decode, `flight/`
+has no tests exercising `getFlightInfo`/`getStream` against a real running
+server yet) — that's the next real gap here, not a compile risk. `ListFlights`,
+`DoPut`, `DoAction`, `DoExchange` are unimplemented (inherited as
+"unimplemented" from `NoOpFlightProducer`) — genuinely out of scope for a
+read-only single-table-at-a-time engine right now, not an oversight.
+
+**Running `DeltaFlightServerApp` directly needs the same JVM flag Surefire
+now sets automatically:**
+
+```
+java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED \
+     -cp target/classes:<dependency-classpath> \
+     com.labuk.deltaflight.flight.DeltaFlightServerApp
+```
+
+(or bundle it into a shaded jar's `MANIFEST.MF`/a launch script later —
+fine to just pass it on the command line for now.)
 
 ### What's still not here
 - Checkpoint files (`.checkpoint.parquet`) — Layer 1 still replays JSON

@@ -66,13 +66,11 @@
       <artifactId>arrow-vector</artifactId>
       <version>${arrow.version}</version>
     </dependency>
-
     <dependency>
       <groupId>org.apache.arrow</groupId>
       <artifactId>arrow-memory-netty</artifactId>
       <version>${arrow.version}</version>
     </dependency>
-
     <dependency>
       <groupId>org.apache.arrow</groupId>
       <artifactId>flight-core</artifactId>
@@ -93,6 +91,18 @@
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
+        <configuration>
+          <!--
+            Arrow's memory library reaches into java.nio.Buffer reflectively
+            for off-heap access, which the JPMS module system blocks by
+            default on Java 9+. This is Arrow's own documented requirement
+            (https://arrow.apache.org/docs/java/install.html), not something
+            specific to this project — every Arrow-Java consumer needs it.
+            Wiring it into Surefire here means `mvn test` just works, rather
+            than everyone who clones this needing to remember the flag.
+          -->
+          <argLine>--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED</argLine>
+        </configuration>
       </plugin>
     </plugins>
   </build>
