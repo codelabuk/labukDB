@@ -67,17 +67,15 @@ the NEQ-never-prunes case.
   filtering into one pass: a row that fails the residual filter is never
   copied into an Arrow vector, rather than decoded and discarded.
 
-**Scope limitation, stated plainly and worth checking against your own
-data before pointing this at local-lakehouse-lab's output:** only flat
-primitive columns are supported — INT32, INT64, FLOAT, DOUBLE, BOOLEAN,
-BINARY (treated as UTF-8 string). Not yet supported: DECIMAL, nested/list
-types, and — this one is a real, not hypothetical, concern — **INT96
-timestamps**. Spark writes TIMESTAMP columns as INT96 by default; unless
-your Spark job sets `spark.sql.parquet.outputTimestampType=TIMESTAMP_MICROS`
-(INT64-encoded, which this reader does support), a column like `event_time`
-from local-lakehouse-lab's own pipeline will hit
-`ArrowSchemaMapper`'s `UnsupportedOperationException`. Worth checking your
-writer config before running this against real tables.
+**Scope limitation, now narrower after a real-table run surfaced the INT96
+gap directly (see `RealTableSmokeCheck` output below):** flat primitive
+columns only — INT32, INT64, FLOAT, DOUBLE, BOOLEAN, INT96 (Spark's default
+legacy timestamp encoding — now decoded via `Int96TimestampCodec`, epoch
+microseconds UTC; see its javadoc for the exact caveat around Spark's
+session-timezone rebasing config), and BINARY (UTF-8 string). Still not
+supported: DECIMAL, nested/list types. Timestamp predicates over the wire
+should use epoch-microsecond `long` literals for now — `PredicateCodec`
+doesn't have an ISO-string/Instant literal type yet.
 
 Covered by `ParquetToArrowReaderTest`, which writes a real Parquet file with
 parquet-mr's own writer and reads it back — the closest thing to a true

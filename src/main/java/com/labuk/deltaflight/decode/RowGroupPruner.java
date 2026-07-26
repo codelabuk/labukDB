@@ -6,6 +6,7 @@ import org.apache.parquet.column.statistics.Statistics;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 import java.util.List;
 
@@ -63,8 +64,8 @@ final class RowGroupPruner {
             if (stats == null || stats.isEmpty()) {
                 return true;
             }
-            Object min = toJavaValue(stats.genericGetMin());
-            Object max = toJavaValue(stats.genericGetMax());
+            Object min = toJavaValue(stats.genericGetMin(), column.getPrimitiveType().getPrimitiveTypeName());
+            Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType().getPrimitiveTypeName());
             return PredicateEvaluation.mightMatchRange(min, max, cmp.op, cmp.literal);
         }
         return true;
@@ -79,12 +80,19 @@ final class RowGroupPruner {
         return null;
     }
 
-    private static Object toJavaValue(Object statValue) {
-        // Parquet's Binary stat type needs an explicit UTF-8 decode to line
-        // up with the String literals a predicate would compare against;
-        // every other stat type (Integer, Long, Float, Double, Boolean) is
-        // already a plain Comparable PredicateEvaluation understands.
+    private static Object toJavaValue(Object statValue, PrimitiveTypeName typeName) {
+        // Parquet's Binary stat type needs explicit handling to line up
+        // with what a predicate would compare against: UTF-8 decode for a
+        // real string column, but the INT96 timestamp codec for a
+        // timestamp column — both arrive as the same raw Binary type from
+        // genericGetMin/Max, so the column's actual Parquet type is what
+        // tells them apart. Every other stat type (Integer, Long, Float,
+        // Double, Boolean) is already a plain Comparable PredicateEvaluation
+        // understands.
         if (statValue instanceof Binary binary) {
+            if (typeName == PrimitiveTypeName.INT96) {
+                return Int96TimestampCodec.toEpochMicros(binary);
+            }
             return binary.toStringUsingUTF8();
         }
         return statValue;

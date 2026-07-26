@@ -1,6 +1,7 @@
 package com.labuk.deltaflight.decode;
 
 import org.apache.arrow.vector.types.FloatingPointPrecision;
+import org.apache.arrow.vector.types.TimeUnit;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -18,19 +19,21 @@ import java.util.stream.Collectors;
  * a given column projection.
  *
  * <b>Scope, stated plainly:</b> flat primitive columns only — INT32, INT64,
- * FLOAT, DOUBLE, BOOLEAN, and BINARY (treated as UTF-8 string; this engine
- * doesn't yet distinguish Parquet's raw BINARY from its UTF8-annotated
- * BINARY, since every column this project's fixtures produce is text).
- * Not yet supported: DECIMAL, INT96 (legacy timestamp encoding), and any
- * nested/repeated (LIST, MAP, GROUP) structure.
+ * FLOAT, DOUBLE, BOOLEAN, INT96 (legacy timestamp — see
+ * {@link Int96TimestampCodec}), and BINARY (treated as UTF-8 string; this
+ * engine doesn't yet distinguish Parquet's raw BINARY from its
+ * UTF8-annotated BINARY, since every non-timestamp column this project's
+ * fixtures produce is text).
+ * Not yet supported: DECIMAL, and any nested/repeated (LIST, MAP, GROUP)
+ * structure.
  *
  * <b>This matters concretely for this project's own data:</b> Spark writes
- * TIMESTAMP columns as INT96 by default. Unless the writer sets
- * {@code spark.sql.parquet.outputTimestampType=TIMESTAMP_MICROS} (which
- * encodes as INT64 and IS supported here), a timestamp column like
- * {@code event_time} from local-lakehouse-lab's own Spark job will hit the
- * UnsupportedOperationException below. That's a real, not hypothetical,
- * integration point to check before running this against real data.
+ * TIMESTAMP columns as INT96 by default. That's now decoded correctly here
+ * (epoch microseconds, UTC — see {@link Int96TimestampCodec} for the exact
+ * caveat around Spark's session-timezone rebasing config). Timestamp
+ * predicates over the wire should use epoch-microsecond long literals for
+ * now, matching {@code PredicateCodec}'s current literal-type support —
+ * there's no ISO-string or Instant literal type on the wire yet.
  */
 final class ArrowSchemaMapper {
 
@@ -64,6 +67,12 @@ final class ArrowSchemaMapper {
                 return ArrowType.Bool.INSTANCE;
             case BINARY:
                 return ArrowType.Utf8.INSTANCE;
+            case INT96:
+                // See Int96TimestampCodec for the decode itself and the
+                // timezone caveat (this reads INT96 as UTC directly, no
+                // rebasing — check spark.sql.parquet.int96TimestampConversion
+                // on the writer side if values come back shifted).
+                return new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
             default:
                 throw new UnsupportedOperationException(
                         "Parquet type not supported yet: " + typeName + " (column '" + column + "'). "

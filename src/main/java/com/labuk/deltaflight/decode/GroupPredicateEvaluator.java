@@ -80,6 +80,10 @@ final class GroupPredicateEvaluator {
                 return row.getBoolean(column, 0);
             case BINARY:
                 return row.getString(column, 0);
+            case INT96:
+                // Epoch microseconds — matches PredicateCodec's current
+                // literal-type support (long), not an ISO string/Instant.
+                return Int96TimestampCodec.toEpochMicros(row.getInt96(column, 0));
             default:
                 throw new UnsupportedOperationException(
                         "Parquet type not supported yet: " + typeName + " (column '" + column + "')");

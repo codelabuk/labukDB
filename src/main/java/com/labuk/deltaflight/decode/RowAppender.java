@@ -6,8 +6,10 @@ import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
+import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.parquet.example.data.Group;
+import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 import java.nio.charset.StandardCharsets;
@@ -73,6 +75,16 @@ final class RowAppender {
                 } else {
                     byte[] bytes = row.getString(column, 0).getBytes(StandardCharsets.UTF_8);
                     v.setSafe(destIndex, bytes);
+                }
+                break;
+            }
+            case INT96: {
+                TimeStampMicroVector v = (TimeStampMicroVector) vector;
+                if (isNull) {
+                    v.setNull(destIndex);
+                } else {
+                    Binary raw = row.getInt96(column, 0);
+                    v.setSafe(destIndex, Int96TimestampCodec.toEpochMicros(raw));
                 }
                 break;
             }
