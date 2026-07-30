@@ -18,12 +18,15 @@ import java.nio.charset.StandardCharsets;
  * Appends one column's value, for one row, from a decoded Parquet
  * {@code Group} into the matching Arrow vector at a given destination
  * index. Appends rather than random-writes, since destination indices
- * advance only for rows that pass {@link GroupPredicateEvaluator} — the
+ * advance only for rows that pass {@link GroupPredicateEvaluator} - the
  * residual filter and the decode step are fused into one pass rather than
  * decoding everything and filtering after, which avoids ever materializing
  * Arrow values for rows that are going to be thrown away anyway.
+ *
+ * One of two {@link CellAppender} implementations - see that interface's
+ * javadoc for the other (partition-column) case.
  */
-final class RowAppender {
+final class RowAppender implements CellAppender {
 
     private final String column;
     private final PrimitiveTypeName typeName;
@@ -35,7 +38,8 @@ final class RowAppender {
         this.vector = vector;
     }
 
-    void append(Group row, int destIndex) {
+    @Override
+    public void append(Group row, int destIndex) {
         boolean isNull = row.getFieldRepetitionCount(column) == 0;
         switch (typeName) {
             case INT32: {

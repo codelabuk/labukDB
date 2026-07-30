@@ -12,45 +12,57 @@ import org.apache.parquet.schema.Type;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Set;
 
 /**
- * Translates a Parquet {@code MessageType} into an Arrow {@code Schema} for
- * a given column projection.
+ * Translates a requested column list into an Arrow {@code Schema}, where
+ * each column is either a physical Parquet field (typed from the file's
+ * own footer) or a Hive-style partition column (typed as UTF-8 - Delta's
+ * log stores partition values as strings regardless of the column's
+ * logical type, and this engine doesn't attempt to reparse them back into
+ * their original type; a caller wanting {@code log_date} as an actual date
+ * type rather than the literal string {@code "2026-07-17"} would need to
+ * cast it downstream).
  *
- * <b>Scope, stated plainly:</b> flat primitive columns only — INT32, INT64,
- * FLOAT, DOUBLE, BOOLEAN, INT96 (legacy timestamp — see
- * {@link Int96TimestampCodec}), and BINARY (treated as UTF-8 string; this
- * engine doesn't yet distinguish Parquet's raw BINARY from its
- * UTF8-annotated BINARY, since every non-timestamp column this project's
- * fixtures produce is text).
+ * <b>Scope, stated plainly, for physical columns:</b> flat primitives only
+ * - INT32, INT64, FLOAT, DOUBLE, BOOLEAN, INT96 (legacy timestamp - see
+ * {@link Int96TimestampCodec}), and BINARY (treated as UTF-8 string).
  * Not yet supported: DECIMAL, and any nested/repeated (LIST, MAP, GROUP)
  * structure.
- *
- * <b>This matters concretely for this project's own data:</b> Spark writes
- * TIMESTAMP columns as INT96 by default. That's now decoded correctly here
- * (epoch microseconds, UTC — see {@link Int96TimestampCodec} for the exact
- * caveat around Spark's session-timezone rebasing config). Timestamp
- * predicates over the wire should use epoch-microsecond long literals for
- * now, matching {@code PredicateCodec}'s current literal-type support —
- * there's no ISO-string or Instant literal type on the wire yet.
  */
 final class ArrowSchemaMapper {
 
     private ArrowSchemaMapper() {
     }
 
-    static Schema toArrowSchema(MessageType parquetSchema, List<String> projectedColumns) {
-        List<String> columns = (projectedColumns == null || projectedColumns.isEmpty())
-                ? parquetSchema.getFields().stream().map(Type::getName).collect(Collectors.toList())
-                : projectedColumns;
-
+    /**
+     * @param columns              every requested output column, physical or partition
+     * @param partitionColumnNames which of the table's columns are partition columns
+     *                              (not necessarily all requested - just the table's set)
+     */
+    static Schema toArrowSchema(MessageType parquetSchema, List<String> columns, Set<String> partitionColumnNames) {
         List<Field> fields = new ArrayList<>();
         for (String column : columns) {
-            PrimitiveTypeName typeName = parquetSchema.getType(column).asPrimitiveType().getPrimitiveTypeName();
-            fields.add(new Field(column, FieldType.nullable(toArrowType(typeName, column)), null));
+            if (containsField(parquetSchema, column)) {
+                PrimitiveTypeName typeName = parquetSchema.getType(column).asPrimitiveType().getPrimitiveTypeName();
+                fields.add(new Field(column, FieldType.nullable(toArrowType(typeName, column)), null));
+            } else if (partitionColumnNames.contains(column)) {
+                fields.add(new Field(column, FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
+            } else {
+                throw new IllegalArgumentException(
+                        "Column '" + column + "' is neither a physical field in this file nor a known partition column");
+            }
         }
         return new Schema(fields);
+    }
+
+    static boolean containsField(MessageType parquetSchema, String column) {
+        for (Type field : parquetSchema.getFields()) {
+            if (field.getName().equals(column)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     static ArrowType toArrowType(PrimitiveTypeName typeName, String column) {
@@ -70,7 +82,7 @@ final class ArrowSchemaMapper {
             case INT96:
                 // See Int96TimestampCodec for the decode itself and the
                 // timezone caveat (this reads INT96 as UTC directly, no
-                // rebasing — check spark.sql.parquet.int96TimestampConversion
+                // rebasing - check spark.sql.parquet.int96TimestampConversion
                 // on the writer side if values come back shifted).
                 return new ArrowType.Timestamp(TimeUnit.MICROSECOND, null);
             default:

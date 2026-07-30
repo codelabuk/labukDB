@@ -4,6 +4,7 @@ import com.labuk.deltaflight.planner.Predicate;
 
 import java.io.File;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Everything {@code DoGet} needs to decode and stream exactly one file:
@@ -15,10 +16,13 @@ final class ScanTicket {
     final File parquetFile;
     final List<String> projectedColumns;
     final Predicate residualPredicate;
+    final Map<String, String> partitionValues;
 
-    ScanTicket(File parquetFile, List<String> projectedColumns, Predicate residualPredicate) {
+    ScanTicket(File parquetFile, List<String> projectedColumns, Predicate residualPredicate,
+               Map<String, String> partitionValues) {
         this.parquetFile = parquetFile;
         this.projectedColumns = projectedColumns;
         this.residualPredicate = residualPredicate;
+        this.partitionValues = partitionValues;
     }
 }

@@ -8,6 +8,7 @@ import com.labuk.deltaflight.log.Snapshot;
 import com.labuk.deltaflight.log.SnapshotManager;
 import com.labuk.deltaflight.log.action.AddFile;
 import com.labuk.deltaflight.planner.Predicate;
+import com.labuk.deltaflight.planner.PartitionValueSubstituter;
 import com.labuk.deltaflight.planner.QueryPlanner;
 import com.labuk.deltaflight.planner.ScanPlan;
 import org.apache.arrow.flight.CallStatus;
@@ -86,22 +87,34 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             List<FlightEndpoint> endpoints = new ArrayList<>();
             for (AddFile file : plan.getFilesToScan()) {
                 File parquetFile = tableRoot.resolve(file.getPath()).toFile();
-                String ticketId = registry.register(
-                        new ScanTicket(parquetFile, plan.getProjectedColumns(), plan.getResidualPredicate()));
+                // The plan's residual predicate is the whole original
+                // predicate, still possibly referencing partition columns
+                // (e.g. "level = 'ERROR' AND amount > 2"). Each file's own
+                // partition values are known exactly, so any partition-
+                // column clause folds to a boolean constant here — this is
+                // what makes it safe to hand the result to decode, which
+                // only knows about this file's physical columns.
+                Predicate perFileResidual =
+                        PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
+                String ticketId = registry.register(new ScanTicket(
+                        parquetFile, plan.getProjectedColumns(), perFileResidual, file.getPartitionValues()));
                 endpoints.add(new FlightEndpoint(new Ticket(ticketId.getBytes(StandardCharsets.UTF_8))));
             }
 
-            // Schema is inferred from the first surviving file's own footer,
-            // rather than parsed from Delta's schemaString — that string is
-            // Spark's JSON schema encoding, a separate format this engine
-            // doesn't parse; the physical Parquet file is authoritative for
-            // what decode/ actually produces anyway. If pruning eliminates
-            // every file, there's nothing to infer a schema from — an empty
-            // Schema is returned rather than guessing.
+            // Schema is inferred from the first surviving file's own footer
+            // plus that file's partition values, rather than parsed from
+            // Delta's schemaString — that string is Spark's JSON schema
+            // encoding, a separate format this engine doesn't parse; the
+            // physical Parquet file (plus known partition columns) is
+            // authoritative for what decode/ actually produces anyway. If
+            // pruning eliminates every file, there's nothing to infer a
+            // schema from — an empty Schema is returned rather than guessing.
             Schema schema = plan.getFilesToScan().isEmpty()
                     ? new Schema(List.of())
-                    : parquetReader.readSchema(tableRoot.resolve(plan.getFilesToScan().get(0).getPath()).toFile(),
-                    plan.getProjectedColumns());
+                    : parquetReader.readSchema(
+                    tableRoot.resolve(plan.getFilesToScan().get(0).getPath()).toFile(),
+                    plan.getProjectedColumns(),
+                    plan.getFilesToScan().get(0).getPartitionValues());
 
             return FlightInfo.builder(schema, descriptor, endpoints)
                     .setRecords(-1) // unknown without opening every file; not worth the cost just to report it
@@ -120,7 +133,8 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         try {
             ScanTicket scanTicket = registry.lookup(ticketId);
             try (VectorSchemaRoot root = parquetReader.read(
-                    scanTicket.parquetFile, allocator, scanTicket.projectedColumns, scanTicket.residualPredicate)) {
+                    scanTicket.parquetFile, allocator, scanTicket.projectedColumns,
+                    scanTicket.residualPredicate, scanTicket.partitionValues)) {
                 listener.start(root);
                 listener.putNext();
                 listener.completed();

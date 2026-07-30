@@ -24,6 +24,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.File;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -139,5 +140,43 @@ class ParquetToArrowReaderTest {
 
         var schema = new ParquetToArrowReader().readSchema(file, null);
         assertEquals(2, schema.getFields().size());
+    }
+
+    @Test
+    void partitionColumn_reconstructedAsConstant_whenExplicitlyRequested(@TempDir Path tempDir) throws Exception {
+        File file = writeSampleFile(tempDir);
+        Map<String, String> partitionValues = Map.of("region", "eu");
+
+        try (VectorSchemaRoot root = new ParquetToArrowReader().read(
+                file, allocator, List.of("label", "region"), null, partitionValues)) {
+            assertEquals(20, root.getRowCount());
+            VarCharVector regionVector = (VarCharVector) root.getVector("region");
+            for (int i = 0; i < root.getRowCount(); i++) {
+                assertEquals("eu", new String(regionVector.get(i)),
+                        "partition column must be the same constant on every row");
+            }
+        }
+    }
+
+    @Test
+    void partitionColumn_includedByDefault_whenNoExplicitProjectionGiven(@TempDir Path tempDir) throws Exception {
+        File file = writeSampleFile(tempDir);
+        Map<String, String> partitionValues = Map.of("region", "eu");
+
+        // null projection means "select *" — for a Hive-partitioned table
+        // that must include the partition column, not just the file's own
+        // physical fields.
+        try (VectorSchemaRoot root = new ParquetToArrowReader().read(file, allocator, null, null, partitionValues)) {
+            assertEquals(3, root.getSchema().getFields().size(), "amount, label, and region");
+            assertNotNull(root.getVector("region"));
+        }
+    }
+
+    @Test
+    void requestingUnknownColumn_throwsRatherThanSilentlyProducingWrongData(@TempDir Path tempDir) throws Exception {
+        File file = writeSampleFile(tempDir);
+
+        assertThrows(IllegalArgumentException.class, () ->
+                new ParquetToArrowReader().read(file, allocator, List.of("does_not_exist"), null, Map.of()));
     }
 }

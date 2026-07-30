@@ -1,4 +1,7 @@
 com\labuk\deltaflight\decode\ParquetToArrowReaderTest.class
+com\labuk\deltaflight\decode\Int96TimestampCodecTest.class
+com\labuk\deltaflight\planner\PartitionValueSubstituterTest.class
 com\labuk\deltaflight\log\CommitLogReaderTest.class
 com\labuk\deltaflight\planner\PrunerTest.class
+com\labuk\deltaflight\flight\FlightIntegrationTest.class
 com\labuk\deltaflight\log\SnapshotManagerTest.class

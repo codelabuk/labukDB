@@ -4,6 +4,10 @@ import com.labuk.deltaflight.decode.ParquetToArrowReader;
 import com.labuk.deltaflight.log.Snapshot;
 import com.labuk.deltaflight.log.SnapshotManager;
 import com.labuk.deltaflight.log.action.AddFile;
+import com.labuk.deltaflight.planner.ComparisonOp;
+import com.labuk.deltaflight.planner.Predicate;
+import com.labuk.deltaflight.planner.QueryPlanner;
+import com.labuk.deltaflight.planner.ScanPlan;
 import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.io.File;
@@ -28,6 +32,21 @@ import java.util.Collection;
  * message tells you exactly which layer and which assumption broke —
  * that's the point of running this before the Flight server, which would
  * otherwise bury the same failure inside a getFlightInfo gRPC error.
+ *
+ * <h2>Testing pruning and projection concretely against your real table</h2>
+ * This tool now also runs two example queries through {@link QueryPlanner}
+ * directly — no Flight server needed — so you can SEE the file counts
+ * change rather than take "pruning works" on faith:
+ * <ul>
+ *   <li><b>Example A — partition-only filter:</b> {@code level = "ERROR"}.
+ *       Watch "files after Layer 2 pruning" drop below the total active
+ *       file count — every {@code level=INFO}/{@code level=WARN} folder's
+ *       files get skipped without ever being opened, regardless of which
+ *       {@code log_date} they're under.</li>
+ *   <li><b>Example B — full scan (no predicate):</b> for comparison, shows
+ *       every active file surviving, confirming Example A's reduction is
+ *       real pruning and not just an empty table.</li>
+ * </ul>
  */
 public final class RealTableSmokeCheck {
 
@@ -50,22 +69,33 @@ public final class RealTableSmokeCheck {
 
         Collection<AddFile> files = snapshot.getActiveFiles();
         if (files.isEmpty()) {
-            System.out.println("No active files — nothing to schema-check.");
+            System.out.println("No active files — nothing further to check.");
             return;
         }
 
         AddFile firstFile = files.iterator().next();
         System.out.println("Sampling schema from: " + firstFile.getPath());
-        System.out.println("Sample file's partition values: " + firstFile.getPartitionValues());
-
         File parquetFile = tableRoot.resolve(firstFile.getPath()).toFile();
         Schema schema = new ParquetToArrowReader().readSchema(parquetFile, null);
-
         System.out.println("Inferred Arrow schema:");
         schema.getFields().forEach(f -> System.out.println("  " + f.getName() + " : " + f.getType()));
 
         System.out.println();
-        System.out.println("If you got here without an exception, Layer 1 and the "
-                + "schema-inference path in Layer 3 both handle this table's real shape.");
+        System.out.println("--- Example A: partition-only pruning, level = \"ERROR\" ---");
+        QueryPlanner planner = new QueryPlanner();
+        Predicate levelFilter = Predicate.compare("level", ComparisonOp.EQ, "ERROR");
+        ScanPlan planA = planner.plan(snapshot, levelFilter, null);
+        System.out.println("Total active files: " + planA.getTotalFilesInSnapshot());
+        System.out.println("Files after Layer 2 pruning: " + planA.getFilesToScan().size());
+        System.out.println("Files skipped (never opened): " + planA.getFilesSkipped());
+
+        System.out.println();
+        System.out.println("--- Example B: no predicate, for comparison ---");
+        ScanPlan planB = planner.plan(snapshot, null, null);
+        System.out.println("Files after Layer 2 pruning (should equal total): " + planB.getFilesToScan().size());
+
+        System.out.println();
+        System.out.println("If Example A's file count is smaller than Example B's, partition "
+                + "pruning is genuinely reducing what gets opened on your real table, not just in fixtures.");
     }
 }

@@ -100,13 +100,45 @@ multiple row groups).
 - `DeltaFlightServerApp` — bootstrap `main()`.
 
 **Confirmed to compile as written** — `FlightInfo.builder(...)` and
-`NoOpFlightProducer` matched arrow.version 16.1.0's actual API. Not yet
-covered by its own test suite though (unlike log/planner/decode, `flight/`
-has no tests exercising `getFlightInfo`/`getStream` against a real running
-server yet) — that's the next real gap here, not a compile risk. `ListFlights`,
+`NoOpFlightProducer` matched arrow.version 16.1.0's actual API.
+**Now covered by `FlightIntegrationTest`**, which starts a real
+`FlightServer` in-process (same producer `DeltaFlightServerApp` uses, an
+ephemeral local port) against a fixture table with real Parquet files —
+not just log fixtures, since `DoGet` genuinely opens files — and drives it
+with a real `FlightClient`. It exercises partition pruning (asserts exactly
+one surviving `FlightEndpoint`) and residual row filtering together in one
+round trip, so a pass means Layer 2 and Layer 3 are correctly wired through
+`GetFlightInfo`/`DoGet`, not just individually unit-tested. `ListFlights`,
 `DoPut`, `DoAction`, `DoExchange` are unimplemented (inherited as
 "unimplemented" from `NoOpFlightProducer`) — genuinely out of scope for a
 read-only single-table-at-a-time engine right now, not an oversight.
+
+**Partition-column reconstruction — the gap `FlightIntegrationTest`
+surfaced — is now fixed, not just named:**
+- `planner/PartitionValueSubstituter` folds any partition-column comparison
+  in a predicate down to a boolean constant using one specific file's known
+  exact partition values, then simplifies the expression with standard
+  boolean algebra. This fixes a real correctness bug alongside the
+  feature: without it, `level = 'ERROR' AND amount > 2` would have thrown
+  at decode time on the first row of every surviving file, since
+  `level` doesn't exist in the physical Parquet schema at all.
+- `decode/CellAppender` (shared interface), `decode/PartitionValueAppender`
+  (writes a constant per file), and `RowAppender` now implementing the same
+  interface — `ParquetToArrowReader` builds one flat list of column
+  fillers per query, physical and partition columns mixed, in requested
+  output order.
+- `ArrowSchemaMapper` now types a requested column as either a physical
+  Parquet field or a UTF-8 partition column; requesting a column that's
+  neither throws `IllegalArgumentException` rather than silently returning
+  wrong data.
+- Default projection (no explicit columns requested) now means "every
+  physical column, plus every partition column" — matching what "select
+  all" means against a real Hive-partitioned table.
+- Tested at both layers: `ParquetToArrowReaderTest` directly (partition
+  reconstruction in isolation, plus the unknown-column failure mode), and
+  `FlightIntegrationTest` end-to-end (partition pruning + predicate
+  substitution + reconstruction, all together, through a real client/server
+  round trip).
 
 **Running `DeltaFlightServerApp` directly needs the same JVM flag Surefire
 now sets automatically:**
@@ -140,13 +172,14 @@ See the four-layer breakdown in the project architecture discussion —
 
 ## Next
 
-1. `mvn test` locally — fix whatever the compiler finds, starting with
-   `flight/` if it fails there first (expected, see above).
-2. Point `DeltaFlightServerApp` at a real table `local-lakehouse-lab`'s
-   Spark job produced. Check the INT96 timestamp question first — it's the
-   most likely first real-data failure.
-3. `cache/` once 1-4 are proven against real data: snapshot cache (already
-   half-built into `SnapshotManager`), Parquet footer cache, optionally a
+1. Run `mvn test` locally — the fixture-table integration test, the new
+   partition-reconstruction tests, and the updated real-table smoke check
+   examples all need a real compiler pass, same caveat as always.
+2. Filter language expansion (`IN`, `LIKE`/contains, a proper
+   timestamp/Instant literal type on the wire) — the pruning levels are all
+   there; what's narrow is the comparison vocabulary.
+3. `cache/` once the above are proven: snapshot cache (already half-built
+   into `SnapshotManager`), Parquet footer cache, optionally a
    decoded-batch LRU for hot files. Safe to cache indefinitely per file
    because Delta files are immutable once written — no invalidation logic
    needed, unlike caching rows in a mutable table.
