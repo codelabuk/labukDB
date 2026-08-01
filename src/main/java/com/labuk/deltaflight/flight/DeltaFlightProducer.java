@@ -1,6 +1,7 @@
 package com.labuk.deltaflight.flight;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.labuk.deltaflight.catalog.TableCatalog;
 import com.labuk.deltaflight.decode.ParquetToArrowReader;
 import com.labuk.deltaflight.flight.query.FlightQueryRequest;
 import com.labuk.deltaflight.flight.query.PredicateCodec;
@@ -13,9 +14,11 @@ import com.labuk.deltaflight.planner.PartitionValueSubstituter;
 import com.labuk.deltaflight.planner.QueryPlanner;
 import com.labuk.deltaflight.planner.ScanPlan;
 import org.apache.arrow.flight.CallStatus;
+import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightProducer.StreamListener;
 import org.apache.arrow.flight.NoOpFlightProducer;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
@@ -47,11 +50,12 @@ import java.util.List;
  * calls {@code DoGet} for an endpoint never causes that file to be opened.
  *
  * Extends {@code NoOpFlightProducer} rather than implementing every
- * {@code FlightProducer} method by hand: {@code ListFlights}, {@code DoPut},
- * {@code DoAction}, {@code DoExchange} are all genuinely out of scope for a
- * read-only single-table-at-a-time engine right now, and NoOpFlightProducer
- * gives them a correct "unimplemented" response instead of this class
- * guessing at signatures it doesn't need.
+ * {@code FlightProducer} method by hand — {@code DoPut}, {@code DoAction},
+ * {@code DoExchange} are genuinely out of scope for a read-only engine
+ * right now, and {@code NoOpFlightProducer} gives them a correct
+ * "unimplemented" response instead of this class guessing at signatures it
+ * doesn't need. {@code ListFlights} IS implemented (see below) — it's the
+ * one of the four that had a real, immediate use: listing catalog entries.
  */
 public class DeltaFlightProducer extends NoOpFlightProducer {
 
@@ -62,16 +66,40 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final ParquetToArrowReader parquetReader = new ParquetToArrowReader();
     private final QueryPlanner queryPlanner = new QueryPlanner();
     private final TableCache tableCache = new TableCache();
+    private final TableCatalog catalog;
 
     public DeltaFlightProducer(BufferAllocator allocator) {
+        this(allocator, TableCatalog.atDefaultLocation());
+    }
+
+    /** Explicit-catalog constructor — mainly for tests that need an isolated catalog file. */
+    public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog) {
         this.allocator = allocator;
+        this.catalog = catalog;
+    }
+
+    /**
+     * Resolves {@code table} (a catalog name) first if present, otherwise
+     * falls back to the raw {@code tableRoot} path — the original form,
+     * still fully supported, not deprecated by this.
+     */
+    private Path resolveTableRoot(FlightQueryRequest query) {
+        if (query.getTable() != null) {
+            return catalog.resolve(query.getTable())
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "No table registered in the catalog under the name '" + query.getTable() + "'"));
+        }
+        if (query.getTableRoot() != null) {
+            return Paths.get(query.getTableRoot());
+        }
+        throw new IllegalArgumentException("Query must set either 'table' (a catalog name) or 'tableRoot' (a raw path)");
     }
 
     @Override
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
         try {
             FlightQueryRequest query = MAPPER.readValue(descriptor.getCommand(), FlightQueryRequest.class);
-            Path tableRoot = Paths.get(query.getTableRoot());
+            Path tableRoot = resolveTableRoot(query);
             SnapshotManager snapshotManager = tableCache.forTable(tableRoot);
 
             Snapshot snapshot;
@@ -174,6 +202,39 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                     .toRuntimeException());
         } finally {
             registry.invalidate(ticketId);
+        }
+    }
+
+    /**
+     * Lists every table registered in the catalog. Deliberately lightweight
+     * compared to {@code GetFlightInfo} — no snapshot resolution, no
+     * pruning, no per-file endpoints. This answers "what tables exist,"
+     * not "here's a plan to scan one." A client still calls
+     * {@code GetFlightInfo} with a {@code table} name afterward to actually
+     * query one.
+     *
+     * {@code criteria} (Flight's filter-by-bytes mechanism for narrowing a
+     * listing) isn't used here — genuinely not needed at catalog sizes this
+     * is meant for; revisit if that stops being true.
+     */
+    @Override
+    public void listFlights(CallContext context, Criteria criteria, StreamListener<FlightInfo> listener) {
+        try {
+            catalog.listAll().forEach((name, tableRoot) -> {
+                FlightDescriptor descriptor = FlightDescriptor.path(name);
+                FlightInfo info = FlightInfo.builder(new Schema(List.of()), descriptor, List.of())
+                        .setRecords(-1)
+                        .setBytes(-1)
+                        .build();
+                listener.onNext(info);
+            });
+            listener.onCompleted();
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+            listener.onError(CallStatus.INTERNAL
+                    .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
+                    .withCause(e)
+                    .toRuntimeException());
         }
     }
 }

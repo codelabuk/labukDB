@@ -1,6 +1,7 @@
 package com.labuk.deltaflight.flight;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.labuk.deltaflight.catalog.TableCatalog;
 import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
@@ -62,11 +63,16 @@ class FlightIntegrationTest {
     private BufferAllocator allocator;
     private FlightServer server;
     private FlightClient client;
+    private TableCatalog catalog;
+
+    @TempDir
+    Path catalogDir;
 
     @BeforeEach
     void setUp() throws Exception {
         allocator = new RootAllocator(Long.MAX_VALUE);
-        DeltaFlightProducer producer = new DeltaFlightProducer(allocator);
+        catalog = new TableCatalog(catalogDir.resolve("catalog.json"));
+        DeltaFlightProducer producer = new DeltaFlightProducer(allocator, catalog);
 
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
         server = FlightServer.builder(allocator, serverLocation, producer).build();
@@ -189,5 +195,46 @@ class FlightIntegrationTest {
         assertTrue(levels.stream().allMatch("ERROR"::equals),
                 "the partition column must be reconstructed as a constant on every row, "
                         + "even though it doesn't exist in the physical Parquet file");
+    }
+
+    @Test
+    void queryingByCatalogName_resolvesToTheRegisteredPath(@TempDir Path tableRoot) throws Exception {
+        writePartitionFile(tableRoot.resolve("level=ERROR"), "ERROR", 1, 3);
+        writePartitionFile(tableRoot.resolve("level=INFO"), "INFO", 100, 1);
+        writeCommitLog(tableRoot); // references both partitions, so both files must exist first
+
+        catalog.register("logs", tableRoot);
+
+        String queryJson = "{\"table\":\"logs\",\"predicate\":"
+                + "{\"type\":\"cmp\",\"column\":\"level\",\"op\":\"EQ\",\"literal\":\"ERROR\",\"literalType\":\"string\"}}";
+
+        FlightDescriptor descriptor = FlightDescriptor.command(queryJson.getBytes(StandardCharsets.UTF_8));
+        FlightInfo info = client.getInfo(descriptor);
+
+        assertEquals(1, info.getEndpoints().size(),
+                "a query by catalog name should resolve to the registered path and prune identically to a raw-path query");
+
+        int totalRows = 0;
+        for (FlightEndpoint endpoint : info.getEndpoints()) {
+            try (FlightStream stream = client.getStream(endpoint.getTicket())) {
+                while (stream.next()) {
+                    totalRows += stream.getRoot().getRowCount();
+                }
+            }
+        }
+        assertEquals(3, totalRows);
+    }
+
+    @Test
+    void listFlights_returnsRegisteredCatalogEntries() throws Exception {
+        catalog.register("alpha", Path.of("some-table-a"));
+        catalog.register("beta", Path.of("some-table-b"));
+
+        Iterable<FlightInfo> listing = client.listFlights(org.apache.arrow.flight.Criteria.ALL);
+        List<String> names = new ArrayList<>();
+        listing.forEach(info -> names.add(info.getDescriptor().getPath().get(0)));
+
+        assertEquals(2, names.size());
+        assertTrue(names.containsAll(List.of("alpha", "beta")));
     }
 }

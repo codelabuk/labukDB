@@ -7,7 +7,7 @@ import java.util.List;
 
 final class CliArgs {
 
-    String tableRoot;
+    String table;
     List<String> columns;
     Predicate predicate;
     Long version;
@@ -21,7 +21,7 @@ final class CliArgs {
         for (int i = 0; i < args.length; i++) {
             switch (args[i]) {
                 case "--table":
-                    result.tableRoot = args[++i];
+                    result.table = args[++i];
                     break;
                 case "--columns":
                     result.columns = List.of(args[++i].split(","));
@@ -44,8 +44,8 @@ final class CliArgs {
             }
         }
 
-        if (result.tableRoot == null) {
-            System.err.println("--table is required");
+        if (result.table == null) {
+            System.err.println("--table is required (a catalog name or a raw path)");
             return null;
         }
         if (result.version != null && result.asOf != null) {
@@ -59,7 +59,10 @@ final class CliArgs {
 
     static void printUsage() {
         System.err.println("""
-                Usage: DeltaCli --table <path> [options]
+                Usage: DeltaCli query --table <name-or-path> [options]
+
+                --table can be either a name registered via 'DeltaCli catalog add',
+                or a raw filesystem path.
 
                 Options:
                   --columns col1,col2      project only these columns (default: all)

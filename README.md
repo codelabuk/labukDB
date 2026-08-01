@@ -214,29 +214,65 @@ See the four-layer breakdown in the project architecture discussion —
 `log/` → `planner/` → `decode/` → `flight/`, with caching added once
 1–4 were correct and measured, not before.
 
-## CLI and Python client demo — new
+## Catalog, CLI subcommands, and Python client demo — new
 
-- `cli/DeltaCli.java` — queries a table directly (log → planner → decode,
-  no Flight server needed): `--table`, `--columns`, `--filter` (a small
-  AND-only syntax — see `SimpleFilterParser`'s javadoc for the exact
-  grammar), `--version`/`--as-of` for time travel, `--limit`. Prints
-  files-skipped alongside results, so pruning is visible, not just implied.
+- `catalog/TableCatalog.java` — a name → table-root registry, persisted to
+  `~/.delta-flight-engine/catalog.json`. Not Unity Catalog, doesn't try to
+  be — just enough that a client (especially an AI agent/MCP tool) can say
+  `"logs"` instead of needing to know an exact filesystem path. Tested via
+  `TableCatalogTest` (register/resolve/list/remove, and persistence across
+  separate instances pointed at the same file).
+- `FlightQueryRequest` gained an optional `table` field (catalog name) —
+  `tableRoot` (raw path) still works exactly as before; `table` is tried
+  first if both are present. `DeltaFlightProducer.listFlights` is now a
+  real implementation (previously inherited a no-op) — lists catalog
+  entries, not a full per-table scan plan.
+- `cli/` restructured into subcommands, kubectl-style, instead of one flat
+  flag set:
+  - `delta-cli catalog add <name> <path>` / `list` / `remove <name>`
+  - `delta-cli describe <name-or-path>` — schema, partition columns, file
+    count, no row data touched
+  - `delta-cli query --table <name-or-path> [--filter ...] [--columns ...]`
+    — same engine as before, now catalog-aware via `TableResolver` (tries
+    the catalog first, falls back to a literal path — nothing about
+    pre-catalog raw-path usage breaks)
 - `python/query_demo.py` — a real `pyarrow.flight` client against a running
-  `DeltaFlightServerApp`. Nothing about the server changes to support
-  this — proof, not just a claim, that any Flight-capable client in any
-  language works unmodified. `pip install pyarrow`, then point it at a
-  running server + table root.
+  `DeltaFlightServerApp`. Proof, not just a claim, that any Flight-capable
+  client in any language works unmodified. Now gives a clear error instead
+  of a raw traceback for the single-quotes-vs-JSON mistake (JSON needs
+  double quotes; wrap the whole shell argument in single quotes instead).
+- `DeltaFlightProducer`'s exception handling widened to a catch-all in both
+  `GetFlightInfo` and `DoGet`, with the real exception logged server-side
+  (`e.printStackTrace()`) — found via a real failure: an exception type
+  neither of the original two narrower catches covered (`UncheckedIOException`
+  from a bad table path) was reaching Flight's generic default handler,
+  producing a useless client-side message with nothing printed server-side
+  at all.
 
-**Not yet tested locally, same caveat as always** — this environment can't
-run either the Java CLI or the Python script; both need a real pass on your
-machine before trusting them.
+**Confirmed working against your real table via Python, over the network** —
+unfiltered (3,999 rows, 8 files, correct partition reconstruction, correct
+INT96 timestamp decode) and filtered (`level="ERROR"` → 1,444 rows across 4
+files; `level="WARN"` → 2,555 rows across 4 files; case-sensitive by design,
+confirmed by `level="warn"` correctly returning zero). The catalog/CLI
+subcommand changes in this section are NOT yet tested locally — same
+caveat as always for anything just written.
 
 ## Next
 
-1. Run `mvn test`, then try `DeltaCli` and `python/query_demo.py` (the
-   latter needs a running `DeltaFlightServerApp` first) against your real
-   table.
-2. Scoped catalog (name → table-root resolution, real `ListFlights`).
-3. Checkpoint support in `SnapshotManager`.
-4. *(stretch)* row-data caching — today only schema/snapshot metadata is
+1. Run `mvn test`, then try the new CLI subcommands and catalog-name
+   queries (Java and Python) against your real table.
+2. RAG demo — a script that takes a plain-English question, calls a local
+   Ollama model to produce the `FlightQueryRequest` JSON, runs it. Smaller
+   than it sounds: `python/query_demo.py` already IS the manual version of
+   this; the LLM just needs to learn to produce the same JSON.
+3. Checkpoint support in `SnapshotManager` — deferred, but with a real
+   ticking clock once this table crosses the default checkpoint interval.
+4. Nested/list-type support in `decode/` — needed for vector embeddings,
+   scheduled alongside checkpoint support, not technically coupled to it.
+5. Storage abstraction (MinIO/S3/ADLS, not just local filesystem) — see
+   the architecture discussion; a real gap, not yet started, and worth
+   scoping deliberately rather than bolting on.
+6. *(stretch)* row-data caching — today only schema/snapshot metadata is
    cached, not actual scanned rows.
+7. *(v2)* streaming subscriptions (`DoExchange`), distributed/gateway
+   deployment, load balancing — infra-shaped work, correctly out of v1.

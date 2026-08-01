@@ -11,16 +11,19 @@ import java.util.List;
  *
  * <pre>{@code
  * {
- *   "tableRoot": "/home/user/lakehouse/logs",
- *   "version": null,
- *   "timestampMillis": null,
- *   "columns": ["level", "message", "event_time"],
+ *   "table": "logs",
+ *   "columns": ["level", "message", "event_ts"],
  *   "predicate": {
  *     "type": "cmp", "column": "level", "op": "EQ",
  *     "literal": "ERROR", "literalType": "string"
  *   }
  * }
  * }</pre>
+ *
+ * Exactly one of {@code table} (a name registered in {@code TableCatalog})
+ * or {@code tableRoot} (a raw filesystem path — the original, still
+ * supported form) must be given; {@code table} is resolved first if both
+ * are present.
  *
  * {@code version}/{@code timestampMillis} are mutually exclusive; if both
  * are null, the query resolves against the latest snapshot. {@code columns}
@@ -30,11 +33,20 @@ import java.util.List;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class FlightQueryRequest {
 
+    private String table;
     private String tableRoot;
     private Long version;
     private Long timestampMillis;
     private List<String> columns;
     private JsonNode predicate;
+
+    public String getTable() {
+        return table;
+    }
+
+    public void setTable(String table) {
+        this.table = table;
+    }
 
     public String getTableRoot() {
         return tableRoot;

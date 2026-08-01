@@ -1,6 +1,11 @@
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\catalog\TableCatalog.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\CatalogCommand.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\CliArgs.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\DeltaCli.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\DescribeCommand.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\QueryCommand.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\SimpleFilterParser.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\cli\TableResolver.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ArrowSchemaMapper.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\CellAppender.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\GroupPredicateEvaluator.java
