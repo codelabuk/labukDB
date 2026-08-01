@@ -33,7 +33,16 @@ def main():
 
     query = {"tableRoot": table_root}
     if len(sys.argv) > 3:
-        query["predicate"] = json.loads(sys.argv[3])
+        try:
+            query["predicate"] = json.loads(sys.argv[3])
+        except json.JSONDecodeError as e:
+            print(f"Could not parse the predicate argument as JSON: {e}")
+            print()
+            print("JSON requires double quotes, not single quotes. In bash/Git Bash, "
+                  "wrap the WHOLE argument in single quotes (untouched literally) and "
+                  "use double quotes inside it for the JSON itself, e.g.:")
+            print("""  '{"type":"cmp","column":"level","op":"EQ","literal":"ERROR","literalType":"string"}'""")
+            sys.exit(1)
 
     client = flight.FlightClient(location)
     descriptor = flight.FlightDescriptor.for_command(json.dumps(query).encode("utf-8"))
