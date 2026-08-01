@@ -58,6 +58,8 @@ import java.util.stream.Collectors;
  */
 public final class ParquetToArrowReader {
 
+    private final ParquetFooterCache footerCache = new ParquetFooterCache();
+
     /** Schema-only read (no partition columns, no row data) — see the 5-arg overload for the full case. */
     public Schema readSchema(File parquetFile, List<String> projectedColumns) throws IOException {
         return readSchema(parquetFile, projectedColumns, Map.of());
@@ -65,13 +67,9 @@ public final class ParquetToArrowReader {
 
     public Schema readSchema(File parquetFile, List<String> projectedColumns,
                               Map<String, String> partitionValues) throws IOException {
-        org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(parquetFile.getAbsolutePath());
-        HadoopInputFile inputFile = HadoopInputFile.fromPath(hadoopPath, new Configuration());
-        try (ParquetFileReader fileReader = ParquetFileReader.open(inputFile)) {
-            MessageType fullSchema = fileReader.getFooter().getFileMetaData().getSchema();
-            List<String> columns = resolveColumns(projectedColumns, fullSchema, partitionValues.keySet());
-            return ArrowSchemaMapper.toArrowSchema(fullSchema, columns, partitionValues.keySet());
-        }
+        MessageType fullSchema = footerCache.schemaOf(parquetFile);
+        List<String> columns = resolveColumns(projectedColumns, fullSchema, partitionValues.keySet());
+        return ArrowSchemaMapper.toArrowSchema(fullSchema, columns, partitionValues.keySet());
     }
 
     /** No-partition-columns convenience overload — see the 5-arg version for the Hive-partitioned case. */

@@ -6,6 +6,7 @@ import com.labuk.deltaflight.flight.query.FlightQueryRequest;
 import com.labuk.deltaflight.flight.query.PredicateCodec;
 import com.labuk.deltaflight.log.Snapshot;
 import com.labuk.deltaflight.log.SnapshotManager;
+import com.labuk.deltaflight.log.TableCache;
 import com.labuk.deltaflight.log.action.AddFile;
 import com.labuk.deltaflight.planner.Predicate;
 import com.labuk.deltaflight.planner.PartitionValueSubstituter;
@@ -60,6 +61,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final TicketRegistry registry = new TicketRegistry();
     private final ParquetToArrowReader parquetReader = new ParquetToArrowReader();
     private final QueryPlanner queryPlanner = new QueryPlanner();
+    private final TableCache tableCache = new TableCache();
 
     public DeltaFlightProducer(BufferAllocator allocator) {
         this.allocator = allocator;
@@ -70,7 +72,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         try {
             FlightQueryRequest query = MAPPER.readValue(descriptor.getCommand(), FlightQueryRequest.class);
             Path tableRoot = Paths.get(query.getTableRoot());
-            SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
+            SnapshotManager snapshotManager = tableCache.forTable(tableRoot);
 
             Snapshot snapshot;
             if (query.getVersion() != null) {

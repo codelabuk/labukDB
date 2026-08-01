@@ -2,6 +2,7 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\CellAppender.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\GroupPredicateEvaluator.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\Int96TimestampCodec.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ParquetFooterCache.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ParquetToArrowReader.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\PartitionValueAppender.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\RowAppender.java
@@ -22,6 +23,7 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\CommitLogReader.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\Snapshot.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\SnapshotManager.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\TableCache.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\ComparisonOp.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\FileStatsPruner.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\PartitionPruner.java

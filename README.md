@@ -155,31 +155,57 @@ fine to just pass it on the command line for now.)
 ### What's still not here
 - Checkpoint files (`.checkpoint.parquet`) — Layer 1 still replays JSON
   commits from version 0 on a cache miss.
-- `cache/` — intentionally last. Layers 1-4 need to be correct and measured
-  against real data first; caching is a multiplier on a scan that's already
-  cheap, not a fix for pruning that doesn't work yet.
 - Real integration testing against local-lakehouse-lab's actual Spark
   output — everything above is tested against either hand-built fixtures or
   a file this project wrote itself. The real test is pointing
   `DeltaFlightServerApp` at a table `local-lakehouse-lab`'s Spark job
   produced and seeing what breaks.
 
+### Caching — no longer entirely deferred
+Two of the three originally-planned caches now exist, both **unverified —
+not yet run through `mvn test`, same status as everything else in this
+section**:
+
+- `log/TableCache.java` — reuses one `SnapshotManager` per table root
+  across requests. This fixes a real inefficiency, not a hypothetical one:
+  `DeltaFlightProducer` previously built a *fresh* `SnapshotManager` on
+  every `GetFlightInfo` call, which meant `SnapshotManager`'s own
+  incremental cache never actually got used across requests — every query
+  replayed the commit log from version 0, regardless of how recently the
+  same table had just been queried. `TableCacheTest` covers same-instance
+  reuse, path normalization, and eviction.
+- `decode/ParquetFooterCache.java` — caches a file's Parquet schema by
+  path, since `GetFlightInfo`'s schema inference re-opens a file on every
+  query otherwise, even identical repeated ones. Scoped deliberately to
+  schema-only access — the full row-data read path still opens and parses
+  the footer itself when actually scanning, since avoiding that too would
+  need a `ParquetFileReader` constructor accepting a pre-read footer, whose
+  exact availability in this project's pinned parquet-mr version hasn't
+  been verified. Named as a follow-up, not guessed at. `ParquetFooterCacheTest`
+  covers cache-hit behavior directly (asserts `size()` stays at 1 across
+  repeated lookups of the same file, not just that the returned schema is
+  correct).
+- Not done: a decoded-batch LRU for hot files (still genuinely optional,
+  lower priority than the two above).
+
 ## Module map
 
 See the four-layer breakdown in the project architecture discussion —
-`log/` → `planner/` → `decode/` → `flight/`, with `cache/` added once
-1–4 are correct and measured, not before.
+`log/` → `planner/` → `decode/` → `flight/`, with caching added once
+1–4 were correct and measured, not before.
 
 ## Next
 
-1. Run `mvn test` locally — the fixture-table integration test, the new
-   partition-reconstruction tests, and the updated real-table smoke check
-   examples all need a real compiler pass, same caveat as always.
+1. **Run `mvn test` locally.** This environment cannot run Maven — no
+   access to Maven Central — so nothing in this repository has been
+   compiled or executed here, ever. Every real result so far (the 29
+   passing tests, the INT96 error, the real-table run) came from running
+   this locally and pasting the output back. That's not a one-time step;
+   it's the only source of truth this project has. A useful batch to test
+   now: partition-column reconstruction, the predicate-substitution fix,
+   and both new caches — four changes since the last confirmed-green run.
 2. Filter language expansion (`IN`, `LIKE`/contains, a proper
    timestamp/Instant literal type on the wire) — the pruning levels are all
    there; what's narrow is the comparison vocabulary.
-3. `cache/` once the above are proven: snapshot cache (already half-built
-   into `SnapshotManager`), Parquet footer cache, optionally a
-   decoded-batch LRU for hot files. Safe to cache indefinitely per file
-   because Delta files are immutable once written — no invalidation logic
-   needed, unlike caching rows in a mutable table.
+3. CLI, then a scoped catalog (name → table-root resolution, `ListFlights`).
+4. Checkpoint support in `SnapshotManager`.

@@ -1,7 +1,9 @@
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\decode\Int96TimestampCodecTest.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\decode\ParquetFooterCacheTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\decode\ParquetToArrowReaderTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\flight\FlightIntegrationTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\CommitLogReaderTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\SnapshotManagerTest.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\TableCacheTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\planner\PartitionValueSubstituterTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\planner\PrunerTest.java
