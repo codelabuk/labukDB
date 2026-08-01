@@ -11,14 +11,16 @@ import java.util.List;
  * Wire format for a {@link Predicate}, matched to the JSON shape documented
  * in {@link FlightQueryRequest}.
  *
- * <b>Scope:</b> literal types supported over the wire are {@code string},
- * {@code long}, and {@code double} — matching what a JSON request can carry
- * unambiguously. Predicate.compare(...) also supports {@code Instant}
- * literals (used internally for {@code atTimestamp} log resolution), but
- * there's no wire encoding for it yet; a client filtering on a timestamp
- * column today should compare against its epoch-millis long representation
- * rather than an ISO string, until this codec grows a "timestamp" literal
- * type.
+ * <b>Literal types:</b> {@code string}, {@code long}, {@code double}, and
+ * {@code timestamp} (ISO-8601, parsed to {@code Instant} — the
+ * representation timestamp/INT96 columns are compared as consistently
+ * across this project now, not the epoch-micros-long convention used
+ * before this type existed on the wire).
+ *
+ * <b>Predicate types:</b> {@code cmp} (single comparison), {@code and}/
+ * {@code or}, {@code in} (needs a {@code "literals"} array plus
+ * {@code literalType}), {@code like} (needs a {@code "pattern"} string —
+ * SQL-style, {@code %}/{@code _} wildcards, case-sensitive).
  */
 public final class PredicateCodec {
 
@@ -39,9 +41,26 @@ public final class PredicateCodec {
                 return Predicate.compare(requireText(node, "column"),
                         ComparisonOp.valueOf(requireText(node, "op")),
                         literal(node));
+            case "in":
+                return Predicate.in(requireText(node, "column"), literalList(node));
+            case "like":
+                return Predicate.like(requireText(node, "column"), requireText(node, "pattern"));
             default:
                 throw new IllegalArgumentException("Unknown predicate type: " + type);
         }
+    }
+
+    private static List<Comparable<?>> literalList(JsonNode node) {
+        String literalType = node.has("literalType") ? node.get("literalType").asText() : "string";
+        JsonNode literalsNode = node.get("literals");
+        if (literalsNode == null || !literalsNode.isArray()) {
+            throw new IllegalArgumentException("'in' predicate requires a 'literals' array");
+        }
+        List<Comparable<?>> result = new ArrayList<>();
+        for (JsonNode item : literalsNode) {
+            result.add(literalOfType(item, literalType));
+        }
+        return result;
     }
 
     private static Predicate[] children(JsonNode node) {
@@ -57,12 +76,20 @@ public final class PredicateCodec {
 
     private static Comparable<?> literal(JsonNode node) {
         String literalType = node.has("literalType") ? node.get("literalType").asText() : "string";
-        JsonNode literalNode = node.get("literal");
+        return literalOfType(node.get("literal"), literalType);
+    }
+
+    private static Comparable<?> literalOfType(JsonNode literalNode, String literalType) {
         switch (literalType) {
             case "long":
                 return literalNode.asLong();
             case "double":
                 return literalNode.asDouble();
+            case "timestamp":
+                // ISO-8601, e.g. "2026-07-17T10:00:00Z" — parsed to Instant,
+                // the single representation timestamp columns (INT96) are
+                // compared as throughout this project now.
+                return java.time.Instant.parse(literalNode.asText());
             case "string":
             default:
                 return literalNode.asText();

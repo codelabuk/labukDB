@@ -28,6 +28,45 @@ public interface Predicate {
         return new Or(List.of(children));
     }
 
+    static Predicate in(String column, List<Comparable<?>> literals) {
+        return new In(column, literals);
+    }
+
+    static Predicate like(String column, String pattern) {
+        return new Like(column, pattern);
+    }
+
+    final class In implements Predicate {
+        public final String column;
+        public final List<Comparable<?>> literals;
+
+        In(String column, List<Comparable<?>> literals) {
+            this.column = column;
+            this.literals = literals;
+        }
+
+        @Override
+        public String toString() {
+            return column + " IN " + literals;
+        }
+    }
+
+    /** SQL-style LIKE: {@code %} matches any run of characters, {@code _} matches exactly one. Case-sensitive. */
+    final class Like implements Predicate {
+        public final String column;
+        public final String pattern;
+
+        Like(String column, String pattern) {
+            this.column = column;
+            this.pattern = pattern;
+        }
+
+        @Override
+        public String toString() {
+            return column + " LIKE '" + pattern + "'";
+        }
+    }
+
     final class Comparison implements Predicate {
         public final String column;
         public final ComparisonOp op;

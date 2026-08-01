@@ -1,6 +1,7 @@
 package com.labuk.deltaflight.planner;
 
 import java.time.Instant;
+import java.util.List;
 
 /**
  * Two evaluation modes, both built on the same type-coercion logic:
@@ -28,6 +29,61 @@ import java.time.Instant;
 public final class PredicateEvaluation {
 
     private PredicateEvaluation() {
+    }
+
+    /** True if actual equals ANY of the literals — same fail-open coercion behavior as compareExact per literal. */
+    public static boolean matchesIn(Object actual, List<Comparable<?>> literals) {
+        for (Comparable<?> literal : literals) {
+            if (compareExact(actual, ComparisonOp.EQ, literal)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** True if the [min,max] range could contain ANY of the literals. */
+    public static boolean mightMatchRangeIn(Object min, Object max, List<Comparable<?>> literals) {
+        for (Comparable<?> literal : literals) {
+            if (mightMatchRange(min, max, ComparisonOp.EQ, literal)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * SQL-style LIKE — {@code %} matches any run of characters, {@code _}
+     * matches exactly one, case-sensitive. Only meaningful against a
+     * String actual value; a non-String actual fails open (true) for the
+     * same reason coercion failures do elsewhere in this class — let a
+     * layer with more context decide, rather than silently drop the row
+     * here.
+     */
+    public static boolean matchesLike(Object actual, String pattern) {
+        if (!(actual instanceof String)) {
+            return true;
+        }
+        return ((String) actual).matches(likeToRegex(pattern));
+    }
+
+    private static String likeToRegex(String likePattern) {
+        StringBuilder regex = new StringBuilder();
+        for (char c : likePattern.toCharArray()) {
+            switch (c) {
+                case '%':
+                    regex.append(".*");
+                    break;
+                case '_':
+                    regex.append('.');
+                    break;
+                default:
+                    if ("\\.[]{}()*+-?^$|".indexOf(c) >= 0) {
+                        regex.append('\\');
+                    }
+                    regex.append(c);
+            }
+        }
+        return regex.toString();
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})

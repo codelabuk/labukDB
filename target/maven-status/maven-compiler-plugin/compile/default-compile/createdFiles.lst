@@ -14,6 +14,7 @@ com\labuk\deltaflight\decode\ArrowSchemaMapper.class
 com\labuk\deltaflight\decode\Int96TimestampCodec.class
 com\labuk\deltaflight\planner\PartitionValueSubstituter.class
 com\labuk\deltaflight\planner\Predicate$Or.class
+com\labuk\deltaflight\planner\Predicate$Like.class
 com\labuk\deltaflight\flight\query\PredicateCodec.class
 com\labuk\deltaflight\log\TableCache.class
 com\labuk\deltaflight\planner\PartitionPruner.class
@@ -36,6 +37,7 @@ com\labuk\deltaflight\decode\RowAppender$1.class
 com\labuk\deltaflight\log\action\ProtocolAction.class
 com\labuk\deltaflight\log\action\SingleAction.class
 com\labuk\deltaflight\log\SnapshotManager.class
+com\labuk\deltaflight\planner\Predicate$In.class
 com\labuk\deltaflight\decode\GroupPredicateEvaluator$1.class
 com\labuk\deltaflight\planner\PredicateEvaluation.class
 com\labuk\deltaflight\log\action\CommitInfoAction.class

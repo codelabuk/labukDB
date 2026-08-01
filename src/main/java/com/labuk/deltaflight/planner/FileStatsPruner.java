@@ -75,6 +75,24 @@ public final class FileStatsPruner {
             }
             return PredicateEvaluation.mightMatchRange(toObject(min), toObject(max), cmp.op, cmp.literal);
         }
+        if (predicate instanceof Predicate.In in) {
+            JsonNode min = section(stats, "minValues", in.column);
+            JsonNode max = section(stats, "maxValues", in.column);
+            if (min == null || max == null) {
+                return true;
+            }
+            return PredicateEvaluation.mightMatchRangeIn(toObject(min), toObject(max), in.literals);
+        }
+        if (predicate instanceof Predicate.Like) {
+            // No range-based pruning for LIKE at this level yet — would need
+            // extracting a fixed prefix from the pattern and comparing it
+            // against min/max lexicographically. Real optimization, not
+            // attempted here; documented as a gap rather than guessed at.
+            // Correctness isn't affected — the residual filter still applies
+            // the pattern exactly, this just means no file gets skipped for
+            // a LIKE-only predicate.
+            return true;
+        }
         return true;
     }
 

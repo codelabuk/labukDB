@@ -54,6 +54,18 @@ public final class PartitionPruner {
             }
             return PredicateEvaluation.compareExact(partitionValues.get(cmp.column), cmp.op, cmp.literal);
         }
+        if (predicate instanceof Predicate.In in) {
+            if (!partitionValues.containsKey(in.column)) {
+                return true;
+            }
+            return PredicateEvaluation.matchesIn(partitionValues.get(in.column), in.literals);
+        }
+        if (predicate instanceof Predicate.Like like) {
+            if (!partitionValues.containsKey(like.column)) {
+                return true;
+            }
+            return PredicateEvaluation.matchesLike(partitionValues.get(like.column), like.pattern);
+        }
         return true; // unrecognized predicate shape — fail open
     }
 }

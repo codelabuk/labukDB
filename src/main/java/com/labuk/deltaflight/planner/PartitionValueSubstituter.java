@@ -62,6 +62,20 @@ public final class PartitionValueSubstituter {
             return predicate; // references a physical column — leave untouched
         }
 
+        if (predicate instanceof Predicate.In in) {
+            if (partitionValues.containsKey(in.column)) {
+                return PredicateEvaluation.matchesIn(partitionValues.get(in.column), in.literals);
+            }
+            return predicate;
+        }
+
+        if (predicate instanceof Predicate.Like like) {
+            if (partitionValues.containsKey(like.column)) {
+                return PredicateEvaluation.matchesLike(partitionValues.get(like.column), like.pattern);
+            }
+            return predicate;
+        }
+
         if (predicate instanceof Predicate.And and) {
             List<Predicate> remaining = new ArrayList<>();
             for (Predicate child : and.children) {

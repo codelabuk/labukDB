@@ -68,6 +68,22 @@ final class RowGroupPruner {
             Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType().getPrimitiveTypeName());
             return PredicateEvaluation.mightMatchRange(min, max, cmp.op, cmp.literal);
         }
+        if (predicate instanceof Predicate.In in) {
+            ColumnChunkMetaData column = findColumn(block, in.column);
+            if (column == null) {
+                return true;
+            }
+            Statistics<?> stats = column.getStatistics();
+            if (stats == null || stats.isEmpty()) {
+                return true;
+            }
+            Object min = toJavaValue(stats.genericGetMin(), column.getPrimitiveType().getPrimitiveTypeName());
+            Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType().getPrimitiveTypeName());
+            return PredicateEvaluation.mightMatchRangeIn(min, max, in.literals);
+        }
+        if (predicate instanceof Predicate.Like) {
+            return true; // same documented gap as FileStatsPruner — no prefix-range pruning for LIKE yet
+        }
         return true;
     }
 
@@ -91,7 +107,7 @@ final class RowGroupPruner {
         // understands.
         if (statValue instanceof Binary binary) {
             if (typeName == PrimitiveTypeName.INT96) {
-                return Int96TimestampCodec.toEpochMicros(binary);
+                return Int96TimestampCodec.toInstant(binary);
             }
             return binary.toStringUsingUTF8();
         }

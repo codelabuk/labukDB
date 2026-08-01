@@ -59,6 +59,20 @@ final class GroupPredicateEvaluator {
             }
             return PredicateEvaluation.compareExact(actual, cmp.op, cmp.literal);
         }
+        if (predicate instanceof Predicate.In in) {
+            Object actual = readValue(row, schema, in.column);
+            if (actual == null) {
+                return false;
+            }
+            return PredicateEvaluation.matchesIn(actual, in.literals);
+        }
+        if (predicate instanceof Predicate.Like like) {
+            Object actual = readValue(row, schema, like.column);
+            if (actual == null) {
+                return false;
+            }
+            return PredicateEvaluation.matchesLike(actual, like.pattern);
+        }
         return true;
     }
 
@@ -81,9 +95,13 @@ final class GroupPredicateEvaluator {
             case BINARY:
                 return row.getString(column, 0);
             case INT96:
-                // Epoch microseconds — matches PredicateCodec's current
-                // literal-type support (long), not an ISO string/Instant.
-                return Int96TimestampCodec.toEpochMicros(row.getInt96(column, 0));
+                // Instant, not raw epoch micros — now that PredicateCodec
+                // supports a real timestamp literal type, Instant is the one
+                // consistent representation for timestamp comparisons across
+                // every layer, rather than an epoch-micros-long convention
+                // that only existed because the wire format used to lack a
+                // timestamp literal.
+                return Int96TimestampCodec.toInstant(row.getInt96(column, 0));
             default:
                 throw new UnsupportedOperationException(
                         "Parquet type not supported yet: " + typeName + " (column '" + column + "')");

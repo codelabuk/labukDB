@@ -43,18 +43,37 @@ backward moves. Covered by `CommitLogReaderTest` and `SnapshotManagerTest`
 against realistic fixture commits.
 
 ### Layer 2 — `planner/`
-- `Predicate` — the filter model: comparisons plus AND/OR (no generic NOT;
-  see its javadoc for why).
-- `PartitionPruner` — exact-match pruning from the log's partition values.
+- `Predicate` — the filter model: comparisons, `IN`, `LIKE` (SQL-style,
+  `%`/`_`, case-sensitive), combined with AND/OR (no generic NOT; see its
+  javadoc for why).
+- `PartitionPruner` — exact-match pruning from the log's partition values,
+  including `IN`/`LIKE` against a file's known exact partition value.
 - `FileStatsPruner` — range pruning from `AddFile.stats` (min/max/null-count
-  per column, if the writer collected them).
-- `QueryPlanner` / `ScanPlan` — orchestrates both, reports files-skipped as
-  a concrete metric.
+  per column, if the writer collected them). `IN` gets real range pruning
+  (OR across each listed value's range check). `LIKE` does NOT get
+  range-based pruning here — a documented gap, not a bug: would need
+  extracting a fixed prefix and comparing it lexicographically against
+  min/max, not attempted yet. Correctness isn't affected, since the
+  residual filter still applies the pattern exactly — this only means a
+  `LIKE`-only predicate skips no files at this level.
+- `PartitionValueSubstituter` — folds `IN`/`LIKE` on partition columns to
+  boolean constants too, same as plain comparisons.
+- `QueryPlanner` / `ScanPlan` — orchestrates all of the above, reports
+  files-skipped as a concrete metric.
 
 All pruning is deliberately **fail-open**: anything it can't decide (missing
-stats, non-partition column, type it doesn't recognize) is kept, never
-skipped. Covered by `PrunerTest`, including the AND/OR combination logic and
-the NEQ-never-prunes case.
+stats, non-partition column, type it doesn't recognize, a `LIKE` pattern
+against a non-string value) is kept, never skipped. Covered by `PrunerTest`
+(comparisons, AND/OR, NEQ-never-prunes, `IN` range pruning, `LIKE`'s
+documented no-pruning behavior) and `PartitionValueSubstituterTest`.
+
+**Timestamp literals are now real on the wire** — `PredicateCodec` (in
+`flight/query/`) supports a `timestamp` literal type (ISO-8601 string,
+parsed to `Instant`), which is also now the single representation INT96
+columns are compared as everywhere (`GroupPredicateEvaluator`,
+`RowGroupPruner`) — replacing the earlier epoch-microsecond-long convention
+that only existed because the wire format used to lack a timestamp type.
+Covered by `PredicateCodecTest`.
 
 ### Layer 3 — `decode/`
 - `RowGroupPruner` — same range logic as `FileStatsPruner`, one level
@@ -74,8 +93,9 @@ legacy timestamp encoding — now decoded via `Int96TimestampCodec`, epoch
 microseconds UTC; see its javadoc for the exact caveat around Spark's
 session-timezone rebasing config), and BINARY (UTF-8 string). Still not
 supported: DECIMAL, nested/list types. Timestamp predicates over the wire
-should use epoch-microsecond `long` literals for now — `PredicateCodec`
-doesn't have an ISO-string/Instant literal type yet.
+should use the `timestamp` literal type (ISO-8601) now — see
+`PredicateCodec`'s class javadoc — rather than the epoch-microsecond `long`
+convention this project used before that literal type existed.
 
 Covered by `ParquetToArrowReaderTest`, which writes a real Parquet file with
 parquet-mr's own writer and reads it back — the closest thing to a true
@@ -196,16 +216,10 @@ See the four-layer breakdown in the project architecture discussion —
 
 ## Next
 
-1. **Run `mvn test` locally.** This environment cannot run Maven — no
-   access to Maven Central — so nothing in this repository has been
-   compiled or executed here, ever. Every real result so far (the 29
-   passing tests, the INT96 error, the real-table run) came from running
-   this locally and pasting the output back. That's not a one-time step;
-   it's the only source of truth this project has. A useful batch to test
-   now: partition-column reconstruction, the predicate-substitution fix,
-   and both new caches — four changes since the last confirmed-green run.
-2. Filter language expansion (`IN`, `LIKE`/contains, a proper
-   timestamp/Instant literal type on the wire) — the pruning levels are all
-   there; what's narrow is the comparison vocabulary.
-3. CLI, then a scoped catalog (name → table-root resolution, `ListFlights`).
-4. Checkpoint support in `SnapshotManager`.
+1. Run `mvn test` locally — filter language expansion (`IN`, `LIKE`, the
+   timestamp literal type, and the INT96-to-Instant switch) touches
+   `PredicateEvaluation`, every pruning layer, `GroupPredicateEvaluator`,
+   `PartitionValueSubstituter`, and `PredicateCodec` — real surface, worth
+   a full pass before trusting it.
+2. CLI, then a scoped catalog (name → table-root resolution, `ListFlights`).
+3. Checkpoint support in `SnapshotManager`.

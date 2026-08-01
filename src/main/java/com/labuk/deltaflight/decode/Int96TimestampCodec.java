@@ -50,4 +50,12 @@ final class Int96TimestampCodec {
         long epochNanos = epochDay * NANOS_PER_DAY + nanosOfDay;
         return Math.floorDiv(epochNanos, 1_000L);
     }
+
+    /** Same decode as {@link #toEpochMicros}, as a java.time.Instant — the representation used for comparisons. */
+    static java.time.Instant toInstant(Binary int96Value) {
+        long micros = toEpochMicros(int96Value);
+        long seconds = Math.floorDiv(micros, 1_000_000L);
+        long nanoAdjustment = Math.floorMod(micros, 1_000_000L) * 1_000L;
+        return java.time.Instant.ofEpochSecond(seconds, nanoAdjustment);
+    }
 }

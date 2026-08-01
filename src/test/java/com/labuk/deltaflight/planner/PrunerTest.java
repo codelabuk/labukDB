@@ -120,4 +120,61 @@ class PrunerTest {
         // Documented conservative behavior: NEQ never rules out a range.
         assertTrue(PredicateEvaluation.mightMatchRange(10L, 150L, ComparisonOp.NEQ, 10L));
     }
+
+    @Test
+    void in_partitionPruner_matchesAnyListedValue() throws Exception {
+        AddFile errorFile = addFile("f1", Map.of("level", "ERROR"), null);
+        AddFile infoFile = addFile("f2", Map.of("level", "INFO"), null);
+        AddFile warnFile = addFile("f3", Map.of("level", "WARN"), null);
+
+        Predicate predicate = Predicate.in("level", List.of("ERROR", "WARN"));
+        List<AddFile> survivors = PartitionPruner.prune(predicate, List.of(errorFile, infoFile, warnFile));
+
+        assertEquals(2, survivors.size());
+        assertTrue(survivors.stream().noneMatch(f -> f.getPath().equals("f2")));
+    }
+
+    @Test
+    void in_fileStatsPruner_skipsFileWhoseRangeMatchesNoListedValue() throws Exception {
+        String stats = "{\"numRecords\":100,\"minValues\":{\"amount\":10},\"maxValues\":{\"amount\":20}}";
+        AddFile file = addFile("f1", Map.of(), stats);
+
+        Predicate predicate = Predicate.in("amount", List.of(100L, 200L));
+        assertEquals(0, FileStatsPruner.prune(predicate, List.of(file)).size());
+    }
+
+    @Test
+    void in_fileStatsPruner_keepsFileWhoseRangeCouldMatchOneListedValue() throws Exception {
+        String stats = "{\"numRecords\":100,\"minValues\":{\"amount\":10},\"maxValues\":{\"amount\":20}}";
+        AddFile file = addFile("f1", Map.of(), stats);
+
+        Predicate predicate = Predicate.in("amount", List.of(15L, 999L));
+        assertEquals(1, FileStatsPruner.prune(predicate, List.of(file)).size());
+    }
+
+    @Test
+    void like_partitionPruner_matchesPrefixPattern() throws Exception {
+        AddFile julyFile = addFile("f1", Map.of("log_date", "2026-07-17"), null);
+        AddFile augFile = addFile("f2", Map.of("log_date", "2026-08-01"), null);
+
+        Predicate predicate = Predicate.like("log_date", "2026-07%");
+        List<AddFile> survivors = PartitionPruner.prune(predicate, List.of(julyFile, augFile));
+
+        assertEquals(1, survivors.size());
+        assertEquals("f1", survivors.get(0).getPath());
+    }
+
+    @Test
+    void like_fileStatsPruner_neverPrunes_documentedGap() throws Exception {
+        // No range-based pruning for LIKE at this level yet — see
+        // FileStatsPruner's handling of Predicate.Like. This test documents
+        // that fact as a deliberate assertion, not an oversight: even a
+        // pattern that clearly can't match anything in [min,max] must still
+        // be kept here.
+        String stats = "{\"numRecords\":100,\"minValues\":{\"label\":\"aaa\"},\"maxValues\":{\"label\":\"bbb\"}}";
+        AddFile file = addFile("f1", Map.of(), stats);
+
+        Predicate predicate = Predicate.like("label", "zzz%");
+        assertEquals(1, FileStatsPruner.prune(predicate, List.of(file)).size());
+    }
 }
