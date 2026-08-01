@@ -126,6 +126,23 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             throw CallStatus.INTERNAL.withDescription("Failed to plan query: " + e.getMessage()).toRuntimeException();
         } catch (IllegalArgumentException | IllegalStateException e) {
             throw CallStatus.INVALID_ARGUMENT.withDescription(e.getMessage()).toRuntimeException();
+        } catch (RuntimeException e) {
+            // Catches things like UncheckedIOException from SnapshotManager
+            // (e.g. a table root that doesn't resolve to a real _delta_log
+            // directory) that don't match either narrower catch above.
+            // Without this, the exception propagates uncaught and Flight's
+            // default handling replaces it with a generic, useless
+            // "There was an error servicing your request" — including the
+            // real exception type and message here is the difference
+            // between a diagnosable error and a dead end. Logged
+            // server-side too, since the server console otherwise shows
+            // nothing at all when a request fails — only the client sees
+            // an error.
+            e.printStackTrace();
+            throw CallStatus.INTERNAL
+                    .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
+                    .withCause(e)
+                    .toRuntimeException();
         }
     }
 
@@ -146,6 +163,15 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                     .toRuntimeException());
         } catch (IllegalArgumentException e) {
             listener.error(CallStatus.NOT_FOUND.withDescription(e.getMessage()).toRuntimeException());
+        } catch (RuntimeException e) {
+            // Same reasoning as getFlightInfo's catch-all: an uncaught type
+            // here becomes an opaque generic Flight error instead of
+            // something a client (or you, reading the log) can act on.
+            e.printStackTrace();
+            listener.error(CallStatus.INTERNAL
+                    .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
+                    .withCause(e)
+                    .toRuntimeException());
         } finally {
             registry.invalidate(ticketId);
         }
