@@ -214,12 +214,29 @@ See the four-layer breakdown in the project architecture discussion —
 `log/` → `planner/` → `decode/` → `flight/`, with caching added once
 1–4 were correct and measured, not before.
 
+## CLI and Python client demo — new
+
+- `cli/DeltaCli.java` — queries a table directly (log → planner → decode,
+  no Flight server needed): `--table`, `--columns`, `--filter` (a small
+  AND-only syntax — see `SimpleFilterParser`'s javadoc for the exact
+  grammar), `--version`/`--as-of` for time travel, `--limit`. Prints
+  files-skipped alongside results, so pruning is visible, not just implied.
+- `python/query_demo.py` — a real `pyarrow.flight` client against a running
+  `DeltaFlightServerApp`. Nothing about the server changes to support
+  this — proof, not just a claim, that any Flight-capable client in any
+  language works unmodified. `pip install pyarrow`, then point it at a
+  running server + table root.
+
+**Not yet tested locally, same caveat as always** — this environment can't
+run either the Java CLI or the Python script; both need a real pass on your
+machine before trusting them.
+
 ## Next
 
-1. Run `mvn test` locally — filter language expansion (`IN`, `LIKE`, the
-   timestamp literal type, and the INT96-to-Instant switch) touches
-   `PredicateEvaluation`, every pruning layer, `GroupPredicateEvaluator`,
-   `PartitionValueSubstituter`, and `PredicateCodec` — real surface, worth
-   a full pass before trusting it.
-2. CLI, then a scoped catalog (name → table-root resolution, `ListFlights`).
+1. Run `mvn test`, then try `DeltaCli` and `python/query_demo.py` (the
+   latter needs a running `DeltaFlightServerApp` first) against your real
+   table.
+2. Scoped catalog (name → table-root resolution, real `ListFlights`).
 3. Checkpoint support in `SnapshotManager`.
+4. *(stretch)* row-data caching — today only schema/snapshot metadata is
+   cached, not actual scanned rows.

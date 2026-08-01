@@ -8,8 +8,10 @@ com\labuk\deltaflight\flight\DeltaFlightProducer.class
 com\labuk\deltaflight\decode\RowGroupPruner.class
 com\labuk\deltaflight\planner\ComparisonOp.class
 com\labuk\deltaflight\planner\QueryPlanner.class
+com\labuk\deltaflight\cli\CliArgs.class
 com\labuk\deltaflight\planner\Predicate$And.class
 com\labuk\deltaflight\log\CommitLogReader.class
+com\labuk\deltaflight\cli\SimpleFilterParser.class
 com\labuk\deltaflight\decode\ArrowSchemaMapper.class
 com\labuk\deltaflight\decode\Int96TimestampCodec.class
 com\labuk\deltaflight\planner\PartitionValueSubstituter.class
@@ -28,6 +30,7 @@ com\labuk\deltaflight\log\CommitFileNames.class
 com\labuk\deltaflight\planner\ScanPlan.class
 com\labuk\deltaflight\decode\ParquetToArrowReader.class
 com\labuk\deltaflight\planner\Predicate$Comparison.class
+com\labuk\deltaflight\cli\DeltaCli.class
 com\labuk\deltaflight\decode\PartitionValueAppender.class
 com\labuk\deltaflight\flight\DeltaFlightServerApp.class
 com\labuk\deltaflight\planner\PredicateEvaluation$1.class
