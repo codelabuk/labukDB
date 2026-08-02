@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Usage: bin/delta-cli catalog add logs /path/to/table
+# Works from any directory — resolves the jar relative to this script's
+# own location, not the caller's current directory.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec java -jar "$DIR/../target/delta-cli.jar" "$@"

@@ -214,6 +214,31 @@ See the four-layer breakdown in the project architecture discussion —
 `log/` → `planner/` → `decode/` → `flight/`, with caching added once
 1–4 were correct and measured, not before.
 
+## Building and running the CLI as an actual command
+
+```
+mvn clean package          # runs tests too; add -DskipTests to skip them
+```
+
+This produces `target/delta-cli.jar` — one file, every dependency bundled
+in. From then on:
+
+```
+bin/delta-cli catalog add logs D:\repo\local-lakehouse-lab\lakehouse\logs_delta
+bin/delta-cli catalog list
+bin/delta-cli describe logs
+bin/delta-cli query --table logs --filter "level=ERROR" --limit 10
+```
+
+(Windows: `bin\delta-cli.bat ...`.) No classpath string, ever. **Zip
+extraction on Windows won't preserve the executable bit on `bin/delta-cli`**
+— run `chmod +x bin/delta-cli` once in Git Bash if it won't execute
+directly; `java -jar target/delta-cli.jar ...` always works regardless.
+
+Not yet built/run here — same caveat as always, and this one specifically
+depends on the shade plugin resolving cleanly, which needs Maven Central
+access this sandbox doesn't have.
+
 ## Catalog, CLI subcommands, and Python client demo — new
 
 - `catalog/TableCatalog.java` — a name → table-root registry, persisted to
@@ -257,7 +282,45 @@ confirmed by `level="warn"` correctly returning zero). The catalog/CLI
 subcommand changes in this section are NOT yet tested locally — same
 caveat as always for anything just written.
 
+## RAG demo — new
+
+`python/rag_demo.py` — plain-English question in, grounded answer out, via
+two separate local Ollama calls with two different jobs:
+
+1. Question + real table schema (fetched live via `GetFlightInfo`, so it's
+   never stale or hand-maintained) → Ollama writes the same JSON
+   `query_demo.py` sends by hand → real query against the server.
+2. Question + the actual retrieved rows → Ollama answers, grounded in step
+   1's real results rather than the model's own guess. This split is what
+   makes it RAG rather than just "LLM with a database nearby."
+
+Fully local — no paid API, matches the Ollama-based pattern from
+`local-lakehouse-lab`'s own NL-to-SQL work, this engine substituted in as
+the backend instead of DuckDB.
+
+**Known limitation, stated plainly (see the script's own docstring too):**
+string filters are case-sensitive, and the LLM has no way to know your
+data's exact casing from the question alone — it can only guess. A real
+fix would fetch distinct values for low-cardinality columns as prompt
+hints; not attempted here.
+
+**Not yet tested locally** — same caveat as always, and this one has an
+extra moving part (Ollama itself, plus whichever model you have pulled) on
+top of the usual "needs a real compiler pass" caveat.
+
 ## Next
+
+1. Run this and `mvn test`. The Ollama call now fails with a clear message
+   instead of a raw traceback if the model isn't pulled — check `ollama list`.
+2. Storage abstraction (S3/MinIO/ADLS) and checkpoint support in
+   `SnapshotManager` — grouped first per current sequencing.
+3. Nested/list types in `decode/` (needed for vector embeddings) + Spark
+   ML integration — after storage/checkpoint.
+4. MCP tool wrapper — same client logic as `rag_demo.py`'s query-execution
+   half, exposed as a callable MCP tool instead of a script.
+5. LICENSE file + basic CI — open-source hygiene, deferred but tracked.
+6. *(stretch)* row-data caching.
+7. *(v2)* streaming subscriptions, distributed/gateway deployment.
 
 1. Run `mvn test`, then try the new CLI subcommands and catalog-name
    queries (Java and Python) against your real table.

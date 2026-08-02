@@ -104,6 +104,48 @@
           <argLine>--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED</argLine>
         </configuration>
       </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.1</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <!--
+                Bundles every dependency into one runnable jar, so the CLI
+                becomes `java -jar delta-cli.jar <subcommand>` instead of
+                needing a hand-built classpath string. ServicesResourceTransformer
+                is not optional here — Hadoop's FileSystem lookup relies on
+                merged META-INF/services entries across multiple jars;
+                without it, shading silently keeps only one jar's service
+                file and HadoopInputFile lookups break in the fat jar
+                specifically, not in the unshaded classpath case.
+              -->
+              <finalName>delta-cli</finalName>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.labuk.deltaflight.cli.DeltaCli</mainClass>
+                </transformer>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
     </plugins>
   </build>
 </project>
