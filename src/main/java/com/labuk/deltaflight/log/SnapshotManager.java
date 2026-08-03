@@ -4,6 +4,7 @@ import com.labuk.deltaflight.log.action.AddFile;
 import com.labuk.deltaflight.log.action.MetadataAction;
 import com.labuk.deltaflight.log.action.ProtocolAction;
 import com.labuk.deltaflight.log.action.SingleAction;
+import com.labuk.deltaflight.storage.TableLocation;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.BufferedReader;
@@ -77,6 +78,18 @@ public class SnapshotManager {
      */
     public SnapshotManager(org.apache.hadoop.fs.Path tableRoot, Configuration conf) throws IOException {
         this.storage = new HadoopLogStorage(new org.apache.hadoop.fs.Path(tableRoot, "_delta_log"), conf);
+    }
+
+    /**
+     * Dispatches on the location itself - local or remote - so callers
+     * don't have to pick a constructor based on inspecting a URI scheme
+     * themselves. This is the one that {@code TableCache} and, through it,
+     * {@code DeltaFlightProducer} actually use.
+     */
+    public static SnapshotManager forLocation(TableLocation location) throws IOException {
+        return location.isRemote()
+                ? new SnapshotManager(location.hadoopPath(), location.hadoopConf())
+                : new SnapshotManager(location.localPath());
     }
 
     public synchronized Snapshot latest() {

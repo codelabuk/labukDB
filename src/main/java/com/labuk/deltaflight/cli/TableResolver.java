@@ -1,31 +1,32 @@
 package com.labuk.deltaflight.cli;
 
 import com.labuk.deltaflight.catalog.TableCatalog;
-
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import com.labuk.deltaflight.storage.MinioConfiguration;
+import com.labuk.deltaflight.storage.TableLocation;
 
 /**
- * Resolves a CLI argument that could be either a name registered in the
- * catalog or a raw filesystem path — the same "works with both" intuition
- * {@code kubectl get pod <name>} relies on. Catalog lookup wins if it
- * matches; otherwise the argument is treated as a literal path, so nothing
- * about pre-catalog usage (a raw path) breaks.
+ * Resolves a CLI argument that could be a catalog name, a local path, or a
+ * remote URI - the same "works with all of them" intuition {@code kubectl
+ * get pod <name>} relies on. Catalog lookup wins if it matches; otherwise
+ * the argument is used literally.
  *
- * <b>Interim limitation:</b> this always returns a local
- * {@code java.nio.file.Path}, even if the catalog entry is a remote URI
- * (which {@link TableCatalog} can now correctly store). The CLI doesn't
- * yet dispatch to the Hadoop-backed engine for remote entries — that's
- * the next integration step, not this class's job yet. Resolving a
- * remote-URI catalog entry through the CLI today will produce a broken
- * local Path, not a working remote query.
+ * Returns a {@link TableLocation}, so remote entries actually dispatch to
+ * the Hadoop-backed engine rather than being flattened into a broken local
+ * path (which is what this class did before URI dispatch existed).
+ * Remote locations pick up connector config from the environment via
+ * {@link MinioConfiguration#fromEnvironment()} - set {@code MINIO_ENDPOINT},
+ * {@code MINIO_ACCESS_KEY}, {@code MINIO_SECRET_KEY} to query MinIO from
+ * the CLI.
  */
 final class TableResolver {
 
     private TableResolver() {
     }
 
-    static Path resolve(String tableArg, TableCatalog catalog) {
-        return catalog.resolve(tableArg).map(Paths::get).orElseGet(() -> Paths.get(tableArg));
+    static TableLocation resolve(String tableArg, TableCatalog catalog) {
+        String raw = catalog.resolve(tableArg).orElse(tableArg);
+        return TableLocation.isRemoteUri(raw)
+                ? TableLocation.forRemote(raw, MinioConfiguration.fromEnvironment())
+                : TableLocation.fromString(raw);
     }
 }

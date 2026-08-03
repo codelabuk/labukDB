@@ -9,14 +9,13 @@ import com.labuk.deltaflight.planner.PartitionValueSubstituter;
 import com.labuk.deltaflight.planner.Predicate;
 import com.labuk.deltaflight.planner.QueryPlanner;
 import com.labuk.deltaflight.planner.ScanPlan;
+import com.labuk.deltaflight.storage.TableLocation;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
 
-import java.io.File;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -42,10 +41,10 @@ final class QueryCommand {
         }
 
         TableCatalog catalog = TableCatalog.atDefaultLocation();
-        Path tableRoot = TableResolver.resolve(parsed.table, catalog);
+        TableLocation tableRoot = TableResolver.resolve(parsed.table, catalog);
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-            SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
+            SnapshotManager snapshotManager = SnapshotManager.forLocation(tableRoot);
 
             Snapshot snapshot = parsed.version != null ? snapshotManager.atVersion(parsed.version)
                     : parsed.asOf != null ? snapshotManager.atTimestamp(parsed.asOf)
@@ -67,11 +66,11 @@ final class QueryCommand {
                 if (remaining <= 0) {
                     break;
                 }
-                File parquetFile = tableRoot.resolve(file.getPath()).toFile();
+                TableLocation dataFile = tableRoot.resolve(file.getPath());
                 Predicate perFileResidual =
                         PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
 
-                try (VectorSchemaRoot root = reader.read(parquetFile, allocator, plan.getProjectedColumns(),
+                try (VectorSchemaRoot root = reader.read(dataFile, allocator, plan.getProjectedColumns(),
                         perFileResidual, file.getPartitionValues())) {
                     if (!headerPrinted) {
                         printHeader(root);

@@ -13,6 +13,8 @@ import com.labuk.deltaflight.planner.Predicate;
 import com.labuk.deltaflight.planner.PartitionValueSubstituter;
 import com.labuk.deltaflight.planner.QueryPlanner;
 import com.labuk.deltaflight.planner.ScanPlan;
+import com.labuk.deltaflight.storage.MinioConfiguration;
+import com.labuk.deltaflight.storage.TableLocation;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -24,12 +26,10 @@ import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.hadoop.conf.Configuration;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -67,15 +67,27 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final QueryPlanner queryPlanner = new QueryPlanner();
     private final TableCache tableCache = new TableCache();
     private final TableCatalog catalog;
+    private final Configuration storageConf;
 
     public DeltaFlightProducer(BufferAllocator allocator) {
-        this(allocator, TableCatalog.atDefaultLocation());
+        this(allocator, TableCatalog.atDefaultLocation(), MinioConfiguration.fromEnvironment());
     }
 
     /** Explicit-catalog constructor — mainly for tests that need an isolated catalog file. */
     public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog) {
+        this(allocator, catalog, MinioConfiguration.fromEnvironment());
+    }
+
+    /**
+     * @param storageConf Hadoop configuration used for any remote
+     *                    ({@code s3a://}, {@code abfss://}) table location —
+     *                    endpoint, credentials, path-style access. See
+     *                    {@link MinioConfiguration}. Unused for local tables.
+     */
+    public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf) {
         this.allocator = allocator;
         this.catalog = catalog;
+        this.storageConf = storageConf;
     }
 
     /**
@@ -85,31 +97,38 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      */
     /**
      * Resolves {@code table} (a catalog name) first if present, otherwise
-     * falls back to the raw {@code tableRoot} path.
+     * falls back to the raw {@code tableRoot}. Returns a
+     * {@link TableLocation}, which decides local-vs-remote once, here, so
+     * everything downstream (log reads, data-file reads) follows the same
+     * decision rather than each re-detecting a URI scheme.
      *
-     * <b>Interim limitation:</b> always returns a local {@code java.nio.file.Path}.
-     * {@code TableCatalog} can now correctly store a remote URI, but
-     * nothing here dispatches to the Hadoop-backed engine for one yet —
-     * next integration step, not done here.
+     * Remote locations get this producer's {@code storageConf} — supplied
+     * at construction (see {@link #DeltaFlightProducer(BufferAllocator,
+     * TableCatalog, Configuration)}), which is where MinIO/S3 endpoint and
+     * credentials come from.
      */
-    private Path resolveTableRoot(FlightQueryRequest query) {
+    private TableLocation resolveTableRoot(FlightQueryRequest query) {
+        String raw;
         if (query.getTable() != null) {
-            String location = catalog.resolve(query.getTable())
+            raw = catalog.resolve(query.getTable())
                     .orElseThrow(() -> new IllegalArgumentException(
                             "No table registered in the catalog under the name '" + query.getTable() + "'"));
-            return Paths.get(location);
+        } else if (query.getTableRoot() != null) {
+            raw = query.getTableRoot();
+        } else {
+            throw new IllegalArgumentException(
+                    "Query must set either 'table' (a catalog name) or 'tableRoot' (a raw path or URI)");
         }
-        if (query.getTableRoot() != null) {
-            return Paths.get(query.getTableRoot());
-        }
-        throw new IllegalArgumentException("Query must set either 'table' (a catalog name) or 'tableRoot' (a raw path)");
+        return TableLocation.isRemoteUri(raw)
+                ? TableLocation.forRemote(raw, storageConf)
+                : TableLocation.fromString(raw);
     }
 
     @Override
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
         try {
             FlightQueryRequest query = MAPPER.readValue(descriptor.getCommand(), FlightQueryRequest.class);
-            Path tableRoot = resolveTableRoot(query);
+            TableLocation tableRoot = resolveTableRoot(query);
             SnapshotManager snapshotManager = tableCache.forTable(tableRoot);
 
             Snapshot snapshot;
@@ -126,7 +145,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
 
             List<FlightEndpoint> endpoints = new ArrayList<>();
             for (AddFile file : plan.getFilesToScan()) {
-                File parquetFile = tableRoot.resolve(file.getPath()).toFile();
+                TableLocation dataFile = tableRoot.resolve(file.getPath());
                 // The plan's residual predicate is the whole original
                 // predicate, still possibly referencing partition columns
                 // (e.g. "level = 'ERROR' AND amount > 2"). Each file's own
@@ -137,7 +156,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                 Predicate perFileResidual =
                         PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
                 String ticketId = registry.register(new ScanTicket(
-                        parquetFile, plan.getProjectedColumns(), perFileResidual, file.getPartitionValues()));
+                        dataFile, plan.getProjectedColumns(), perFileResidual, file.getPartitionValues()));
                 endpoints.add(new FlightEndpoint(new Ticket(ticketId.getBytes(StandardCharsets.UTF_8))));
             }
 
@@ -152,7 +171,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             Schema schema = plan.getFilesToScan().isEmpty()
                     ? new Schema(List.of())
                     : parquetReader.readSchema(
-                    tableRoot.resolve(plan.getFilesToScan().get(0).getPath()).toFile(),
+                    tableRoot.resolve(plan.getFilesToScan().get(0).getPath()),
                     plan.getProjectedColumns(),
                     plan.getFilesToScan().get(0).getPartitionValues());
 
@@ -190,7 +209,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         try {
             ScanTicket scanTicket = registry.lookup(ticketId);
             try (VectorSchemaRoot root = parquetReader.read(
-                    scanTicket.parquetFile, allocator, scanTicket.projectedColumns,
+                    scanTicket.dataFile, allocator, scanTicket.projectedColumns,
                     scanTicket.residualPredicate, scanTicket.partitionValues)) {
                 listener.start(root);
                 listener.putNext();

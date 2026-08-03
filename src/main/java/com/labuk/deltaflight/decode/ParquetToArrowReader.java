@@ -1,6 +1,7 @@
 package com.labuk.deltaflight.decode;
 
 import com.labuk.deltaflight.planner.Predicate;
+import com.labuk.deltaflight.storage.TableLocation;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VarCharVector;
@@ -86,6 +87,33 @@ public final class ParquetToArrowReader {
     public VectorSchemaRoot read(File parquetFile, BufferAllocator allocator, List<String> projectedColumns,
                                   Predicate residualPredicate, Map<String, String> partitionValues) throws IOException {
         return read(ParquetInputFiles.local(parquetFile), allocator, projectedColumns, residualPredicate, partitionValues);
+    }
+
+    // --- TableLocation-based: dispatches local vs. remote, the entry point DeltaFlightProducer uses ---
+
+    /**
+     * Dispatches on the location - a local path uses the cached
+     * {@code File} path (keeping {@link ParquetFooterCache}'s benefit), a
+     * remote URI builds a Hadoop-backed {@code InputFile}. This is what
+     * makes an end-to-end remote (S3/MinIO/ADLS) query actually work,
+     * rather than only the log layer being remote-capable.
+     */
+    public Schema readSchema(TableLocation dataFile, List<String> projectedColumns,
+                              Map<String, String> partitionValues) throws IOException {
+        if (dataFile.isRemote()) {
+            return readSchema(ParquetInputFiles.remote(dataFile.hadoopPath(), dataFile.hadoopConf()),
+                    projectedColumns, partitionValues);
+        }
+        return readSchema(dataFile.localPath().toFile(), projectedColumns, partitionValues);
+    }
+
+    public VectorSchemaRoot read(TableLocation dataFile, BufferAllocator allocator, List<String> projectedColumns,
+                                  Predicate residualPredicate, Map<String, String> partitionValues) throws IOException {
+        if (dataFile.isRemote()) {
+            return read(ParquetInputFiles.remote(dataFile.hadoopPath(), dataFile.hadoopConf()),
+                    allocator, projectedColumns, residualPredicate, partitionValues);
+        }
+        return read(dataFile.localPath().toFile(), allocator, projectedColumns, residualPredicate, partitionValues);
     }
 
     // --- InputFile-based methods: the actual implementation, storage-agnostic ---
