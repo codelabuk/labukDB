@@ -23,6 +23,14 @@ public class ProtocolAction {
     @JsonProperty("minWriterVersion")
     private int minWriterVersion;
 
+    public ProtocolAction() {
+    }
+
+    public ProtocolAction(int minReaderVersion, int minWriterVersion) {
+        this.minReaderVersion = minReaderVersion;
+        this.minWriterVersion = minWriterVersion;
+    }
+
     public int getMinReaderVersion() {
         return minReaderVersion;
     }

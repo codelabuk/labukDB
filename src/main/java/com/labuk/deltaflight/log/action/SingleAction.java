@@ -33,6 +33,27 @@ public class SingleAction {
     @JsonProperty("commitInfo")
     private CommitInfoAction commitInfo;
 
+    public SingleAction() {
+    }
+
+    public static SingleAction ofAdd(AddFile add) {
+        SingleAction a = new SingleAction();
+        a.add = add;
+        return a;
+    }
+
+    public static SingleAction ofMetaData(MetadataAction metaData) {
+        SingleAction a = new SingleAction();
+        a.metaData = metaData;
+        return a;
+    }
+
+    public static SingleAction ofProtocol(ProtocolAction protocol) {
+        SingleAction a = new SingleAction();
+        a.protocol = protocol;
+        return a;
+    }
+
     public AddFile getAdd() {
         return add;
     }

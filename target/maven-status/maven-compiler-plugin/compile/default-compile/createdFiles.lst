@@ -1,5 +1,7 @@
 com\labuk\deltaflight\flight\ScanTicket.class
+com\labuk\deltaflight\log\HadoopLogStorage.class
 com\labuk\deltaflight\planner\QueryPlanner.class
+com\labuk\deltaflight\log\LocalNioLogStorage.class
 com\labuk\deltaflight\planner\Predicate$And.class
 com\labuk\deltaflight\log\CommitLogReader.class
 com\labuk\deltaflight\cli\SimpleFilterParser.class
@@ -7,6 +9,7 @@ com\labuk\deltaflight\decode\Int96TimestampCodec.class
 com\labuk\deltaflight\planner\Predicate$Like.class
 com\labuk\deltaflight\flight\query\PredicateCodec.class
 com\labuk\deltaflight\planner\PartitionPruner.class
+com\labuk\deltaflight\log\CheckpointReader.class
 com\labuk\deltaflight\decode\ParquetFooterCache.class
 com\labuk\deltaflight\flight\TicketRegistry.class
 com\labuk\deltaflight\planner\Predicate.class
@@ -29,6 +32,7 @@ com\labuk\deltaflight\flight\DeltaFlightProducer.class
 com\labuk\deltaflight\decode\RowGroupPruner.class
 com\labuk\deltaflight\planner\ComparisonOp.class
 com\labuk\deltaflight\cli\CliArgs.class
+com\labuk\deltaflight\log\LogStorage.class
 com\labuk\deltaflight\decode\ArrowSchemaMapper.class
 com\labuk\deltaflight\planner\PartitionValueSubstituter.class
 com\labuk\deltaflight\planner\Predicate$Or.class

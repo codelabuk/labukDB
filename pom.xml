@@ -60,6 +60,23 @@
       <artifactId>hadoop-client</artifactId>
       <version>${hadoop.version}</version>
     </dependency>
+    <!--
+      Enables s3a:// (S3 and, via endpoint override, MinIO) for
+      HadoopLogStorage and decode/'s HadoopInputFile usage. Marked optional
+      so a consumer who only ever uses local storage isn't forced to pull
+      in the AWS SDK transitively — this project's own build still gets it
+      (Maven includes a module's own optional deps in its own build,
+      "optional" only affects whether it propagates to consumers of this
+      as a dependency). ADLS (abfss://) would need hadoop-azure similarly;
+      not added here since S3/MinIO was the concretely requested target —
+      add it the same way if/when ADLS is actually needed.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <version>${hadoop.version}</version>
+      <optional>true</optional>
+    </dependency>
 
     <dependency>
       <groupId>org.apache.arrow</groupId>

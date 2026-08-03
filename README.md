@@ -308,34 +308,59 @@ hints; not attempted here.
 extra moving part (Ollama itself, plus whichever model you have pulled) on
 top of the usual "needs a real compiler pass" caveat.
 
+## Storage abstraction + checkpoint support — new, high-risk parts flagged honestly
+
+**Storage abstraction — solid, low-risk:**
+- `log/LogStorage` — interface abstracting what `SnapshotManager` needs
+  from the `_delta_log` directory. `LocalNioLogStorage` (unchanged
+  `java.nio.file` behavior) and `HadoopLogStorage` (Hadoop `FileSystem`,
+  S3/MinIO/ADLS-capable given the right connector jar + config) both
+  implement it.
+- `SnapshotManager` gained a second constructor
+  (`org.apache.hadoop.fs.Path` + `Configuration`) alongside the original
+  local one — **purely additive**, the original constructor's behavior is
+  provably unchanged (see `HadoopBackedSnapshotManagerTest`, which asserts
+  both constructors give identical results for the same local directory).
+- `hadoop-aws` added as an optional dependency (S3/MinIO via `s3a://`).
+  ADLS would need `hadoop-azure` added the same way when actually needed.
+- `CommitFileNames`/`CommitLogReader` refactored to be storage-agnostic
+  (String-based, not tied to a specific Path type) — `CommitLogReader.read(Path)`'s
+  behavior is unchanged, existing tests untouched.
+- **Not yet extended to `decode/`** — Parquet *data* file reads still
+  assume a local `java.io.File`. The log/metadata layer is now
+  storage-abstracted; wiring `decode/` the same way is the next step
+  before a genuine end-to-end remote query works.
+
+**Checkpoint support — the highest-risk code in this project, stated
+plainly, not softened:**
+- `log/CheckpointReader` hand-parses a *nested* Parquet schema (structs
+  for add/remove/metaData/protocol, MAP-encoded partitionValues/configuration,
+  LIST-encoded partitionColumns) using parquet-mr's raw `Group` API — field
+  names assumed from the Delta protocol spec and the standard Parquet
+  MAP/LIST 3-level encoding, **never verified against a real
+  Spark-produced checkpoint file**, since none exists in this environment.
+- `CheckpointReaderTest` round-trips against a checkpoint file built with
+  the assumed schema — this proves the `Group`-navigation logic is
+  mechanically correct, **not** that the schema assumption itself is
+  right. If real checkpoint loading fails, that test still passing tells
+  you the bug is in the schema assumption, not the parsing mechanics.
+- Only single-part checkpoints are supported; multi-part checkpoints
+  throw a clear `UnsupportedOperationException` rather than silently
+  reading partial data.
+- `SnapshotManager` now checks for a checkpoint at or below the target
+  version before falling back to full JSON replay from version 0.
+
 ## Next
 
-1. Run this and `mvn test`. The Ollama call now fails with a clear message
-   instead of a raw traceback if the model isn't pulled — check `ollama list`.
-2. Storage abstraction (S3/MinIO/ADLS) and checkpoint support in
-   `SnapshotManager` — grouped first per current sequencing.
-3. Nested/list types in `decode/` (needed for vector embeddings) + Spark
-   ML integration — after storage/checkpoint.
-4. MCP tool wrapper — same client logic as `rag_demo.py`'s query-execution
-   half, exposed as a callable MCP tool instead of a script.
-5. LICENSE file + basic CI — open-source hygiene, deferred but tracked.
+1. Run `mvn test` — this batch has the highest change-to-verification
+   ratio of anything in this project so far. If something breaks, check
+   `CheckpointReaderTest` and `HadoopBackedSnapshotManagerTest` first.
+2. Extend `decode/` to the same `LogStorage`-style abstraction, so a
+   remote table's actual data files (not just its log) can be read.
+3. Nested/list types in `decode/`'s general engine (needed for vector
+   embeddings) — distinct from `CheckpointReader`'s narrow, checkpoint-only
+   nested parsing.
+4. MCP tool wrapper.
+5. LICENSE file + basic CI.
 6. *(stretch)* row-data caching.
 7. *(v2)* streaming subscriptions, distributed/gateway deployment.
-
-1. Run `mvn test`, then try the new CLI subcommands and catalog-name
-   queries (Java and Python) against your real table.
-2. RAG demo — a script that takes a plain-English question, calls a local
-   Ollama model to produce the `FlightQueryRequest` JSON, runs it. Smaller
-   than it sounds: `python/query_demo.py` already IS the manual version of
-   this; the LLM just needs to learn to produce the same JSON.
-3. Checkpoint support in `SnapshotManager` — deferred, but with a real
-   ticking clock once this table crosses the default checkpoint interval.
-4. Nested/list-type support in `decode/` — needed for vector embeddings,
-   scheduled alongside checkpoint support, not technically coupled to it.
-5. Storage abstraction (MinIO/S3/ADLS, not just local filesystem) — see
-   the architecture discussion; a real gap, not yet started, and worth
-   scoping deliberately rather than bolting on.
-6. *(stretch)* row-data caching — today only schema/snapshot metadata is
-   cached, not actual scanned rows.
-7. *(v2)* streaming subscriptions (`DoExchange`), distributed/gateway
-   deployment, load balancing — infra-shaped work, correctly out of v1.

@@ -41,6 +41,18 @@ public class MetadataAction {
     @JsonProperty("createdTime")
     private Long createdTime;
 
+    public MetadataAction() {
+    }
+
+    public MetadataAction(String id, String schemaString, List<String> partitionColumns,
+                           Map<String, String> configuration, Long createdTime) {
+        this.id = id;
+        this.schemaString = schemaString;
+        this.partitionColumns = partitionColumns;
+        this.configuration = configuration;
+        this.createdTime = createdTime;
+    }
+
     public String getId() {
         return id;
     }

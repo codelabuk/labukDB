@@ -27,8 +27,12 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\action\ProtocolAction.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\action\RemoveFile.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\action\SingleAction.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\CheckpointReader.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\CommitFileNames.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\CommitLogReader.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\HadoopLogStorage.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\LocalNioLogStorage.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\LogStorage.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\Snapshot.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\SnapshotManager.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\log\TableCache.java

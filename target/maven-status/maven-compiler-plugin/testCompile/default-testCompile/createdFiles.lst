@@ -1,7 +1,9 @@
 com\labuk\deltaflight\decode\ParquetFooterCacheTest.class
+com\labuk\deltaflight\log\CheckpointReaderTest.class
 com\labuk\deltaflight\decode\ParquetToArrowReaderTest.class
 com\labuk\deltaflight\catalog\TableCatalogTest.class
 com\labuk\deltaflight\decode\Int96TimestampCodecTest.class
+com\labuk\deltaflight\log\HadoopBackedSnapshotManagerTest.class
 com\labuk\deltaflight\log\CommitLogReaderTest.class
 com\labuk\deltaflight\planner\PrunerTest.class
 com\labuk\deltaflight\flight\query\PredicateCodecTest.class

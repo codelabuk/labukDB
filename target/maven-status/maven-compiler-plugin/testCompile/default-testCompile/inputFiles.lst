@@ -4,7 +4,9 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\decode\ParquetToArrowReaderTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\flight\FlightIntegrationTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\flight\query\PredicateCodecTest.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\CheckpointReaderTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\CommitLogReaderTest.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\HadoopBackedSnapshotManagerTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\SnapshotManagerTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\log\TableCacheTest.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\test\java\com\labuk\deltaflight\planner\PartitionValueSubstituterTest.java

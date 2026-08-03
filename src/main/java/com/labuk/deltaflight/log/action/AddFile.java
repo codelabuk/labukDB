@@ -35,6 +35,21 @@ public class AddFile {
     @JsonProperty("stats")
     private String stats;
 
+    /** No-arg — used by Jackson for JSON deserialization. */
+    public AddFile() {
+    }
+
+    /** Used by {@code CheckpointReader} to build an instance from a decoded Parquet checkpoint row, not JSON. */
+    public AddFile(String path, Map<String, String> partitionValues, long size,
+                    long modificationTime, boolean dataChange, String stats) {
+        this.path = path;
+        this.partitionValues = partitionValues;
+        this.size = size;
+        this.modificationTime = modificationTime;
+        this.dataChange = dataChange;
+        this.stats = stats;
+    }
+
     public String getPath() {
         return path;
     }
