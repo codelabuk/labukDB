@@ -34,13 +34,23 @@ public final class TableCache {
 
     /** Dispatches local vs. remote via {@link SnapshotManager#forLocation}. */
     public SnapshotManager forTable(TableLocation location) {
-        return managers.computeIfAbsent(key(location), k -> {
-            try {
-                return SnapshotManager.forLocation(location);
-            } catch (IOException e) {
-                throw new UncheckedIOException("Failed to open table at " + location, e);
-            }
-        });
+        String key = key(location);
+        SnapshotManager existing = managers.get(key);
+        if (existing != null) {
+            return existing;
+        }
+        // Not using computeIfAbsent here deliberately: if the SnapshotManager
+        // constructor throws (e.g. no MinIO reachable), computeIfAbsent leaves
+        // a null mapped to the key in some JDK versions, meaning a subsequent
+        // call for the same location would find the dead entry and fail again
+        // without retrying. Build first, then put only if it succeeds.
+        try {
+            SnapshotManager manager = SnapshotManager.forLocation(location);
+            SnapshotManager raced = managers.putIfAbsent(key, manager);
+            return raced != null ? raced : manager;
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to open table at " + location, e);
+        }
     }
 
     /** Convenience for local-only callers - same behavior as before TableLocation existed. */

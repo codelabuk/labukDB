@@ -24,6 +24,7 @@ com\labuk\deltaflight\flight\DeltaFlightServerApp.class
 com\labuk\deltaflight\log\action\SingleAction.class
 com\labuk\deltaflight\planner\Predicate$In.class
 com\labuk\deltaflight\log\action\CommitInfoAction.class
+com\labuk\deltaflight\storage\TableLocation.class
 com\labuk\deltaflight\log\Snapshot.class
 com\labuk\deltaflight\flight\query\FlightQueryRequest.class
 com\labuk\deltaflight\log\action\AddFile.class
@@ -44,6 +45,7 @@ com\labuk\deltaflight\cli\QueryCommand.class
 com\labuk\deltaflight\log\action\MetadataAction.class
 com\labuk\deltaflight\cli\TableResolver.class
 com\labuk\deltaflight\cli\DeltaCli.class
+com\labuk\deltaflight\storage\MinioConfiguration.class
 com\labuk\deltaflight\planner\PredicateEvaluation$1.class
 com\labuk\deltaflight\decode\CellAppender.class
 com\labuk\deltaflight\planner\FileStatsPruner.class
