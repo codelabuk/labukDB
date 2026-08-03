@@ -1,5 +1,6 @@
 com\labuk\deltaflight\flight\ScanTicket.class
 com\labuk\deltaflight\log\HadoopLogStorage.class
+com\labuk\deltaflight\decode\ParquetInputFiles.class
 com\labuk\deltaflight\planner\QueryPlanner.class
 com\labuk\deltaflight\log\LocalNioLogStorage.class
 com\labuk\deltaflight\planner\Predicate$And.class

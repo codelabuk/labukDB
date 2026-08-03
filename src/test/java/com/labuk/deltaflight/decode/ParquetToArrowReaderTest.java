@@ -179,4 +179,30 @@ class ParquetToArrowReaderTest {
         assertThrows(IllegalArgumentException.class, () ->
                 new ParquetToArrowReader().read(file, allocator, List.of("does_not_exist"), null, Map.of()));
     }
+
+    @Test
+    void inputFileBasedPath_matchesFileBasedPath_forTheSameFile(@TempDir Path tempDir) throws Exception {
+        // Proves the storage-abstracted core (InputFile) produces identical
+        // results to the original File-based path, for the same
+        // underlying file — the decode-layer equivalent of
+        // HadoopBackedSnapshotManagerTest's local-equivalence check. Does
+        // NOT prove real S3/MinIO/ADLS works — there's no real endpoint to
+        // test against here.
+        File file = writeSampleFile(tempDir);
+        Predicate predicate = Predicate.compare("amount", ComparisonOp.GT, 15L);
+
+        try (VectorSchemaRoot viaFile = new ParquetToArrowReader().read(file, allocator, null, predicate);
+             VectorSchemaRoot viaInputFile = new ParquetToArrowReader().read(
+                     ParquetInputFiles.local(file), allocator, null, predicate, Map.of())) {
+
+            assertEquals(viaFile.getRowCount(), viaInputFile.getRowCount());
+            assertEquals(viaFile.getSchema(), viaInputFile.getSchema());
+
+            BigIntVector fileAmounts = (BigIntVector) viaFile.getVector("amount");
+            BigIntVector inputFileAmounts = (BigIntVector) viaInputFile.getVector("amount");
+            for (int i = 0; i < viaFile.getRowCount(); i++) {
+                assertEquals(fileAmounts.get(i), inputFileAmounts.get(i));
+            }
+        }
+    }
 }

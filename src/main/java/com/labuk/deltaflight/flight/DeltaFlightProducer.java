@@ -83,11 +83,21 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * falls back to the raw {@code tableRoot} path — the original form,
      * still fully supported, not deprecated by this.
      */
+    /**
+     * Resolves {@code table} (a catalog name) first if present, otherwise
+     * falls back to the raw {@code tableRoot} path.
+     *
+     * <b>Interim limitation:</b> always returns a local {@code java.nio.file.Path}.
+     * {@code TableCatalog} can now correctly store a remote URI, but
+     * nothing here dispatches to the Hadoop-backed engine for one yet —
+     * next integration step, not done here.
+     */
     private Path resolveTableRoot(FlightQueryRequest query) {
         if (query.getTable() != null) {
-            return catalog.resolve(query.getTable())
+            String location = catalog.resolve(query.getTable())
                     .orElseThrow(() -> new IllegalArgumentException(
                             "No table registered in the catalog under the name '" + query.getTable() + "'"));
+            return Paths.get(location);
         }
         if (query.getTableRoot() != null) {
             return Paths.get(query.getTableRoot());

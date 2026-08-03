@@ -11,13 +11,32 @@ import static org.junit.jupiter.api.Assertions.*;
 class TableCatalogTest {
 
     @Test
-    void registerThenResolve_returnsAbsoluteNormalizedPath(@TempDir Path tempDir) {
+    void registerThenResolve_normalizesLocalPathToAbsolute(@TempDir Path tempDir) {
         TableCatalog catalog = new TableCatalog(tempDir.resolve("catalog.json"));
-        catalog.register("logs", Path.of("some-relative-table"));
+        catalog.register("logs", "some-relative-table");
 
-        Optional<Path> resolved = catalog.resolve("logs");
+        Optional<String> resolved = catalog.resolve("logs");
         assertTrue(resolved.isPresent());
-        assertTrue(resolved.get().isAbsolute());
+        assertTrue(Path.of(resolved.get()).isAbsolute());
+    }
+
+    @Test
+    void registerThenResolve_remoteUri_isLeftUntouched(@TempDir Path tempDir) {
+        TableCatalog catalog = new TableCatalog(tempDir.resolve("catalog.json"));
+        String uri = "s3a://some-bucket/some-table";
+        catalog.register("logs", uri);
+
+        assertEquals(uri, catalog.resolve("logs").orElseThrow(),
+                "a remote URI must be stored exactly as given, not mangled through local-path normalization");
+    }
+
+    @Test
+    void isRemoteUri_detectsSchemesCorrectly() {
+        assertTrue(TableCatalog.isRemoteUri("s3a://bucket/table"));
+        assertTrue(TableCatalog.isRemoteUri("abfss://container@account.dfs.core.windows.net/table"));
+        assertFalse(TableCatalog.isRemoteUri("D:\\repo\\lakehouse\\logs_delta"));
+        assertFalse(TableCatalog.isRemoteUri("/home/user/lakehouse/logs"));
+        assertFalse(TableCatalog.isRemoteUri("some-relative-table"));
     }
 
     @Test
@@ -29,8 +48,8 @@ class TableCatalogTest {
     @Test
     void listAll_returnsEverythingRegistered(@TempDir Path tempDir) {
         TableCatalog catalog = new TableCatalog(tempDir.resolve("catalog.json"));
-        catalog.register("logs", Path.of("table-a"));
-        catalog.register("metrics", Path.of("table-b"));
+        catalog.register("logs", "table-a");
+        catalog.register("metrics", "table-b");
 
         assertEquals(2, catalog.listAll().size());
         assertTrue(catalog.listAll().containsKey("logs"));
@@ -40,7 +59,7 @@ class TableCatalogTest {
     @Test
     void unregister_removesTheEntry(@TempDir Path tempDir) {
         TableCatalog catalog = new TableCatalog(tempDir.resolve("catalog.json"));
-        catalog.register("logs", Path.of("table-a"));
+        catalog.register("logs", "table-a");
 
         assertTrue(catalog.unregister("logs"));
         assertTrue(catalog.resolve("logs").isEmpty());
@@ -57,7 +76,7 @@ class TableCatalogTest {
         Path catalogFile = tempDir.resolve("catalog.json");
 
         TableCatalog first = new TableCatalog(catalogFile);
-        first.register("logs", Path.of("table-a"));
+        first.register("logs", "table-a");
 
         TableCatalog second = new TableCatalog(catalogFile);
         assertTrue(second.resolve("logs").isPresent(),

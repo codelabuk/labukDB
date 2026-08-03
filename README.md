@@ -350,17 +350,29 @@ plainly, not softened:**
 - `SnapshotManager` now checks for a checkpoint at or below the target
   version before falling back to full JSON replay from version 0.
 
-## Next
+## Next — v1 close-out
 
-1. Run `mvn test` — this batch has the highest change-to-verification
-   ratio of anything in this project so far. If something breaks, check
-   `CheckpointReaderTest` and `HadoopBackedSnapshotManagerTest` first.
-2. Extend `decode/` to the same `LogStorage`-style abstraction, so a
-   remote table's actual data files (not just its log) can be read.
-3. Nested/list types in `decode/`'s general engine (needed for vector
-   embeddings) — distinct from `CheckpointReader`'s narrow, checkpoint-only
-   nested parsing.
-4. MCP tool wrapper.
-5. LICENSE file + basic CI.
+1. Run `mvn test` — this batch touches `TableCatalog`'s public API (Path →
+   String) and every caller of it (CLI commands, `DeltaFlightProducer`,
+   two test files), on top of the still-unverified checkpoint support and
+   decode-layer storage abstraction from the prior round. Real surface.
+2. Wire `DeltaFlightProducer`/CLI to actually dispatch to remote storage
+   based on a resolved location's URI scheme (`TableCatalog.isRemoteUri`
+   now exists specifically to support this) — the engine is remote-capable
+   at both the log and decode layer; nothing yet automatically chooses
+   that path over local resolution. This is the last piece needed for
+   genuine end-to-end S3/MinIO/ADLS querying.
+3. Nested/list types in `decode/`'s general engine (vector embeddings).
+
+**Moved to v2, explicitly:** MCP tool wrapper (was next; the
+lakehouse-gateway direction below is the higher-priority v2 target now),
+streaming subscriptions, distributed/gateway deployment.
+
+**v2 target, stated as direction not commitment:** a lakehouse gateway —
+one Flight interface across Delta, Iceberg, and Parquet, with AI/LLM
+support as a first-class part of the design rather than bolted on after.
+Not started; this project's own Delta engine plus the reasoning already
+proven out in `rag_demo.py` are the two pieces such a gateway would
+combine, not a rewrite of either.
 6. *(stretch)* row-data caching.
 7. *(v2)* streaming subscriptions, distributed/gateway deployment.

@@ -203,7 +203,7 @@ class FlightIntegrationTest {
         writePartitionFile(tableRoot.resolve("level=INFO"), "INFO", 100, 1);
         writeCommitLog(tableRoot); // references both partitions, so both files must exist first
 
-        catalog.register("logs", tableRoot);
+        catalog.register("logs", tableRoot.toString());
 
         String queryJson = "{\"table\":\"logs\",\"predicate\":"
                 + "{\"type\":\"cmp\",\"column\":\"level\",\"op\":\"EQ\",\"literal\":\"ERROR\",\"literalType\":\"string\"}}";
@@ -227,8 +227,8 @@ class FlightIntegrationTest {
 
     @Test
     void listFlights_returnsRegisteredCatalogEntries() throws Exception {
-        catalog.register("alpha", Path.of("some-table-a"));
-        catalog.register("beta", Path.of("some-table-b"));
+        catalog.register("alpha", "some-table-a");
+        catalog.register("beta", "some-table-b");
 
         Iterable<FlightInfo> listing = client.listFlights(org.apache.arrow.flight.Criteria.ALL);
         List<String> names = new ArrayList<>();
