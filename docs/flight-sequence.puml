@@ -1,0 +1,115 @@
+@startuml lakehouse-flight-v1-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam sequenceMessageAlign center
+skinparam roundCorner 8
+skinparam shadowing false
+
+skinparam participant {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam actor {
+  BorderColor #993C1D
+  BackgroundColor #FAECE7
+  FontColor #4A1B0C
+}
+
+title Arrow Flight — Query Round Trip
+
+actor       "Client\n(Python / Java / Go / RAG)" as C
+participant "DeltaFlightProducer"                 as DFP
+participant "TableLocation"                        as TL
+participant "TableCache → SnapshotManager"         as SM
+participant "QueryPlanner"                         as QP
+participant "TicketRegistry"                       as TR
+participant "ParquetToArrowReader"                 as PTAR
+
+== Phase 1 — GetFlightInfo (planning, no files opened yet) ==
+
+C   -> DFP  : GetFlightInfo(\n  FlightDescriptor.command(\n    FlightQueryRequest JSON\n  )\n)
+note right of C
+  {
+    "table": "logs",          ← catalog name OR
+    "tableRoot": "s3a://...", ← raw path/URI
+    "predicate": { ... },
+    "columns": ["level", "message"],
+    "version": null           ← null = latest
+  }
+end note
+
+DFP -> TL   : fromString(location)\ndetects local vs remote URI
+TL  --> DFP : TableLocation (carries Hadoop conf if remote)
+
+DFP -> SM   : TableCache.forTable(location)\n→ SnapshotManager.forLocation()
+SM  --> DFP : Snapshot\n(live file set at requested version)
+note right of SM
+  Reads _delta_log/:
+  1. find latest checkpoint ≤ version
+  2. load checkpoint (if any) as baseline
+  3. replay JSON commits from checkpoint to version
+  Incremental: cache keeps running state,
+  applies only new commits on next call
+end note
+
+DFP -> QP   : plan(snapshot, predicate, columns)
+
+group Pruning (cheapest first, no file opened)
+  QP  -> QP  : ① PartitionPruner\n   exact match on partition values from log
+  QP  -> QP  : ② FileStatsPruner\n   range check on add.stats min/max from log
+end
+
+QP  --> DFP : ScanPlan (surviving files only)
+
+loop for each surviving file
+  DFP -> DFP  : PartitionValueSubstituter\n  fold partition predicates to constants\n  (level='ERROR' AND amount>2 → amount>2)
+  DFP -> TR   : register(ScanTicket)\n  carries: dataFile, columns, residual predicate, partitionValues
+  TR  --> DFP : opaque ticket id (UUID)
+end
+
+DFP --> C   : FlightInfo\n  schema + [FlightEndpoint per file]
+note left of C
+  Client receives N endpoints.
+  Can fetch them in parallel
+  across N connections.
+end note
+
+== Phase 2 — DoGet (one call per endpoint, can be parallel) ==
+
+C   -> DFP  : DoGet(ticket)
+
+DFP -> TR   : lookup(ticketId) → ScanTicket
+TR  --> DFP : ScanTicket
+
+DFP -> PTAR : read(dataFile, allocator,\n  projectedColumns,\n  residualPredicate,\n  partitionValues)
+
+group Decode (file is now opened)
+  PTAR -> PTAR : open Parquet file via ParquetInputFiles\n  (local File or Hadoop InputFile)
+  PTAR -> PTAR : read footer only
+  PTAR -> PTAR : ③ RowGroupPruner\n   range check on Parquet footer stats\n   → skipNextRowGroup() for pruned ones
+  loop for each surviving row group
+    PTAR -> PTAR : decode projected columns only\n  (unrequested column bytes never read)
+    PTAR -> PTAR : ④ GroupPredicateEvaluator\n   per-row residual filter\n   (rows that fail never enter Arrow vector)
+    PTAR -> PTAR : PartitionValueAppender\n   fill partition columns as constants\n   (level, log_date — not in physical file)
+    PTAR -> PTAR : Int96TimestampCodec\n   INT96 → Instant (UTC, no rebasing)
+  end
+end
+
+PTAR --> DFP : VectorSchemaRoot
+
+DFP --> C   : Arrow IPC stream\n(zero-copy — Flight wire format IS Arrow IPC,\nno re-serialization)
+
+DFP -> TR   : invalidate(ticketId)
+
+note over C, DFP
+  Total pruning levels: 4
+  ① partition values — from log, no I/O
+  ② file stats min/max — from log, no I/O
+  ③ row-group stats — Parquet footer only
+  ④ per-row residual — fused with decode
+end note
+
+@enduml

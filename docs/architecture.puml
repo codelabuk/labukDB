@@ -1,0 +1,169 @@
+@startuml lakehouse-flight-v1-architecture
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam roundCorner 10
+skinparam shadowing false
+
+skinparam rectangle {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+skinparam component {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam database {
+  BorderColor #0F6E56
+  BackgroundColor #E1F5EE
+  FontColor #04342C
+}
+skinparam actor {
+  BorderColor #993C1D
+  BackgroundColor #FAECE7
+  FontColor #4A1B0C
+}
+skinparam note {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+
+title lakehouse-flight v1 — System Architecture
+
+' ─── WRITERS ───────────────────────────────────────────
+package "Writers (upstream, not part of this project)" #F1EFE8 {
+  [Spark batch]       as SB  #D3D1C7
+  [Spark streaming]   as SS  #D3D1C7
+  [Flink]             as FL  #D3D1C7
+}
+
+' ─── STORAGE ────────────────────────────────────────────
+database "Delta table" as DT #9FE1CB {
+  [_delta_log/\n(JSON commits + checkpoints)] as LOG
+  [Parquet data files\n(Hive-partitioned)]    as PAR
+}
+
+note bottom of DT
+  Supported storage backends:
+  local disk · MinIO (s3a://) · S3 · ADLS (abfss://)
+end note
+
+SB  --> DT : commits add/remove actions
+SS  --> DT : one commit per micro-batch
+FL  --> DT : commits add/remove actions
+
+' ─── ENGINE ─────────────────────────────────────────────
+package "lakehouse-flight engine" #EEEDFE {
+
+  package "Layer 1 — log/" #EEEDFE {
+    [CommitLogReader]   as CLR
+    [CheckpointReader]  as CPR
+    [SnapshotManager\n(incremental cache)] as SM
+    [TableCache\n(one SM per table)] as TC
+    [LocalNioLogStorage] as LNS
+    [HadoopLogStorage\n(S3/MinIO/ADLS)] as HLS
+  }
+
+  package "Layer 2 — planner/" #EEEDFE {
+    [PartitionPruner\n(log partition values)] as PP
+    [FileStatsPruner\n(add.stats min/max)]    as FSP
+    [QueryPlanner]      as QP
+    [PartitionValueSubstituter] as PVS
+    note right of PP
+      Filters: = != < <= > >=
+      IN · LIKE · AND · OR
+      timestamp literals (Instant)
+    end note
+  }
+
+  package "Layer 3 — decode/" as D3 #EEEDFE {
+    [ParquetToArrowReader] as PTAR
+    [RowGroupPruner\n(Parquet footer stats)] as RGP
+    [GroupPredicateEvaluator\n(per-row residual)] as GPE
+    [PartitionValueAppender\n(constant columns)] as PVA
+    [Int96TimestampCodec] as ITC
+    [ParquetInputFiles\n(local or Hadoop)] as PIF
+    [ParquetFooterCache] as PFC
+  }
+
+  package "Layer 4 — flight/" #EEEDFE {
+    [DeltaFlightProducer] as DFP
+    [TicketRegistry\n(opaque ticket → ScanTicket)] as TR
+    [DeltaFlightServerApp\n(port 9443)] as DFSA
+  }
+
+  package "storage/" #EEEDFE {
+    [TableLocation\n(local vs remote)] as TL
+    [MinioConfiguration\n(s3a:// settings)] as MC
+  }
+
+  package "catalog/" #EEEDFE {
+    [TableCatalog\n(~/.delta-flight-engine/catalog.json)] as CAT
+  }
+
+  package "cli/" #EEEDFE {
+    [DeltaCli\n(catalog / describe / query)] as CLI
+    [TableResolver] as TR2
+  }
+
+}
+
+' ─── LAYER WIRING ────────────────────────────────────────
+DT  --> CLR  : JSON-lines commit files
+DT  --> CPR  : .checkpoint.parquet
+
+CLR --> SM
+CPR --> SM
+SM  --> TC
+TC  --> LNS  : local path
+TC  --> HLS  : s3a:// / abfss://
+LNS --> LOG
+HLS --> LOG
+
+SM  --> QP   : Snapshot (live file set)
+QP  --> PP
+QP  --> FSP
+PP  --> QP
+FSP --> QP   : ScanPlan (surviving files)
+
+QP  --> PVS  : fold partition predicates per file
+
+DFP --> TC
+DFP --> QP
+DFP --> PTAR
+DFP --> TR
+DFP --> CAT
+DFP --> TL
+
+PTAR --> RGP
+PTAR --> GPE
+PTAR --> PVA
+PTAR --> ITC
+PTAR --> PIF
+PTAR --> PFC
+
+TL  --> MC   : remote config
+
+CLI --> TR2
+TR2 --> CAT
+TR2 --> TL
+CLI --> SM   : direct (in-process, no server)
+CLI --> PTAR : direct (in-process, no server)
+
+' ─── CLIENTS ─────────────────────────────────────────────
+actor "Python client\n(pyarrow.flight)" as PY  #FAECE7
+actor "Java client\n(arrow-flight-core)" as JV #FAECE7
+actor "RAG / LLM\n(rag_demo.py + Ollama)" as RAG #FAECE7
+actor "Other clients\n(Go · Rust · JS)" as OTH #FAECE7
+
+PY  --> DFSA : GetFlightInfo + DoGet\n(Arrow IPC over gRPC)
+JV  --> DFSA
+RAG --> DFSA
+OTH --> DFSA
+DFSA --> DFP
+
+@enduml
