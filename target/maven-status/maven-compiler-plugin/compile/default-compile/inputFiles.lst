@@ -45,6 +45,7 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\PredicateEvaluation.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\QueryPlanner.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\planner\ScanPlan.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\storage\AdlsConfiguration.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\storage\MinioConfiguration.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\storage\TableLocation.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\tools\RealTableSmokeCheck.java

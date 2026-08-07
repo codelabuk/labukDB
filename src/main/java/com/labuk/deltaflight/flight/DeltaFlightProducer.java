@@ -13,6 +13,7 @@ import com.labuk.deltaflight.planner.Predicate;
 import com.labuk.deltaflight.planner.PartitionValueSubstituter;
 import com.labuk.deltaflight.planner.QueryPlanner;
 import com.labuk.deltaflight.planner.ScanPlan;
+import com.labuk.deltaflight.storage.AdlsConfiguration;
 import com.labuk.deltaflight.storage.MinioConfiguration;
 import com.labuk.deltaflight.storage.TableLocation;
 import org.apache.arrow.flight.CallStatus;
@@ -70,12 +71,27 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final Configuration storageConf;
 
     public DeltaFlightProducer(BufferAllocator allocator) {
-        this(allocator, TableCatalog.atDefaultLocation(), MinioConfiguration.fromEnvironment());
+        this(allocator, TableCatalog.atDefaultLocation(), mergedStorageConf());
     }
 
     /** Explicit-catalog constructor — mainly for tests that need an isolated catalog file. */
     public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog) {
-        this(allocator, catalog, MinioConfiguration.fromEnvironment());
+        this(allocator, catalog, mergedStorageConf());
+    }
+
+    /**
+     * Merges MinIO and ADLS environment-variable config into one
+     * Configuration so a single server instance can serve tables from
+     * either storage backend without the caller having to pick one.
+     * Explicit settings from either helper win over Hadoop's defaults;
+     * if both set the same key (unlikely — they use distinct prefixes)
+     * MinIO's value wins, since it's iterated last.
+     */
+    private static Configuration mergedStorageConf() {
+        Configuration conf = AdlsConfiguration.fromEnvironment();
+        MinioConfiguration.fromEnvironment().iterator()
+                .forEachRemaining(entry -> conf.set(entry.getKey(), entry.getValue()));
+        return conf;
     }
 
     /**

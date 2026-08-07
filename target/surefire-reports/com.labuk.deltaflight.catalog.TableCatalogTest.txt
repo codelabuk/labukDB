@@ -1,4 +1,4 @@
 -------------------------------------------------------------------------------
 Test set: com.labuk.deltaflight.catalog.TableCatalogTest
 -------------------------------------------------------------------------------
-Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.450 s -- in com.labuk.deltaflight.catalog.TableCatalogTest
+Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.433 s -- in com.labuk.deltaflight.catalog.TableCatalogTest

@@ -77,6 +77,20 @@
       <version>${hadoop.version}</version>
       <optional>true</optional>
     </dependency>
+    <!--
+      Enables abfss:// (Azure Data Lake Storage Gen2) for HadoopLogStorage
+      and ParquetInputFiles usage. Marked optional for the same reason as
+      hadoop-aws — a consumer using only local or S3 storage shouldn't be
+      forced to pull in the Azure SDK transitively.
+      Requires ADLS_STORAGE_ACCOUNT + credentials env vars, or call
+      AdlsConfiguration.forSharedKey() / forServicePrincipal() directly.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-azure</artifactId>
+      <version>${hadoop.version}</version>
+      <optional>true</optional>
+    </dependency>
 
     <dependency>
       <groupId>org.apache.arrow</groupId>

@@ -15,6 +15,7 @@ com\labuk\deltaflight\decode\ParquetFooterCache.class
 com\labuk\deltaflight\flight\TicketRegistry.class
 com\labuk\deltaflight\planner\Predicate.class
 com\labuk\deltaflight\decode\GroupPredicateEvaluator.class
+com\labuk\deltaflight\storage\AdlsConfiguration.class
 com\labuk\deltaflight\log\CommitFileNames.class
 com\labuk\deltaflight\planner\ScanPlan.class
 com\labuk\deltaflight\decode\ParquetToArrowReader.class

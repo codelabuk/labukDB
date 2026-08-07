@@ -322,7 +322,11 @@ top of the usual "needs a real compiler pass" caveat.
   provably unchanged (see `HadoopBackedSnapshotManagerTest`, which asserts
   both constructors give identical results for the same local directory).
 - `hadoop-aws` added as an optional dependency (S3/MinIO via `s3a://`).
-  ADLS would need `hadoop-azure` added the same way when actually needed.
+  `hadoop-azure` added as an optional dependency (ADLS Gen2 via `abfss://`).
+  Both optional so a consumer using only local storage isn't forced to
+  pull in either SDK. `MinioConfiguration` and `AdlsConfiguration`
+  helpers handle the settings that matter for each backend, both
+  readable from environment variables automatically.
 - `CommitFileNames`/`CommitLogReader` refactored to be storage-agnostic
   (String-based, not tied to a specific Path type) — `CommitLogReader.read(Path)`'s
   behavior is unchanged, existing tests untouched.
