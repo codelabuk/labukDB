@@ -47,11 +47,12 @@ OLLAMA_HOST = "http://localhost:11434"
 DEFAULT_MODEL = "qwen2.5-coder"
 
 PREDICATE_GRAMMAR = """Predicate grammar (JSON):
-- Comparison: {"type":"cmp","column":"<col>","op":"EQ|NEQ|LT|LTE|GT|GTE","literal":<value>,"literalType":"string|long|double|timestamp"}
-- IN:         {"type":"in","column":"<col>","literals":[<value>,...],"literalType":"string|long|double"}
+- Comparison: {"type":"cmp","column":"<col>","op":"EQ|NEQ|LT|LTE|GT|GTE","literal":<value>,"literalType":"string|long|double|boolean|timestamp"}
+- IN:         {"type":"in","column":"<col>","literals":[<value>,...],"literalType":"string|long|double|boolean"}
 - LIKE:       {"type":"like","column":"<col>","pattern":"<sql-like-pattern-with-%-or-_>"}
 - AND/OR:     {"type":"and","children":[<predicate>,...]}  or  {"type":"or","children":[...]}
-timestamp literals must be ISO-8601, e.g. "2026-07-17T00:00:00Z"."""
+timestamp literals must be ISO-8601, e.g. "2026-07-17T00:00:00Z".
+boolean literals must use literalType:"boolean" with literal true or false (not the string "true")."""
 
 
 def call_ollama(prompt, model, json_mode=False):

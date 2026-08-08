@@ -85,10 +85,16 @@ public final class PredicateCodec {
                 return literalNode.asLong();
             case "double":
                 return literalNode.asDouble();
+            case "boolean":
+                // LLMs frequently generate the string form "true"/"false"
+                // rather than a real JSON boolean even when told to use
+                // boolean type. Handle both.
+                if (literalNode.isBoolean()) {
+                    return literalNode.asBoolean();
+                }
+                return Boolean.parseBoolean(literalNode.asText().trim().toLowerCase());
             case "timestamp":
-                // ISO-8601, e.g. "2026-07-17T10:00:00Z" — parsed to Instant,
-                // the single representation timestamp columns (INT96) are
-                // compared as throughout this project now.
+                // ISO-8601, e.g. "2026-07-17T10:00:00Z"
                 return java.time.Instant.parse(literalNode.asText());
             case "string":
             default:

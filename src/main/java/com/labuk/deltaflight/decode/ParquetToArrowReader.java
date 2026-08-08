@@ -1,6 +1,7 @@
 package com.labuk.deltaflight.decode;
 
 import com.labuk.deltaflight.planner.Predicate;
+import com.labuk.deltaflight.planner.PredicateColumns;
 import com.labuk.deltaflight.storage.TableLocation;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.FieldVector;
@@ -133,9 +134,31 @@ public final class ParquetToArrowReader {
             MessageType fullSchema = fileReader.getFooter().getFileMetaData().getSchema();
             Set<String> partitionColumnNames = partitionValues.keySet();
 
-            List<String> columns = resolveColumns(projectedColumns, fullSchema, partitionColumnNames);
+            // Output columns — what the caller asked to receive back.
+            List<String> outputColumns = resolveColumns(projectedColumns, fullSchema, partitionColumnNames);
 
-            List<String> physicalColumns = columns.stream()
+            // Physical read set = output columns UNION predicate columns.
+            // This is the fix for the projection-pushdown bug: a predicate
+            // on is_active with output columns [company, title] previously
+            // built a read schema with only company/title, then tried to
+            // evaluate is_active in GroupPredicateEvaluator against a row
+            // where is_active was never decoded — InvalidRecordException.
+            // We read the extra predicate column(s), filter, then drop them
+            // before returning so the output schema still only contains what
+            // the caller asked for.
+            Set<String> predicateColumnNames = PredicateColumns.collect(residualPredicate);
+            List<String> physicalOutputColumns = new ArrayList<>(outputColumns);
+            List<String> predicateOnlyColumns = new ArrayList<>();
+            for (String col : predicateColumnNames) {
+                if (!outputColumns.contains(col)
+                        && !partitionColumnNames.contains(col)
+                        && ArrowSchemaMapper.containsField(fullSchema, col)) {
+                    physicalOutputColumns.add(col);
+                    predicateOnlyColumns.add(col);
+                }
+            }
+
+            List<String> physicalColumns = physicalOutputColumns.stream()
                     .filter(c -> ArrowSchemaMapper.containsField(fullSchema, c))
                     .collect(Collectors.toList());
             List<Type> selectedTypes = fullSchema.getFields().stream()
@@ -143,13 +166,15 @@ public final class ParquetToArrowReader {
                     .collect(Collectors.toList());
             MessageType projectedSchema = new MessageType(fullSchema.getName(), selectedTypes);
 
-            Schema arrowSchema = ArrowSchemaMapper.toArrowSchema(fullSchema, columns, partitionColumnNames);
-            VectorSchemaRoot root = VectorSchemaRoot.create(arrowSchema, allocator);
-            root.allocateNew();
+            // Arrow schema for the internal decode — includes predicate-only
+            // columns so GroupPredicateEvaluator can evaluate them.
+            Schema decodeArrowSchema = ArrowSchemaMapper.toArrowSchema(fullSchema, physicalOutputColumns, partitionColumnNames);
+            VectorSchemaRoot decodeRoot = VectorSchemaRoot.create(decodeArrowSchema, allocator);
+            decodeRoot.allocateNew();
 
             List<CellAppender> appenders = new ArrayList<>();
-            for (String column : columns) {
-                FieldVector vector = root.getVector(column);
+            for (String column : physicalOutputColumns) {
+                FieldVector vector = decodeRoot.getVector(column);
                 if (physicalColumns.contains(column)) {
                     PrimitiveType.PrimitiveTypeName typeName =
                             projectedSchema.getType(column).asPrimitiveType().getPrimitiveTypeName();
@@ -186,8 +211,26 @@ public final class ParquetToArrowReader {
                 }
             }
 
-            root.setRowCount(destRow);
-            return root;
+            decodeRoot.setRowCount(destRow);
+
+            // Drop predicate-only columns from the output so the caller
+            // only sees what they asked for, even though we read more.
+            if (predicateOnlyColumns.isEmpty()) {
+                return decodeRoot;
+            }
+            Schema outputArrowSchema = ArrowSchemaMapper.toArrowSchema(fullSchema, outputColumns, partitionColumnNames);
+            VectorSchemaRoot outputRoot = VectorSchemaRoot.create(outputArrowSchema, allocator);
+            outputRoot.allocateNew();
+            for (String col : outputColumns) {
+                FieldVector src = decodeRoot.getVector(col);
+                FieldVector dst = outputRoot.getVector(col);
+                for (int r = 0; r < destRow; r++) {
+                    dst.copyFromSafe(r, r, src);
+                }
+            }
+            outputRoot.setRowCount(destRow);
+            decodeRoot.close();
+            return outputRoot;
         }
     }
 

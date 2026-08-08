@@ -356,27 +356,70 @@ plainly, not softened:**
 
 ## Next — v1 close-out
 
-1. Run `mvn test` — this batch touches `TableCatalog`'s public API (Path →
-   String) and every caller of it (CLI commands, `DeltaFlightProducer`,
-   two test files), on top of the still-unverified checkpoint support and
-   decode-layer storage abstraction from the prior round. Real surface.
-2. Wire `DeltaFlightProducer`/CLI to actually dispatch to remote storage
-   based on a resolved location's URI scheme (`TableCatalog.isRemoteUri`
-   now exists specifically to support this) — the engine is remote-capable
-   at both the log and decode layer; nothing yet automatically chooses
-   that path over local resolution. This is the last piece needed for
-   genuine end-to-end S3/MinIO/ADLS querying.
-3. Nested/list types in `decode/`'s general engine (vector embeddings).
+1. Run `mvn test` — the ADLS additions (`AdlsConfiguration`, `hadoop-azure`
+   dependency, merged `storageConf` in `DeltaFlightProducer` and
+   `TableResolver`) plus earlier changes all need a real compiler pass.
+2. Verify checkpoint support against a real Spark-produced checkpoint —
+   run the streaming job until the table crosses 10 commits, restart the
+   server cold, query the table.
+3. Push to GitHub as `lakehouse-flight` (Apache 2.0, CI already wired).
 
-**Moved to v2, explicitly:** MCP tool wrapper (was next; the
-lakehouse-gateway direction below is the higher-priority v2 target now),
-streaming subscriptions, distributed/gateway deployment.
+## v2 Roadmap
 
-**v2 target, stated as direction not commitment:** a lakehouse gateway —
-one Flight interface across Delta, Iceberg, and Parquet, with AI/LLM
-support as a first-class part of the design rather than bolted on after.
-Not started; this project's own Delta engine plus the reasoning already
-proven out in `rag_demo.py` are the two pieces such a gateway would
-combine, not a rewrite of either.
-6. *(stretch)* row-data caching.
-7. *(v2)* streaming subscriptions, distributed/gateway deployment.
+### Core engine extensions
+| Item | Notes |
+|---|---|
+| Nested/list type support in `decode/` | Required for vector embeddings |
+| Checkpoint multi-part support | Single-part works; multi-part throws UnsupportedOperationException |
+| Row-data caching (LRU) | Metadata cached today; actual scanned rows not yet |
+| Streaming subscriptions (`DoExchange`) | Push-based freshness, not pull |
+
+### Lakehouse gateway — the primary v2 target
+| Item | Notes |
+|---|---|
+| Iceberg metadata reader | Avro manifest lists/files — different from Delta's JSON log |
+| Multi-format dispatcher | One catalog entry knows its format; `GetFlightInfo` routes accordingly |
+| Parquet-only tables | No transaction log — direct file listing with stats |
+| Single Flight interface across Delta + Iceberg + Parquet | The v2 headline feature |
+
+### AI / LLM
+| Item | Notes |
+|---|---|
+| MCP tool wrapper | `pyarrow.flight` client exposed as an MCP tool — agent says "query the logs table", gets grounded rows back |
+| Catalog semantic descriptions | Store a human-readable description per table so `ListFlights` returns meaning, not just names — "logs: application error/warn/info events, partitioned by date and level" |
+| Case-insensitive filter option | LLM-generated queries often get casing wrong (ERROR vs error) — optional flag per query |
+
+### Observability (Grafana / Prometheus / InfluxDB)
+Three distinct use cases, each real, each independently valuable:
+
+**Grafana as a Flight client (highest value, least new code):**
+Grafana has an Arrow Flight data source plugin. `DeltaFlightServerApp` is
+already a valid Flight server — Grafana can query it directly without any
+changes to this project. The demo: point Grafana at `logs_delta`, build a
+dashboard showing ERROR/WARN rates over time, partitioned by service.
+Your own log data, queried via your own engine, visualized in Grafana.
+No InfluxDB in between. This is the most compelling v2 demo available.
+
+**Prometheus server metrics (standard service observability):**
+Once the server is actually deployed (not just "run on a laptop"), add a
+Micrometer registry to `DeltaFlightProducer` exposing: queries/sec, p95
+latency per query, files-scanned vs files-pruned ratio per query, error
+rate. Prometheus scrapes a `/metrics` endpoint; Grafana dashboards show
+"is pruning actually working in production." Standard Java service
+observability — Micrometer + Prometheus + Grafana is a well-worn path,
+low implementation risk.
+
+**InfluxDB as a writer into Delta (pipeline integration, different scope):**
+If time-series metrics flow into InfluxDB, a Spark/Flink job could write
+them into a Delta table and this engine reads them back. This is a pipeline
+architecture story, not something the engine does natively — worth noting
+as a possible integration but not a core v2 item.
+
+### Infrastructure
+| Item | Notes |
+|---|---|
+| Distributed Flight / load balancing | Multiple server instances; self-describing tickets (remove TicketRegistry's in-memory-only limitation) |
+| Authentication / authorization | Token-based access control on Flight endpoints |
+| Docker / Helm chart | Deployable as a service, not just a JAR |
+| Streaming subscriptions (`DoExchange`) | Live push when new commits land |
+

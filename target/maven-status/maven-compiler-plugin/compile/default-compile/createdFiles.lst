@@ -36,6 +36,7 @@ com\labuk\deltaflight\decode\RowGroupPruner.class
 com\labuk\deltaflight\planner\ComparisonOp.class
 com\labuk\deltaflight\cli\CliArgs.class
 com\labuk\deltaflight\log\LogStorage.class
+com\labuk\deltaflight\planner\PredicateColumns.class
 com\labuk\deltaflight\decode\ArrowSchemaMapper.class
 com\labuk\deltaflight\planner\PartitionValueSubstituter.class
 com\labuk\deltaflight\planner\Predicate$Or.class
