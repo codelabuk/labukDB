@@ -289,12 +289,12 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * any data — used by the NL query validator to build a column
      * whitelist before generating predicates, and by any client that
      * needs to discover table structure cheaply.
-            *
-            * Arrow Flight's {@code GetSchema} RPC is separate from
-            * {@code GetFlightInfo} precisely for this use case: schema discovery
+     *
+     * Arrow Flight's {@code GetSchema} RPC is separate from
+     * {@code GetFlightInfo} precisely for this use case: schema discovery
      * without committing to a full scan plan. {@code NoOpFlightProducer}
      * inherits it as a no-op; this override makes it real.
-            */
+     */
     @Override
     public SchemaResult getSchema(CallContext context, FlightDescriptor descriptor) {
         try {

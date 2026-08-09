@@ -1,6 +1,38 @@
-# delta-flight-engine
+# lakehouse-flight
 
-A Delta Lake table reader built from the transaction log up — no DuckDB,
+[![CI](https://github.com/codelabuk/lakehouse-flight/actions/workflows/ci.yml/badge.svg)](https://github.com/codelabuk/lakehouse-flight/actions)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+**A from-scratch Delta Lake read engine, served over Apache Arrow Flight.**
+
+Reads Delta tables on local disk, MinIO, S3, or ADLS — applies four-level
+predicate pushdown — streams results as Arrow IPC to any client in any
+language. Includes a working local-LLM RAG demo (Ollama).
+
+## What this is
+
+- A **read engine**, not a SQL engine — one operator (scan with pushdown),
+  no joins, no aggregations
+- The only Java Delta reader built from the `_delta_log` up, with no
+  `delta-rs`, `delta-kernel`, or DuckDB in the path — every layer is
+  readable and independently testable
+- A **Flight server** — any language with an Arrow Flight client binding
+  (Python, Java, Go, Rust, JS) connects unmodified
+- An honest implementation with documented limitations, not marketing
+
+## What this is not
+
+- A Spark replacement — different scope entirely
+- A writer — read-only by design; Spark/Flink handle writes
+- A full query engine — use DuckDB or Trino if you need SQL
+
+---
+
+*Copyright 2026 Afzal and lakehouse-flight contributors.
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).*
+
+---
+
 no delta-rs, no Spark in the read path. Exposes results over Arrow Flight.
 
 Companion project to `local-lakehouse-lab`, not part of it: that project is
