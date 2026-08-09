@@ -31,6 +31,18 @@ def main():
     location = f"grpc://{sys.argv[1]}"
     table_root = sys.argv[2]
 
+    # Special mode: --schema only prints the table schema and exits.
+    # Useful for the NL query validator to discover column names.
+    if "--schema" in sys.argv:
+        client = flight.FlightClient(location)
+        descriptor = flight.FlightDescriptor.for_command(
+            json.dumps({"table": table_root}).encode("utf-8"))
+        schema = client.get_schema(descriptor).schema
+        print(f"Schema for '{table_root}':")
+        for field in schema:
+            print(f"  {field.name}: {field.type}")
+        return
+
     query = {"tableRoot": table_root}
     if len(sys.argv) > 3:
         try:

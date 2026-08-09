@@ -110,8 +110,7 @@ def literal_type_hint(arrow_type):
 
 def fetch_schema(client, table):
     descriptor = flight.FlightDescriptor.for_command(json.dumps({"table": table}).encode("utf-8"))
-    info = client.get_flight_info(descriptor)
-    return info.schema
+    return client.get_schema(descriptor).schema
 
 
 def generate_query(question, schema, model):

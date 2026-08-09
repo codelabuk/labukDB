@@ -23,6 +23,7 @@ import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer.StreamListener;
 import org.apache.arrow.flight.NoOpFlightProducer;
+import org.apache.arrow.flight.SchemaResult;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -280,6 +281,46 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                     .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
                     .withCause(e)
                     .toRuntimeException());
+        }
+    }
+
+    /*
+     * Returns the schema for a named table without planning or scanning
+     * any data — used by the NL query validator to build a column
+     * whitelist before generating predicates, and by any client that
+     * needs to discover table structure cheaply.
+            *
+            * Arrow Flight's {@code GetSchema} RPC is separate from
+            * {@code GetFlightInfo} precisely for this use case: schema discovery
+     * without committing to a full scan plan. {@code NoOpFlightProducer}
+     * inherits it as a no-op; this override makes it real.
+            */
+    @Override
+    public SchemaResult getSchema(CallContext context, FlightDescriptor descriptor) {
+        try {
+            FlightQueryRequest query = MAPPER.readValue(descriptor.getCommand(), FlightQueryRequest.class);
+            TableLocation tableRoot = resolveTableRoot(query);
+            SnapshotManager snapshotManager = tableCache.forTable(tableRoot);
+            Snapshot snapshot = snapshotManager.latest();
+
+            if (snapshot.getActiveFiles().isEmpty()) {
+                return new SchemaResult(new Schema(List.of()));
+            }
+
+            AddFile sample = snapshot.getActiveFiles().iterator().next();
+            TableLocation dataFile = tableRoot.resolve(sample.getPath());
+            Schema schema = parquetReader.readSchema(dataFile, null, sample.getPartitionValues());
+            return new SchemaResult(schema);
+        } catch (IOException e) {
+            throw CallStatus.INTERNAL.withDescription("Failed to read schema: " + e.getMessage()).toRuntimeException();
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            throw CallStatus.INVALID_ARGUMENT.withDescription(e.getMessage()).toRuntimeException();
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+            throw CallStatus.INTERNAL
+                    .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
+                    .withCause(e)
+                    .toRuntimeException();
         }
     }
 }

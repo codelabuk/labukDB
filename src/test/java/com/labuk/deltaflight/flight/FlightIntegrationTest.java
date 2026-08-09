@@ -237,4 +237,23 @@ class FlightIntegrationTest {
         assertEquals(2, names.size());
         assertTrue(names.containsAll(List.of("alpha", "beta")));
     }
+
+    @Test
+    void getSchema_returnsTableSchemaWithoutPlanningScan(@TempDir Path tableRoot) throws Exception {
+        writePartitionFile(tableRoot.resolve("level=ERROR"), "ERROR", 1, 3);
+        writePartitionFile(tableRoot.resolve("level=INFO"), "INFO", 100, 1);
+        writeCommitLog(tableRoot);
+        catalog.register("schema-test", tableRoot.toString());
+
+        // GetSchema must return the schema cheaply — no scan, no endpoints.
+        // This is what the NL query validator calls to get a column whitelist.
+        FlightDescriptor descriptor = FlightDescriptor.command(
+                "{\"table\":\"schema-test\"}".getBytes(StandardCharsets.UTF_8));
+        var result = client.getSchema(descriptor);
+
+        assertNotNull(result);
+        assertNotNull(result.getSchema());
+        assertTrue(result.getSchema().getFields().size() >= 2,
+                "schema must contain at least the physical columns (amount, message)");
+    }
 }
