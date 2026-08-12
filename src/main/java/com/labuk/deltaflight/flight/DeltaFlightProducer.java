@@ -252,39 +252,6 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     }
 
     /**
-     * Lists every table registered in the catalog. Deliberately lightweight
-     * compared to {@code GetFlightInfo} — no snapshot resolution, no
-     * pruning, no per-file endpoints. This answers "what tables exist,"
-     * not "here's a plan to scan one." A client still calls
-     * {@code GetFlightInfo} with a {@code table} name afterward to actually
-     * query one.
-     *
-     * {@code criteria} (Flight's filter-by-bytes mechanism for narrowing a
-     * listing) isn't used here — genuinely not needed at catalog sizes this
-     * is meant for; revisit if that stops being true.
-     */
-    @Override
-    public void listFlights(CallContext context, Criteria criteria, StreamListener<FlightInfo> listener) {
-        try {
-            catalog.listAll().forEach((name, tableRoot) -> {
-                FlightDescriptor descriptor = FlightDescriptor.path(name);
-                FlightInfo info = FlightInfo.builder(new Schema(List.of()), descriptor, List.of())
-                        .setRecords(-1)
-                        .setBytes(-1)
-                        .build();
-                listener.onNext(info);
-            });
-            listener.onCompleted();
-        } catch (RuntimeException e) {
-            e.printStackTrace();
-            listener.onError(CallStatus.INTERNAL
-                    .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
-                    .withCause(e)
-                    .toRuntimeException());
-        }
-    }
-
-    /*
      * Returns the schema for a named table without planning or scanning
      * any data — used by the NL query validator to build a column
      * whitelist before generating predicates, and by any client that
@@ -321,6 +288,39 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                     .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
                     .withCause(e)
                     .toRuntimeException();
+        }
+    }
+
+    /**
+     * Deliberately lightweight
+     * compared to {@code GetFlightInfo} — no snapshot resolution, no
+     * pruning, no per-file endpoints. This answers "what tables exist,"
+     * not "here's a plan to scan one." A client still calls
+     * {@code GetFlightInfo} with a {@code table} name afterward to actually
+     * query one.
+     *
+     * {@code criteria} (Flight's filter-by-bytes mechanism for narrowing a
+     * listing) isn't used here — genuinely not needed at catalog sizes this
+     * is meant for; revisit if that stops being true.
+     */
+    @Override
+    public void listFlights(CallContext context, Criteria criteria, StreamListener<FlightInfo> listener) {
+        try {
+            catalog.listAll().forEach((name, tableRoot) -> {
+                FlightDescriptor descriptor = FlightDescriptor.path(name);
+                FlightInfo info = FlightInfo.builder(new Schema(List.of()), descriptor, List.of())
+                        .setRecords(-1)
+                        .setBytes(-1)
+                        .build();
+                listener.onNext(info);
+            });
+            listener.onCompleted();
+        } catch (RuntimeException e) {
+            e.printStackTrace();
+            listener.onError(CallStatus.INTERNAL
+                    .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
+                    .withCause(e)
+                    .toRuntimeException());
         }
     }
 }

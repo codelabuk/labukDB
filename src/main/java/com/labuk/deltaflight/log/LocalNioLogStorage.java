@@ -30,7 +30,7 @@ final class LocalNioLogStorage implements LogStorage {
     public List<String> listCheckpointFileNames() throws IOException {
         try (Stream<Path> stream = Files.list(logDir)) {
             return stream.map(p -> p.getFileName().toString())
-                    .filter(CommitFileNames::isSinglePartCheckpoint)
+                    .filter(CommitFileNames::isAnyCheckpoint)
                     .collect(Collectors.toList());
         }
     }

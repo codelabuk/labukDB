@@ -10,6 +10,7 @@ C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\CellAppender.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\GroupPredicateEvaluator.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\Int96TimestampCodec.java
+C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\NestedTypeDecoder.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ParquetFooterCache.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ParquetInputFiles.java
 C:\Users\Admin\Downloads\delta-flight-engine\src\main\java\com\labuk\deltaflight\decode\ParquetToArrowReader.java

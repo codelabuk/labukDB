@@ -14,6 +14,7 @@ com\labuk\deltaflight\log\CheckpointReader.class
 com\labuk\deltaflight\decode\ParquetFooterCache.class
 com\labuk\deltaflight\flight\TicketRegistry.class
 com\labuk\deltaflight\planner\Predicate.class
+com\labuk\deltaflight\decode\NestedTypeDecoder$1.class
 com\labuk\deltaflight\decode\GroupPredicateEvaluator.class
 com\labuk\deltaflight\storage\AdlsConfiguration.class
 com\labuk\deltaflight\log\CommitFileNames.class
@@ -51,6 +52,7 @@ com\labuk\deltaflight\storage\MinioConfiguration.class
 com\labuk\deltaflight\planner\PredicateEvaluation$1.class
 com\labuk\deltaflight\decode\CellAppender.class
 com\labuk\deltaflight\planner\FileStatsPruner.class
+com\labuk\deltaflight\decode\NestedTypeDecoder.class
 com\labuk\deltaflight\decode\RowAppender$1.class
 com\labuk\deltaflight\log\action\ProtocolAction.class
 com\labuk\deltaflight\catalog\TableCatalog.class

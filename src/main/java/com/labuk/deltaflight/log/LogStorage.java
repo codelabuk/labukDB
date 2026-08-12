@@ -29,7 +29,7 @@ interface LogStorage {
     /** Filenames only (not full paths), already filtered to the {@code NNNN...N.json} commit pattern. */
     List<String> listCommitFileNames() throws IOException;
 
-    /** Filenames only, already filtered to the single-part {@code NNNN...N.checkpoint.parquet} pattern. */
+    /** Filenames only, already filtered to ANY checkpoint file (single or multi-part). */
     List<String> listCheckpointFileNames() throws IOException;
 
     BufferedReader openReader(String fileName) throws IOException;

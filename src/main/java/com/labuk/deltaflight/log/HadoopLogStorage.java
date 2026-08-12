@@ -50,7 +50,7 @@ final class HadoopLogStorage implements LogStorage {
 
     @Override
     public List<String> listCheckpointFileNames() throws IOException {
-        return listMatching(CommitFileNames::isSinglePartCheckpoint);
+        return listMatching(CommitFileNames::isAnyCheckpoint);
     }
 
     private List<String> listMatching(java.util.function.Predicate<String> filter) throws IOException {

@@ -226,19 +226,6 @@ class FlightIntegrationTest {
     }
 
     @Test
-    void listFlights_returnsRegisteredCatalogEntries() throws Exception {
-        catalog.register("alpha", "some-table-a");
-        catalog.register("beta", "some-table-b");
-
-        Iterable<FlightInfo> listing = client.listFlights(org.apache.arrow.flight.Criteria.ALL);
-        List<String> names = new ArrayList<>();
-        listing.forEach(info -> names.add(info.getDescriptor().getPath().get(0)));
-
-        assertEquals(2, names.size());
-        assertTrue(names.containsAll(List.of("alpha", "beta")));
-    }
-
-    @Test
     void getSchema_returnsTableSchemaWithoutPlanningScan(@TempDir Path tableRoot) throws Exception {
         writePartitionFile(tableRoot.resolve("level=ERROR"), "ERROR", 1, 3);
         writePartitionFile(tableRoot.resolve("level=INFO"), "INFO", 100, 1);
@@ -255,5 +242,18 @@ class FlightIntegrationTest {
         assertNotNull(result.getSchema());
         assertTrue(result.getSchema().getFields().size() >= 2,
                 "schema must contain at least the physical columns (amount, message)");
+    }
+
+    @Test
+    void listFlights_returnsRegisteredCatalogEntries() throws Exception {
+        catalog.register("alpha", "some-table-a");
+        catalog.register("beta", "some-table-b");
+
+        Iterable<FlightInfo> listing = client.listFlights(org.apache.arrow.flight.Criteria.ALL);
+        List<String> names = new ArrayList<>();
+        listing.forEach(info -> names.add(info.getDescriptor().getPath().get(0)));
+
+        assertEquals(2, names.size());
+        assertTrue(names.containsAll(List.of("alpha", "beta")));
     }
 }

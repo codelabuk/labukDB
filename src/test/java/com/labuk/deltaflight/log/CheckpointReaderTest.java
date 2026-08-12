@@ -146,9 +146,40 @@ class CheckpointReaderTest {
     }
 
     @Test
-    void multiPartCheckpoint_throwsRatherThanSilentlyReadingPartialData() {
-        LogStorage storage = new LocalNioLogStorage(Path.of("irrelevant"));
-        assertThrows(UnsupportedOperationException.class, () ->
-                new CheckpointReader().read(storage, "00000000000000000005.checkpoint.0000000001.0000000003.parquet"));
+    void multiPartCheckpointFile_parsesWithSameLogicAsSinglePart(@TempDir Path tempDir) throws Exception {
+        // Multi-part checkpoint files use the identical Parquet schema as
+        // single-part ones — the difference is only in how many files
+        // SnapshotManager calls read() with. Write a single file with a
+        // multi-part filename and verify it parses correctly.
+        MessageType schema = MessageTypeParser.parseMessageType(CHECKPOINT_SCHEMA);
+        String multiPartName = "00000000000000000005.checkpoint.0000000001.0000000002.parquet";
+        Path file = tempDir.resolve(multiPartName);
+
+        Configuration conf = new Configuration();
+        GroupWriteSupport.setSchema(schema, conf);
+        org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(file.toString());
+
+        try (ParquetWriter<Group> writer = ExampleParquetWriter.builder(hadoopPath)
+                .withConf(conf).withType(schema).withCompressionCodec(CompressionCodecName.SNAPPY).build()) {
+            SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+            Group addRow = factory.newGroup();
+            Group add = addRow.addGroup("add");
+            add.append("path", "level=WARN/part-0.parquet");
+            Group pv = add.addGroup("partitionValues");
+            Group pvEntry = pv.addGroup("key_value");
+            pvEntry.append("key", "level");
+            pvEntry.append("value", "WARN");
+            add.append("size", 100L);
+            add.append("modificationTime", 1732000000000L);
+            add.append("dataChange", false);
+            writer.write(addRow);
+        }
+
+        LogStorage storage = new LocalNioLogStorage(tempDir);
+        List<SingleAction> actions = new CheckpointReader().read(storage, multiPartName);
+
+        assertEquals(1, actions.size());
+        assertNotNull(actions.get(0).getAdd());
+        assertEquals("level=WARN/part-0.parquet", actions.get(0).getAdd().getPath());
     }
 }

@@ -153,26 +153,80 @@ public class SnapshotManager {
     }
 
     /**
-     * Finds the highest single-part checkpoint at or below
-     * {@code upToVersion} and, if one exists, loads it as the cache's
-     * starting point instead of leaving the cache at -1 (which would mean
-     * "replay from version 0"). Only {@code add}/{@code metaData}/
-     * {@code protocol} rows are consumed - a checkpoint's own live-file
-     * set already has removes resolved away by whatever wrote it, so
-     * there's nothing to apply from any {@code remove} rows it might also
-     * contain (present in newer Delta versions for VACUUM bookkeeping,
-     * irrelevant to reconstructing the live set).
+     * Finds the highest checkpoint at or below {@code upToVersion} and loads
+     * it as the cache baseline. Supports both single-part and multi-part
+     * checkpoints.
+     *
+     * Multi-part checkpoints (e.g.
+     * {@code 00000000000000000010.checkpoint.0000000001.0000000003.parquet},
+     * {@code 00000000000000000010.checkpoint.0000000002.0000000003.parquet},
+     * {@code 00000000000000000010.checkpoint.0000000003.0000000003.parquet})
+     * are read in part-number order and merged — each part is a subset of the
+     * full live file set, and together they reconstruct the same state a
+     * single-part checkpoint would. Missing a part would silently produce an
+     * incomplete live set, so this throws if any part is missing rather than
+     * silently reading a partial checkpoint.
      */
     private void loadFromCheckpointIfAvailable(long upToVersion) {
-        Optional<Long> checkpointVersion = findLatestCheckpointVersionAtOrBelow(upToVersion);
-        if (checkpointVersion.isEmpty()) {
-            return; // cache stays at -1; normal from-scratch JSON replay proceeds
+        List<String> allCheckpointFiles;
+        try {
+            allCheckpointFiles = storage.listCheckpointFileNames();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to list checkpoint files in " + storage.describe(), e);
         }
 
-        String fileName = CommitFileNames.jsonFileName(checkpointVersion.get())
-                .replace(".json", ".checkpoint.parquet");
-        List<SingleAction> actions = checkpointReader.read(storage, fileName);
+        Optional<Long> checkpointVersion = allCheckpointFiles.stream()
+                .map(CommitFileNames::parseCheckpointVersion)
+                .filter(v -> v <= upToVersion)
+                .max(Long::compareTo);
 
+        if (checkpointVersion.isEmpty()) {
+            return;
+        }
+
+        long version = checkpointVersion.get();
+        List<String> parts = allCheckpointFiles.stream()
+                .filter(f -> CommitFileNames.parseCheckpointVersion(f) == version)
+                .sorted()
+                .collect(java.util.stream.Collectors.toList());
+
+        boolean isMultiPart = parts.size() > 1
+                || (parts.size() == 1 && CommitFileNames.isMultiPartCheckpoint(parts.get(0)));
+
+        if (isMultiPart) {
+            loadMultiPartCheckpoint(version, parts);
+        } else {
+            loadSinglePartCheckpoint(parts.get(0));
+        }
+        cachedVersion = version;
+    }
+
+    private void loadSinglePartCheckpoint(String fileName) {
+        List<SingleAction> actions = checkpointReader.read(storage, fileName);
+        applyCheckpointActions(actions);
+    }
+
+    private void loadMultiPartCheckpoint(long version, List<String> parts) {
+        // Verify all parts are present before reading any — a partial read
+        // would silently produce an incomplete live set, which is worse than
+        // a clear failure.
+        if (!parts.isEmpty() && CommitFileNames.isMultiPartCheckpoint(parts.get(0))) {
+            int expectedTotal = CommitFileNames.parseCheckpointTotalParts(parts.get(0));
+            if (parts.size() != expectedTotal) {
+                throw new IllegalStateException(
+                        "Multi-part checkpoint at version " + version + " is incomplete: "
+                                + "found " + parts.size() + " of " + expectedTotal + " expected parts. "
+                                + "The checkpoint may have been written partially or some files may have "
+                                + "been cleaned up prematurely. Cannot safely reconstruct the live file set.");
+            }
+        }
+        for (String part : parts) {
+            List<SingleAction> actions = checkpointReader.read(storage, part);
+            applyCheckpointActions(actions);
+        }
+    }
+
+    private void applyCheckpointActions(List<SingleAction> actions) {
         for (SingleAction action : actions) {
             if (action.getAdd() != null) {
                 cachedActiveFiles.put(action.getAdd().getPath(), action.getAdd());
@@ -183,18 +237,6 @@ public class SnapshotManager {
             if (action.getProtocol() != null) {
                 cachedProtocol = action.getProtocol();
             }
-        }
-        cachedVersion = checkpointVersion.get();
-    }
-
-    private Optional<Long> findLatestCheckpointVersionAtOrBelow(long upToVersion) {
-        try {
-            return storage.listCheckpointFileNames().stream()
-                    .map(CommitFileNames::parseCheckpointVersion)
-                    .filter(v -> v <= upToVersion)
-                    .max(Long::compareTo);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to list checkpoint files in " + storage.describe(), e);
         }
     }
 

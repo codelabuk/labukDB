@@ -55,15 +55,10 @@ import java.util.Map;
 final class CheckpointReader {
 
     List<SingleAction> read(LogStorage storage, String checkpointFileName) {
-        if (CommitFileNames.isMultiPartCheckpoint(checkpointFileName)) {
-            throw new UnsupportedOperationException(
-                    "Multi-part checkpoints are not supported yet: " + checkpointFileName
-                            + " — only single-part (NNNN...N.checkpoint.parquet) checkpoints are read. "
-                            + "This table's checkpoint has been split across multiple files, likely because "
-                            + "it exceeded a size threshold; falling back to JSON-commit replay from version 0 "
-                            + "would still be correct, just slower — that fallback is not automatic here yet.");
-        }
-
+        // Both single-part and multi-part files use the same Parquet schema
+        // and the same Group-navigation logic — the difference is only in
+        // how many files SnapshotManager calls this method with, not in
+        // anything about the Parquet format itself.
         List<SingleAction> actions = new ArrayList<>();
         try {
             InputFile inputFile = storage.openParquetInputFile(checkpointFileName);

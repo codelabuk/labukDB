@@ -32,10 +32,10 @@ skinparam note {
   FontColor #2C2C2A
 }
 
-title lakehouse-flight v1 — System Architecture
+title delta-flight-engine v1 — System Architecture\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
 
 ' ─── WRITERS ───────────────────────────────────────────
-package "Writers (upstream, not part of this project)" #F1EFE8 {
+package "Writers (upstream — not part of this project)" #F1EFE8 {
   [Spark batch]       as SB  #D3D1C7
   [Spark streaming]   as SS  #D3D1C7
   [Flink]             as FL  #D3D1C7
@@ -43,13 +43,13 @@ package "Writers (upstream, not part of this project)" #F1EFE8 {
 
 ' ─── STORAGE ────────────────────────────────────────────
 database "Delta table" as DT #9FE1CB {
-  [_delta_log/\n(JSON commits + checkpoints)] as LOG
-  [Parquet data files\n(Hive-partitioned)]    as PAR
+  [_delta_log/\n(JSON commits + single/multi-part checkpoints)] as LOG
+  [Parquet data files\n(Hive-partitioned, flat + nested types)] as PAR
 }
 
 note bottom of DT
   Supported storage backends:
-  local disk · MinIO (s3a://) · S3 · ADLS (abfss://)
+  local disk · MinIO (s3a://) · S3 (s3a://) · ADLS Gen2 (abfss://)
 end note
 
 SB  --> DT : commits add/remove actions
@@ -57,80 +57,81 @@ SS  --> DT : one commit per micro-batch
 FL  --> DT : commits add/remove actions
 
 ' ─── ENGINE ─────────────────────────────────────────────
-package "lakehouse-flight engine" #EEEDFE {
+package "delta-flight-engine (this project)" #EEEDFE {
+
+  package "storage/ — location dispatch" #EEEDFE {
+    [TableLocation\n(local vs remote, decided once)] as TL
+    [MinioConfiguration\n(s3a:// settings + env vars)]  as MC
+    [AdlsConfiguration\n(abfss:// settings + env vars)] as AC
+  }
 
   package "Layer 1 — log/" #EEEDFE {
-    [CommitLogReader]   as CLR
-    [CheckpointReader]  as CPR
-    [SnapshotManager\n(incremental cache)] as SM
+    [CommitLogReader\n(JSON-lines parser)]          as CLR
+    [CheckpointReader\n(single + multi-part Parquet)] as CPR
+    [SnapshotManager\n(incremental cache,\nlatest/atVersion/atTimestamp)] as SM
     [TableCache\n(one SM per table)] as TC
-    [LocalNioLogStorage] as LNS
-    [HadoopLogStorage\n(S3/MinIO/ADLS)] as HLS
+    [LocalNioLogStorage\n(java.nio.file)]  as LNS
+    [HadoopLogStorage\n(S3/MinIO/ADLS)]   as HLS
   }
 
   package "Layer 2 — planner/" #EEEDFE {
-    [PartitionPruner\n(log partition values)] as PP
-    [FileStatsPruner\n(add.stats min/max)]    as FSP
-    [QueryPlanner]      as QP
-    [PartitionValueSubstituter] as PVS
+    [PartitionPruner\n(log partition values,\nno file opened)]   as PP
+    [FileStatsPruner\n(add.stats min/max,\nno file opened)]      as FSP
+    [QueryPlanner\n(orchestrates pruning,\nreturns ScanPlan)]    as QP
+    [PartitionValueSubstituter\n(folds partition predicates\nto constants per file)] as PVS
+    [PredicateColumns\n(collects cols referenced\nin predicate tree)] as PC
     note right of PP
       Filters: = != < <= > >=
       IN · LIKE · AND · OR
-      timestamp literals (Instant)
+      boolean · timestamp (ISO-8601)
     end note
   }
 
-  package "Layer 3 — decode/" as D3 #EEEDFE {
-    [ParquetToArrowReader] as PTAR
-    [RowGroupPruner\n(Parquet footer stats)] as RGP
-    [GroupPredicateEvaluator\n(per-row residual)] as GPE
-    [PartitionValueAppender\n(constant columns)] as PVA
-    [Int96TimestampCodec] as ITC
-    [ParquetInputFiles\n(local or Hadoop)] as PIF
-    [ParquetFooterCache] as PFC
+  package "Layer 3 — decode/" #EEEDFE {
+    [ParquetToArrowReader\n(local + remote InputFile)] as PTAR
+    [RowGroupPruner\n(Parquet footer stats)]           as RGP
+    [GroupPredicateEvaluator\n(per-row residual)]      as GPE
+    [PartitionValueAppender\n(constant partition cols)] as PVA
+    [NestedTypeDecoder\n(LIST<float/double/int/string>\nfor embedding vectors)] as NTD
+    [Int96TimestampCodec\n(INT96 → Instant UTC)]       as ITC
+    [ParquetFooterCache\n(schema per stable path)]     as PFC
+    [ParquetInputFiles\n(local File or Hadoop InputFile)] as PIF
   }
 
   package "Layer 4 — flight/" #EEEDFE {
-    [DeltaFlightProducer] as DFP
-    [TicketRegistry\n(opaque ticket → ScanTicket)] as TR
-    [DeltaFlightServerApp\n(port 9443)] as DFSA
-  }
-
-  package "storage/" #EEEDFE {
-    [TableLocation\n(local vs remote)] as TL
-    [MinioConfiguration\n(s3a:// settings)] as MC
+    [DeltaFlightProducer\n(GetFlightInfo · DoGet\nGetSchema · ListFlights)] as DFP
+    [TicketRegistry\n(ticket id → ScanTicket)]  as TR
+    [DeltaFlightServerApp\n(port 9443)]          as DFSA
   }
 
   package "catalog/" #EEEDFE {
-    [TableCatalog\n(~/.delta-flight-engine/catalog.json)] as CAT
+    [TableCatalog\n(name → location,\n~/.delta-flight-engine/catalog.json)] as CAT
   }
 
   package "cli/" #EEEDFE {
     [DeltaCli\n(catalog / describe / query)] as CLI
-    [TableResolver] as TR2
+    [TableResolver\n(name or path or URI → TableLocation)] as TR2
   }
 
 }
 
 ' ─── LAYER WIRING ────────────────────────────────────────
 DT  --> CLR  : JSON-lines commit files
-DT  --> CPR  : .checkpoint.parquet
+DT  --> CPR  : .checkpoint.parquet (single + multi-part)
 
 CLR --> SM
-CPR --> SM
+CPR --> SM   : actions merged from all parts
 SM  --> TC
 TC  --> LNS  : local path
 TC  --> HLS  : s3a:// / abfss://
 LNS --> LOG
 HLS --> LOG
 
-SM  --> QP   : Snapshot (live file set)
-QP  --> PP
-QP  --> FSP
-PP  --> QP
-FSP --> QP   : ScanPlan (surviving files)
-
+SM  --> QP   : Snapshot (live file set + schema)
+QP  --> PP   : prune by partition values
+QP  --> FSP  : prune by add.stats min/max
 QP  --> PVS  : fold partition predicates per file
+QP  --> PC   : collect predicate columns for safe projection
 
 DFP --> TC
 DFP --> QP
@@ -139,31 +140,39 @@ DFP --> TR
 DFP --> CAT
 DFP --> TL
 
-PTAR --> RGP
-PTAR --> GPE
-PTAR --> PVA
-PTAR --> ITC
-PTAR --> PIF
-PTAR --> PFC
+PTAR --> RGP  : prune row groups
+PTAR --> GPE  : residual per-row filter
+PTAR --> PVA  : fill partition columns as constants
+PTAR --> NTD  : decode LIST columns (embeddings)
+PTAR --> ITC  : decode INT96 timestamps
+PTAR --> PIF  : open Parquet file
+PTAR --> PFC  : cache schema by path
 
-TL  --> MC   : remote config
+TL  --> MC
+TL  --> AC
 
 CLI --> TR2
 TR2 --> CAT
 TR2 --> TL
-CLI --> SM   : direct (in-process, no server)
-CLI --> PTAR : direct (in-process, no server)
+CLI --> SM   : direct in-process (no server needed)
+CLI --> PTAR : direct in-process (no server needed)
 
 ' ─── CLIENTS ─────────────────────────────────────────────
-actor "Python client\n(pyarrow.flight)" as PY  #FAECE7
-actor "Java client\n(arrow-flight-core)" as JV #FAECE7
-actor "RAG / LLM\n(rag_demo.py + Ollama)" as RAG #FAECE7
-actor "Other clients\n(Go · Rust · JS)" as OTH #FAECE7
+actor "Python\n(pyarrow.flight\nquery_demo.py)" as PY  #FAECE7
+actor "Java\n(arrow-flight-core)"                as JV  #FAECE7
+actor "RAG / LLM\n(rag_demo.py + Ollama)"        as RAG #FAECE7
+actor "lakehouse-gateway\n(future MCP server)"   as GW  #FAECE7
 
-PY  --> DFSA : GetFlightInfo + DoGet\n(Arrow IPC over gRPC)
+PY  --> DFSA : GetFlightInfo + DoGet + GetSchema\n(Arrow IPC over gRPC)
 JV  --> DFSA
 RAG --> DFSA
-OTH --> DFSA
+GW  --> DFSA : GetSchema · ListFlights · DoGet
 DFSA --> DFP
+
+note bottom of GW
+  lakehouse-gateway is a separate repo
+  that will wrap this engine with:
+  MCP tools · semantic layer · auth · audit
+end note
 
 @enduml

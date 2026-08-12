@@ -20,7 +20,6 @@ import org.apache.parquet.io.RecordReader;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
-
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -176,9 +175,20 @@ public final class ParquetToArrowReader {
             for (String column : physicalOutputColumns) {
                 FieldVector vector = decodeRoot.getVector(column);
                 if (physicalColumns.contains(column)) {
-                    PrimitiveType.PrimitiveTypeName typeName =
-                            projectedSchema.getType(column).asPrimitiveType().getPrimitiveTypeName();
-                    appenders.add(new RowAppender(column, typeName, vector));
+                    Type parquetType = projectedSchema.getType(column);
+                    if (!parquetType.isPrimitive() && NestedTypeDecoder.isSupported(parquetType)) {
+                        // Nested type (e.g. LIST<float> for embedding vectors)
+                        final Type capturedType = parquetType;
+                        final org.apache.arrow.vector.complex.ListVector listVector =
+                                (org.apache.arrow.vector.complex.ListVector) vector;
+                        final String capturedColumn = column;
+                        appenders.add((row, destIndex) ->
+                                NestedTypeDecoder.appendList(row, capturedColumn, capturedType, listVector, destIndex));
+                    } else {
+                        PrimitiveType.PrimitiveTypeName typeName =
+                                parquetType.asPrimitiveType().getPrimitiveTypeName();
+                        appenders.add(new RowAppender(column, typeName, vector));
+                    }
                 } else {
                     appenders.add(new PartitionValueAppender((VarCharVector) vector, partitionValues.get(column)));
                 }

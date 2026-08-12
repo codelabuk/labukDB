@@ -11,5 +11,6 @@ com\labuk\deltaflight\storage\TableLocationTest.class
 com\labuk\deltaflight\flight\query\PredicateCodecTest.class
 com\labuk\deltaflight\planner\PartitionValueSubstituterTest.class
 com\labuk\deltaflight\log\TableCacheTest.class
+com\labuk\deltaflight\decode\NestedTypeDecoderTest.class
 com\labuk\deltaflight\flight\FlightIntegrationTest.class
 com\labuk\deltaflight\log\SnapshotManagerTest.class

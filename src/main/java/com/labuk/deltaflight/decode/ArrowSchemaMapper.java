@@ -9,6 +9,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 import org.apache.parquet.schema.Type;
+import org.apache.parquet.schema.Type;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -44,8 +45,20 @@ final class ArrowSchemaMapper {
         List<Field> fields = new ArrayList<>();
         for (String column : columns) {
             if (containsField(parquetSchema, column)) {
-                PrimitiveTypeName typeName = parquetSchema.getType(column).asPrimitiveType().getPrimitiveTypeName();
-                fields.add(new Field(column, FieldType.nullable(toArrowType(typeName, column)), null));
+                Type parquetType = parquetSchema.getType(column);
+                if (parquetType.isPrimitive()) {
+                    PrimitiveTypeName typeName = parquetType.asPrimitiveType().getPrimitiveTypeName();
+                    fields.add(new Field(column, FieldType.nullable(toArrowType(typeName, column)), null));
+                } else if (NestedTypeDecoder.isSupported(parquetType)) {
+                    // Nested type (LIST<float> etc.) — delegate to NestedTypeDecoder
+                    // for the Arrow field definition so the schema matches
+                    // what the decode step will produce.
+                    fields.add(NestedTypeDecoder.toArrowField(column, parquetType));
+                } else {
+                    throw new UnsupportedOperationException(
+                            "Unsupported Parquet type for column '" + column + "': " + parquetType
+                                    + ". Supported nested types: LIST<float/double/int/long/string>.");
+                }
             } else if (partitionColumnNames.contains(column)) {
                 fields.add(new Field(column, FieldType.nullable(ArrowType.Utf8.INSTANCE), null));
             } else {
