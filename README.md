@@ -123,6 +123,88 @@ case-sensitive), combined with `AND`/`OR`. No generic `NOT` — see
 
 ---
 
+## Using it as a library
+
+There are three ways to use this engine — the `delta-cli` binary, a
+running Flight server queried remotely, and calling the Java API directly
+in-process (what both of the above actually do under the hood). The third
+option is useful if you're embedding a Delta reader inside your own JVM
+application rather than shelling out or opening a Flight connection.
+
+Not published to Maven Central — build and install it into your local
+`~/.m2` repository first:
+
+```
+mvn clean install -DskipTests
+```
+
+Then depend on it like any other Maven artifact:
+
+```xml
+<dependency>
+    <groupId>com.labuk</groupId>
+    <artifactId>delta-flight-engine</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+The four layers map directly onto four calls — resolve a snapshot, plan
+which files survive pruning, fold each file's partition values into the
+residual predicate, then decode:
+
+```java
+import com.labuk.deltaflight.log.Snapshot;
+import com.labuk.deltaflight.log.SnapshotManager;
+import com.labuk.deltaflight.log.action.AddFile;
+import com.labuk.deltaflight.planner.*;
+import com.labuk.deltaflight.decode.ParquetToArrowReader;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.List;
+
+Path tableRoot = Path.of("D:/repo/local-lakehouse-lab/lakehouse/logs_delta");
+
+// 1. log/ — resolve the current (or a historical) snapshot
+SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
+Snapshot snapshot = snapshotManager.latest();          // or atVersion(n) / atTimestamp(instant)
+
+// 2. planner/ — decide which files survive pruning
+Predicate filter = Predicate.compare("level", ComparisonOp.EQ, "ERROR");
+QueryPlanner planner = new QueryPlanner();
+ScanPlan plan = planner.plan(snapshot, filter, List.of("service", "message"));
+
+System.out.println(plan.getFilesToScan().size() + " of "
+        + plan.getTotalFilesInSnapshot() + " files survived pruning");
+
+// 3. decode/ — read each surviving file (partition columns folded to constants)
+ParquetToArrowReader reader = new ParquetToArrowReader();
+try (RootAllocator allocator = new RootAllocator()) {
+    for (AddFile file : plan.getFilesToScan()) {
+        Predicate residual = PartitionValueSubstituter.simplify(
+                plan.getResidualPredicate(), file.getPartitionValues());
+        File parquetFile = tableRoot.resolve(file.getPath()).toFile();
+
+        try (VectorSchemaRoot root = reader.read(
+                parquetFile, allocator, plan.getProjectedColumns(), residual, file.getPartitionValues())) {
+            System.out.println(root.contentToTSVString());   // one Arrow batch per file
+        }
+    }
+}
+```
+
+`SnapshotManager` also has a `TableLocation`-aware constructor for S3/MinIO/
+ADLS tables (`SnapshotManager.forLocation(...)`), and `ParquetToArrowReader`
+has matching `TableLocation`-based `readSchema`/`read` overloads — see
+`src/main/java/com/labuk/deltaflight/tools/RealTableSmokeCheck.java` for a
+second, runnable end-to-end example (schema inspection plus a side-by-side
+pruned vs. unpruned file count), and `DeltaFlightProducer` for exactly this
+same sequence wired into `GetFlightInfo`/`DoGet`.
+
+---
+
 ## The catalog
 
 `TableCatalog` maps a short name to a table location, persisted to
