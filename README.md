@@ -186,6 +186,45 @@ right now.
 
 ---
 
+## Built on
+
+Libraries this project actually depends on (see `pom.xml` for exact
+versions):
+
+| Library | Used for |
+|---|---|
+| [Apache Parquet (`parquet-mr`)](https://parquet.apache.org/) | Footer statistics, row-group reads, the `Group` record API `GroupPredicateEvaluator` and `CheckpointReader` decode against |
+| [Apache Arrow](https://arrow.apache.org/) | The in-memory columnar format every decoded row lands in (`arrow-vector`) |
+| [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) | The gRPC-based wire protocol `flight/` serves over — this is *why* any language's Flight client works unmodified |
+| [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction for `log/` and `decode/` — no MapReduce/YARN/HDFS daemons involved, see [HADOOP_USAGE.md](HADOOP_USAGE.md) |
+| [Jackson](https://github.com/FasterXML/jackson) | Parsing the `_delta_log` JSON commit files |
+
+## Inspired by, deliberately not depending on
+
+The point of this project is understanding the mechanics of a Delta reader
+first-hand, so these were read as references, not pulled in as
+dependencies:
+
+- **[Delta Lake transaction log protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)** —
+  the spec `log/` and `planner/` implement against: action types
+  (`add`/`remove`/`metaData`/`protocol`), the JSON commit format, and the
+  checkpoint Parquet schema `CheckpointReader` assumes.
+- **[delta-kernel-rs](https://github.com/delta-io/delta-kernel-rs) / delta-kernel-java** —
+  Delta's own official "build an engine on top of this" library. This
+  project intentionally does *not* use it — the log replay, pruning, and
+  Parquet decode it would otherwise hand you are implemented from scratch
+  here instead, as the whole point of the exercise.
+- **[delta-rs](https://github.com/delta-io/delta-rs)** — another
+  from-scratch (Rust) Delta implementation; a useful sanity check for
+  "does my understanding of the protocol match another independent
+  implementation's."
+- **[DuckDB](https://duckdb.org/)** — what `local-lakehouse-lab`'s own
+  query layer uses; the natural "just use this instead" answer this
+  project is deliberately not taking, for the reasons in
+  [Why build this instead of using delta-kernel / DuckDB](#why-build-this-instead-of-using-delta-kernel--duckdb).
+
+---
+
 ## Roadmap
 
 ### Core engine
