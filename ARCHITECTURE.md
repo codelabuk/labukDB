@@ -148,9 +148,11 @@ because Flight's wire format **is** Arrow IPC — no serialization step
 between engine and client.
 
 **Type support:** INT32, INT64, FLOAT, DOUBLE, BOOLEAN, BINARY (UTF-8),
-and INT96 (Spark's default legacy timestamp encoding — see
-`Int96TimestampCodec`, including its timezone caveat). Not supported:
-DECIMAL, nested/list types.
+INT96 (Spark's default legacy timestamp encoding — see
+`Int96TimestampCodec`, including its timezone caveat), and flat
+`LIST<float/double/int/long/string>` via `NestedTypeDecoder` (vector
+embeddings, numeric/string arrays). Not supported: DECIMAL, nested
+`LIST<LIST<...>>`, MAP, STRUCT.
 
 **`PartitionValueAppender`** reconstructs partition columns as constants,
 since they exist only in folder names, not in the files.
