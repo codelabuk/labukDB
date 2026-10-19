@@ -52,6 +52,11 @@ final class LocalNioLogStorage implements LogStorage {
     }
 
     @Override
+    public void createCommitFile(String fileName, String content) throws IOException {
+        Files.writeString(logDir.resolve(fileName), content, java.nio.file.StandardOpenOption.CREATE_NEW);
+    }
+
+    @Override
     public String describe() {
         return logDir.toString();
     }

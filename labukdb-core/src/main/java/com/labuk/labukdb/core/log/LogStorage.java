@@ -39,6 +39,22 @@ interface LogStorage {
     /** For {@link CheckpointReader} — a Parquet-mr {@code InputFile}, uniform across both backends. */
     org.apache.parquet.io.InputFile openParquetInputFile(String fileName) throws IOException;
 
+    /**
+     * Atomically creates a new commit file with the given content — must
+     * fail (not silently overwrite) if a file with this name already
+     * exists. This is the primitive {@link CommitWriter}'s single-writer
+     * append relies on today, and that later multi-writer optimistic
+     * concurrency control will rely on for conflict detection: two writers
+     * racing for the same version number must have exactly one succeed.
+     *
+     * {@link LocalNioLogStorage} is genuinely atomic (local filesystem
+     * {@code CREATE_NEW}). {@link HadoopLogStorage} implements the same
+     * contract for S3/MinIO/ADLS, with differentiated, backend-specific
+     * confidence levels documented on that class — see its javadoc before
+     * relying on this for a specific remote backend.
+     */
+    void createCommitFile(String fileName, String content) throws IOException;
+
     /** For error messages. */
     String describe();
 }

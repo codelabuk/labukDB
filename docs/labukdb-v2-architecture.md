@@ -188,6 +188,24 @@ foundation under it is proven:
    [Concurrent writes](#concurrent-writes) is actually done. v1 ships
    single-writer-per-table instead.
 
+## Phase roadmap beyond v1 core
+
+**Correction to an earlier framing:** a previous pass at this plan called
+distributed ingestion and distributed query execution "explicitly out of
+scope." That was wrong — they're required for the full architecture and
+stay on the roadmap. What's true is only that they come *after* v1 core
+(the write path above) is built and validated, not that they're dropped.
+v1 core is the current priority; these are sequenced, not shelved.
+
+| Phase | Scope | Status |
+|---|---|---|
+| v1 core | `format/TableFormat`, `WriteBuffer`, `CommitWriter` (single-writer), `encode/`, `Compactor`/`Vacuum`, `execution/` | Not started — see [Build order](#build-order) above, this is the current priority |
+| Multi-format | `labukdb-format-iceberg` module, using `iceberg-core` (not hand-rolled) | Not started |
+| Read scale-out | Self-describing Flight tickets (encode the scan directly in the ticket bytes instead of a `TicketRegistry` lookup), stateless server replicas behind a load balancer | Not started — cheap once started, no new distributed-systems machinery needed since snapshot resolution is already stateless against shared object storage |
+| Multi-writer OCC across machines | Per-backend atomic create-if-absent verification (S3/MinIO/ADLS — see [Concurrent writes](#concurrent-writes)), then OCC conflict/retry | Not started — falls out naturally once verified, no extra coordination service needed |
+| **Distributed ingestion fleet** | Router + sharded Ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer — IOx's Router/Ingester split | **Planned, not yet designed.** Genuinely the largest remaining piece — closer to a distributed-systems project than an extension of the single-node write path, and needs its own dedicated design pass once v1 core is real |
+| **Distributed query execution** | Splitting one query's work across multiple compute nodes (join/aggregate pushdown across a fleet, not just client-side fan-out over `FlightEndpoint`s) | **Planned, not yet designed.** Needs a real distributed query planner; revisit once `execution/` exists single-node and its limits are actually felt |
+
 ---
 
 *This document and its diagrams describe a plan, not current behavior.
