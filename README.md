@@ -69,10 +69,20 @@ Writers (Spark batch, Spark streaming, Flink) → Delta table
 | 1 | `log/` | Parse the commit log, resolve a snapshot at a version, timestamp, or `latest()`. Incrementally cached; falls back to checkpoints where available. | `CommitLogReader`, `SnapshotManager`, `CheckpointReader` |
 | 2 | `planner/` | Decide which files can be skipped, without opening them, using partition values and file-level stats from the log. Fail-open: anything it can't decide, it keeps. | `Predicate`, `PartitionPruner`, `FileStatsPruner`, `QueryPlanner` |
 | 3 | `decode/` | For each surviving file: prune row groups via Parquet footer stats, decode only the requested columns, apply the residual filter row-by-row, and reconstruct partition columns as constants. Decode and filter are fused into one pass. | `RowGroupPruner`, `GroupPredicateEvaluator`, `ParquetToArrowReader` |
-| 4 | `flight/` | Serve it. `GetFlightInfo` plans and returns one `FlightEndpoint` per surviving file; `DoGet` lazily decodes exactly the file its ticket refers to. | `DeltaFlightProducer`, `DeltaFlightServerApp` |
+| 4 | `flight/` | Serve it. `GetFlightInfo` plans and returns one `FlightEndpoint` per surviving file; `DoGet` lazily decodes exactly the file its ticket refers to. | `DeltaFlightProducer`, `LabukDbServerApp` |
 
 Supporting packages: `storage/` (local/S3/MinIO/ADLS location resolution),
-`catalog/` (name → table-root registry), `cli/` (the `delta-cli` tool).
+`catalog/` (name → table-root registry), `cli/` (the `labukdb` tool).
+
+**Multi-module since the labukDB restructuring:** these four layers now
+live in separate Maven modules — `labukdb-core` (log/planner/decode/
+storage/catalog, no Flight dependency, embeddable like DuckDB),
+`labukdb-flight` (Flight serving), `labukdb-server-app` (the runnable
+server jar), `labukdb-cli` (the `labukdb` binary, depends on
+`labukdb-core` only). See
+[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
+the full module design and what's planned on top of it (write support,
+Iceberg, etc.).
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full walkthrough of each
 layer, including why a table is a log and not a folder, how pruning stays
@@ -86,19 +96,21 @@ correct under ambiguity, and what "zero-copy" actually means here.
 mvn clean package          # runs tests too; add -DskipTests to skip them
 ```
 
-This produces `target/delta-cli.jar` — one file, every dependency bundled
-in.
+This produces `labukdb-cli/target/labukdb-cli.jar` — one file, every
+dependency bundled in — and `labukdb-server-app/target/labukdb-server-app.jar`,
+the standalone Flight server.
 
 ```
-bin/delta-cli catalog add logs D:\repo\local-lakehouse-lab\lakehouse\logs_delta
-bin/delta-cli catalog list
-bin/delta-cli describe logs
-bin/delta-cli query --table logs --filter "level=ERROR" --columns service,message --limit 10
+bin/labukdb catalog add logs D:\repo\local-lakehouse-lab\lakehouse\logs_delta
+bin/labukdb catalog list
+bin/labukdb describe logs
+bin/labukdb query --table logs --filter "level=ERROR" --columns service,message --limit 10
 ```
 
-(Windows: `bin\delta-cli.bat ...`. Zip extraction on Windows won't preserve
-the executable bit on `bin/delta-cli` — run `chmod +x bin/delta-cli` once
-in Git Bash, or just use `java -jar target/delta-cli.jar ...` directly.)
+(Windows: `bin\labukdb.bat ...`. Zip extraction on Windows won't preserve
+the executable bit on `bin/labukdb` — run `chmod +x bin/labukdb` once
+in Git Bash, or just use `java -jar labukdb-cli/target/labukdb-cli.jar ...`
+directly.)
 
 Every subcommand accepts either a catalog name or a raw filesystem/URI path
 wherever a table is expected.
@@ -107,8 +119,7 @@ wherever a table is expected.
 
 ```
 java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED \
-     -cp target/classes:<dependency-classpath> \
-     com.labuk.deltaflight.flight.DeltaFlightServerApp
+     -jar labukdb-server-app/target/labukdb-server-app.jar
 ```
 
 The `--add-opens` flag is needed because Arrow's off-heap memory library
@@ -125,11 +136,13 @@ case-sensitive), combined with `AND`/`OR`. No generic `NOT` — see
 
 ## Using it as a library
 
-There are three ways to use this engine — the `delta-cli` binary, a
+There are three ways to use this engine — the `labukdb` CLI binary, a
 running Flight server queried remotely, and calling the Java API directly
 in-process (what both of the above actually do under the hood). The third
 option is useful if you're embedding a Delta reader inside your own JVM
-application rather than shelling out or opening a Flight connection.
+application rather than shelling out or opening a Flight connection —
+`labukdb-core` has no Flight/gRPC dependency, so this is the DuckDB-style
+embedded path.
 
 Not published to Maven Central — build and install it into your local
 `~/.m2` repository first:
@@ -138,12 +151,12 @@ Not published to Maven Central — build and install it into your local
 mvn clean install -DskipTests
 ```
 
-Then depend on it like any other Maven artifact:
+Then depend on just the core module, like any other Maven artifact:
 
 ```xml
 <dependency>
     <groupId>com.labuk</groupId>
-    <artifactId>delta-flight-engine</artifactId>
+    <artifactId>labukdb-core</artifactId>
     <version>0.1.0-SNAPSHOT</version>
 </dependency>
 ```
@@ -153,11 +166,11 @@ which files survive pruning, fold each file's partition values into the
 residual predicate, then decode:
 
 ```java
-import com.labuk.deltaflight.log.Snapshot;
-import com.labuk.deltaflight.log.SnapshotManager;
-import com.labuk.deltaflight.log.action.AddFile;
-import com.labuk.deltaflight.planner.*;
-import com.labuk.deltaflight.decode.ParquetToArrowReader;
+import com.labuk.labukdb.core.log.Snapshot;
+import com.labuk.labukdb.core.log.SnapshotManager;
+import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.planner.*;
+import com.labuk.labukdb.core.decode.ParquetToArrowReader;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -198,19 +211,20 @@ try (RootAllocator allocator = new RootAllocator()) {
 `SnapshotManager` also has a `TableLocation`-aware constructor for S3/MinIO/
 ADLS tables (`SnapshotManager.forLocation(...)`), and `ParquetToArrowReader`
 has matching `TableLocation`-based `readSchema`/`read` overloads — see
-`src/main/java/com/labuk/deltaflight/tools/RealTableSmokeCheck.java` for a
-second, runnable end-to-end example (schema inspection plus a side-by-side
-pruned vs. unpruned file count), and `DeltaFlightProducer` for exactly this
-same sequence wired into `GetFlightInfo`/`DoGet`.
+`labukdb-core/src/main/java/com/labuk/labukdb/core/tools/RealTableSmokeCheck.java`
+for a second, runnable end-to-end example (schema inspection plus a
+side-by-side pruned vs. unpruned file count), and `DeltaFlightProducer`
+(in `labukdb-flight`) for exactly this same sequence wired into
+`GetFlightInfo`/`DoGet`.
 
 ---
 
 ## The catalog
 
 `TableCatalog` maps a short name to a table location, persisted to
-`~/.delta-flight-engine/catalog.json` — so a client (especially an AI
-agent or MCP tool) can say `"logs"` instead of needing to know an exact
-path. Not Unity Catalog, and doesn't try to be.
+`~/.labukdb/catalog.json` — so a client (especially an AI agent or MCP
+tool) can say `"logs"` instead of needing to know an exact path. Not
+Unity Catalog, and doesn't try to be.
 
 ## Storage backends
 
@@ -226,7 +240,7 @@ genuine end-to-end remote query isn't wired through yet.
 ## Python client & RAG demo
 
 - `python/query_demo.py` — a plain `pyarrow.flight` client against a
-  running `DeltaFlightServerApp`. Proof that any Flight-capable client in
+  running `labukdb-server-app`. Proof that any Flight-capable client in
   any language works against this server unmodified.
 - `python/rag_demo.py` — a small grounded-QA demo using two local Ollama
   calls: one turns a plain-English question into the JSON query

@@ -5,178 +5,150 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>com.labuk</groupId>
-  <artifactId>delta-flight-engine</artifactId>
+  <artifactId>labukdb-parent</artifactId>
   <version>0.1.0-SNAPSHOT</version>
-  <packaging>jar</packaging>
+  <packaging>pom</packaging>
+
+  <!--
+    labukDB — multi-module lakehouse database (reads/writes Delta tables,
+    reads Iceberg tables, embeddable or Flight-served). This is phase 1 of
+    the v2 plan: pure module/package restructuring, no new behavior.
+    See docs/labukdb-v2-architecture.md for the full target design.
+
+    Module dependency order:
+      labukdb-core         — the embeddable engine, no Flight/gRPC dependency
+      labukdb-flight        — depends on core, adds Arrow Flight serving
+      labukdb-server-app    — depends on core + flight, bootstraps + shades a runnable server jar
+      labukdb-cli           — depends on core only (in-process, no server needed), shades a runnable CLI jar
+  -->
+  <modules>
+    <module>labukdb-core</module>
+    <module>labukdb-flight</module>
+    <module>labukdb-server-app</module>
+    <module>labukdb-cli</module>
+  </modules>
 
   <properties>
-    <maven.compiler.source>17</maven.compiler.source>
-    <maven.compiler.target>17</maven.compiler.target>
+    <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <jackson.version>2.17.1</jackson.version>
     <junit.version>5.10.2</junit.version>
     <parquet.version>1.13.1</parquet.version>
     <arrow.version>16.1.0</arrow.version>
     <hadoop.version>3.3.6</hadoop.version>
+    <surefire.version>3.2.5</surefire.version>
+    <shade.version>3.5.1</shade.version>
   </properties>
 
   <!--
-    Layer 1 (log) needs only Jackson. Layers 2-4 add:
-      - parquet-column / parquet-hadoop / parquet-common: footer + row-group
-        reads, and the Group-based record API used for residual filtering
-      - hadoop-client: parquet-hadoop's InputFile/Configuration plumbing
-        pulls this in transitively regardless; declaring it explicitly pins
-        the version rather than leaving it to transitive resolution.
-        (This is the standard, if heavy, cost of using parquet-mr from Java —
-        Arrow's own C++-backed Dataset API avoids it but isn't a "build it
-        yourself" path, which is the point of this project.)
-      - arrow-vector / arrow-memory-netty: the decoded columnar output
-      - arrow-flight-core: the serving layer
+    Centralized so every module declares a dependency without repeating a
+    version. Per-module comments explaining *why* each dependency is
+    needed live in that module's own pom.xml, close to the code that uses
+    it, rather than here.
   -->
-  <dependencies>
-    <dependency>
-      <groupId>com.fasterxml.jackson.core</groupId>
-      <artifactId>jackson-databind</artifactId>
-      <version>${jackson.version}</version>
-    </dependency>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.labuk</groupId>
+        <artifactId>labukdb-core</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.labuk</groupId>
+        <artifactId>labukdb-flight</artifactId>
+        <version>${project.version}</version>
+      </dependency>
 
-    <dependency>
-      <groupId>org.apache.parquet</groupId>
-      <artifactId>parquet-column</artifactId>
-      <version>${parquet.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.parquet</groupId>
-      <artifactId>parquet-hadoop</artifactId>
-      <version>${parquet.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.parquet</groupId>
-      <artifactId>parquet-common</artifactId>
-      <version>${parquet.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-client</artifactId>
-      <version>${hadoop.version}</version>
-    </dependency>
-    <!--
-      Enables s3a:// (S3 and, via endpoint override, MinIO) for
-      HadoopLogStorage and decode/'s HadoopInputFile usage. Marked optional
-      so a consumer who only ever uses local storage isn't forced to pull
-      in the AWS SDK transitively — this project's own build still gets it
-      (Maven includes a module's own optional deps in its own build,
-      "optional" only affects whether it propagates to consumers of this
-      as a dependency). ADLS (abfss://) would need hadoop-azure similarly;
-      not added here since S3/MinIO was the concretely requested target —
-      add it the same way if/when ADLS is actually needed.
-    -->
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-aws</artifactId>
-      <version>${hadoop.version}</version>
-      <optional>true</optional>
-    </dependency>
-    <!--
-      Enables abfss:// (Azure Data Lake Storage Gen2) for HadoopLogStorage
-      and ParquetInputFiles usage. Marked optional for the same reason as
-      hadoop-aws — a consumer using only local or S3 storage shouldn't be
-      forced to pull in the Azure SDK transitively.
-      Requires ADLS_STORAGE_ACCOUNT + credentials env vars, or call
-      AdlsConfiguration.forSharedKey() / forServicePrincipal() directly.
-    -->
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-azure</artifactId>
-      <version>${hadoop.version}</version>
-      <optional>true</optional>
-    </dependency>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>${jackson.version}</version>
+      </dependency>
 
-    <dependency>
-      <groupId>org.apache.arrow</groupId>
-      <artifactId>arrow-vector</artifactId>
-      <version>${arrow.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.arrow</groupId>
-      <artifactId>arrow-memory-netty</artifactId>
-      <version>${arrow.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.arrow</groupId>
-      <artifactId>flight-core</artifactId>
-      <version>${arrow.version}</version>
-    </dependency>
+      <dependency>
+        <groupId>org.apache.parquet</groupId>
+        <artifactId>parquet-column</artifactId>
+        <version>${parquet.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.parquet</groupId>
+        <artifactId>parquet-hadoop</artifactId>
+        <version>${parquet.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.parquet</groupId>
+        <artifactId>parquet-common</artifactId>
+        <version>${parquet.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-client</artifactId>
+        <version>${hadoop.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-aws</artifactId>
+        <version>${hadoop.version}</version>
+        <optional>true</optional>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.hadoop</groupId>
+        <artifactId>hadoop-azure</artifactId>
+        <version>${hadoop.version}</version>
+        <optional>true</optional>
+      </dependency>
 
-    <dependency>
-      <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter</artifactId>
-      <version>${junit.version}</version>
-      <scope>test</scope>
-    </dependency>
-  </dependencies>
+      <dependency>
+        <groupId>org.apache.arrow</groupId>
+        <artifactId>arrow-vector</artifactId>
+        <version>${arrow.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow</groupId>
+        <artifactId>arrow-memory-netty</artifactId>
+        <version>${arrow.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.arrow</groupId>
+        <artifactId>flight-core</artifactId>
+        <version>${arrow.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.junit.jupiter</groupId>
+        <artifactId>junit-jupiter</artifactId>
+        <version>${junit.version}</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <build>
-    <plugins>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.2.5</version>
-        <configuration>
-          <!--
-            Arrow's memory library reaches into java.nio.Buffer reflectively
-            for off-heap access, which the JPMS module system blocks by
-            default on Java 9+. This is Arrow's own documented requirement
-            (https://arrow.apache.org/docs/java/install.html), not something
-            specific to this project — every Arrow-Java consumer needs it.
-            Wiring it into Surefire here means `mvn test` just works, rather
-            than everyone who clones this needing to remember the flag.
-          -->
-          <argLine>--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED</argLine>
-        </configuration>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-shade-plugin</artifactId>
-        <version>3.5.1</version>
-        <executions>
-          <execution>
-            <phase>package</phase>
-            <goals>
-              <goal>shade</goal>
-            </goals>
-            <configuration>
-              <!--
-                Bundles every dependency into one runnable jar, so the CLI
-                becomes `java -jar delta-cli.jar <subcommand>` instead of
-                needing a hand-built classpath string. ServicesResourceTransformer
-                is not optional here — Hadoop's FileSystem lookup relies on
-                merged META-INF/services entries across multiple jars;
-                without it, shading silently keeps only one jar's service
-                file and HadoopInputFile lookups break in the fat jar
-                specifically, not in the unshaded classpath case.
-              -->
-              <finalName>delta-cli</finalName>
-              <transformers>
-                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                  <mainClass>com.labuk.deltaflight.cli.DeltaCli</mainClass>
-                </transformer>
-                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
-              </transformers>
-              <filters>
-                <filter>
-                  <artifact>*:*</artifact>
-                  <excludes>
-                    <exclude>META-INF/*.SF</exclude>
-                    <exclude>META-INF/*.DSA</exclude>
-                    <exclude>META-INF/*.RSA</exclude>
-                  </excludes>
-                </filter>
-              </filters>
-            </configuration>
-          </execution>
-        </executions>
-      </plugin>
-    </plugins>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${surefire.version}</version>
+          <configuration>
+            <!--
+              Arrow's memory library reaches into java.nio.Buffer reflectively
+              for off-heap access, which the JPMS module system blocks by
+              default on Java 9+. This is Arrow's own documented requirement
+              (https://arrow.apache.org/docs/java/install.html), not specific
+              to this project — every Arrow-Java consumer needs it. Wiring it
+              in here means `mvn test` just works for every module that runs
+              Arrow-touching tests, without each one repeating the flag.
+            -->
+            <argLine>--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED</argLine>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-shade-plugin</artifactId>
+          <version>${shade.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
   </build>
 </project>

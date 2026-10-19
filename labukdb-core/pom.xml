@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.labuk</groupId>
+    <artifactId>labukdb-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>labukdb-core</artifactId>
+  <packaging>jar</packaging>
+
+  <!--
+    The embeddable engine: log/ planner/ decode/ storage/ catalog/.
+    Deliberately has NO Flight/gRPC dependency, so an application that
+    only wants in-process query access (the DuckDB-style use case) isn't
+    forced to pull in Netty/gRPC just because the project also offers a
+    server mode elsewhere (labukdb-server-app).
+
+    - log/ needs only Jackson (JSON commit parsing).
+    - planner/ needs nothing beyond log/'s own model types.
+    - decode/ adds parquet-column/-hadoop/-common (footer + row-group
+      reads, the Group-based record API used for residual filtering) and
+      hadoop-client (parquet-hadoop's InputFile/Configuration plumbing
+      pulls this in transitively regardless; declaring it explicitly pins
+      the version rather than leaving it to transitive resolution — the
+      standard, if heavy, cost of using parquet-mr from Java).
+    - storage/ adds the optional hadoop-aws / hadoop-azure connectors for
+      s3a:// / abfss://, kept optional so a local-only consumer isn't
+      forced to pull in either cloud SDK transitively.
+    - arrow-vector / arrow-memory-netty: the decoded columnar output.
+  -->
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-column</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-hadoop</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.parquet</groupId>
+      <artifactId>parquet-common</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-client</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <optional>true</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-azure</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-netty</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

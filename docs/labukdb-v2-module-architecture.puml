@@ -1,0 +1,237 @@
+@startuml labukdb-v2-module-architecture
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam roundCorner 10
+skinparam shadowing false
+
+skinparam rectangle {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+' reused today, unchanged behavior
+skinparam component {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam database {
+  BorderColor #0F6E56
+  BackgroundColor #E1F5EE
+  FontColor #04342C
+}
+skinparam actor {
+  BorderColor #993C1D
+  BackgroundColor #FAECE7
+  FontColor #4A1B0C
+}
+skinparam note {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+
+title labukDB v2 — Multi-Module Architecture (planned)\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+
+legend top left
+  |= color |= meaning |
+  |<#EEEDFE>| reused from delta-flight-engine v1, package renamed com.labuk.deltaflight → com.labuk.labukdb |
+  |<#FFF1CF>| new in v2 — does not exist yet |
+endlegend
+
+' ─── EXTERNAL WRITERS ───────────────────────────────────
+package "External writers (unchanged role)" #F1EFE8 {
+  [Spark batch]       as SB  #D3D1C7
+  [Spark streaming]   as SS  #D3D1C7
+  [Flink]             as FL  #D3D1C7
+  [Other Iceberg\nwriter (Trino, etc.)] as OIW #D3D1C7
+}
+
+' ─── STORAGE ─────────────────────────────────────────────
+database "Delta table" as DT #9FE1CB {
+  [_delta_log/\n(JSON commits + checkpoints)] as LOG
+  [Parquet data files] as PAR
+}
+
+database "Iceberg table" as IT #9FE1CB {
+  [metadata/\n(manifest lists + manifest files)] as ICEMETA
+  [Parquet data files] as ICEPAR
+}
+
+note bottom of DT
+  Backends: local disk · MinIO (s3a://)
+  S3 (s3a://) · ADLS Gen2 (abfss://)
+end note
+
+SB  --> DT : commits add/remove actions
+SS  --> DT : one commit per micro-batch
+FL  --> DT : commits add/remove actions
+OIW --> IT : Iceberg commit protocol
+
+' ─── labukdb-core ────────────────────────────────────────
+package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB-style)" #EEEDFE {
+
+  package "storage/ — location dispatch (reused)" #EEEDFE {
+    [TableLocation] as TL
+    [MinioConfiguration] as MC
+    [AdlsConfiguration]  as AC
+  }
+
+  package "format/ — TableFormat SPI" #FFF1CF {
+    [TableFormat\n(interface: snapshot → schema +\npartitionSpec + List<DataFileRef>)] as TF #FFF1CF
+    [DeltaTableFormat\n(wraps log/ below)] as DTF #EEEDFE
+    [WriteBuffer / Ingester\n(in-memory per-table buffer,\nWAL-backed, flush on\nsize/time threshold)] as WB #FFF1CF
+    [CommitWriter\n(optimistic concurrency,\natomic commit, conflict retry —\nv1 scope: single-writer-per-table,\nsee note)] as CW #FFF1CF
+    [Compactor\n(bin-pack small files,\nOPTIMIZE-style commit)] as COMP #FFF1CF
+    [Vacuum\n(remove orphaned files\npast retention window)] as VAC #FFF1CF
+
+    note right of CW
+      Atomic create-if-absent commit,
+      per storage backend:
+      · local disk — trivial (CREATE_NEW)
+      · S3 — native since 2024
+        (If-None-Match: *) — needs
+        verifying hadoop-aws exposes it
+      · MinIO — needs verifying
+      · ADLS Gen2 — needs verifying
+        (lease / If-None-Match via abfs)
+      True multi-writer OCC deferred
+      to v2 pending that verification.
+    end note
+  }
+
+  package "log/ — commit log (reused, now write-capable)" #EEEDFE {
+    [CommitLogReader] as CLR
+    [CheckpointReader\n(single + multi-part)] as CPR
+    [SnapshotManager\n(latest/atVersion/atTimestamp)] as SM
+    [TableCache] as TC
+    [LocalNioLogStorage] as LNS
+    [HadoopLogStorage\n(S3/MinIO/ADLS)] as HLS
+  }
+
+  package "planner/ — pruning (reused, format-agnostic)" #EEEDFE {
+    [PartitionPruner] as PP
+    [FileStatsPruner] as FSP
+    [QueryPlanner] as QP
+    [PartitionValueSubstituter] as PVS
+    [PredicateColumns] as PC
+  }
+
+  package "decode/ — Parquet → Arrow (reused)" #EEEDFE {
+    [ParquetToArrowReader] as PTAR
+    [RowGroupPruner] as RGP
+    [GroupPredicateEvaluator] as GPE
+    [PartitionValueAppender] as PVA
+    [NestedTypeDecoder] as NTD
+    [Int96TimestampCodec] as ITC
+    [ParquetFooterCache] as PFC
+  }
+
+  package "encode/ — Arrow → Parquet" #FFF1CF {
+    [ArrowToParquetWriter\n(mirror of ParquetToArrowReader)] as ATPW #FFF1CF
+  }
+
+  package "execution/ — query operators" #FFF1CF {
+    [FilterOperator\n(formalizes existing\nresidual-predicate pass)] as FOP #FFF1CF
+    [AggregateOperator\n(GROUP BY, SUM/COUNT/\nMIN/MAX/AVG)] as AOP #FFF1CF
+    [SortLimitOperator\n(ORDER BY ... LIMIT)] as SOP #FFF1CF
+  }
+
+  package "catalog/ — name → location (reused)" #EEEDFE {
+    [TableCatalog\n(name → location + format,\n~/.labukdb/catalog.json)] as CAT
+  }
+}
+
+' ─── optional format module ──────────────────────────────
+package "labukdb-format-iceberg  (optional — pulls in iceberg-core)" #FFF1CF {
+  [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core)] as ITF #FFF1CF
+}
+
+' ─── labukdb-flight ───────────────────────────────────────
+package "labukdb-flight  (depends on core [+ format-iceberg])" #EEEDFE {
+  [LabukDbFlightProducer\nGetFlightInfo · DoGet\nDoPut (NEW) · GetSchema · ListFlights] as DFP
+  [TicketRegistry] as TR
+}
+
+package "labukdb-server-app" #EEEDFE {
+  [LabukDbServerApp\n(bootstrap main, port 9443)] as DFSA
+}
+
+package "labukdb-cli  (depends on core in-process, no server)" #EEEDFE {
+  [LabukDbCli\ncatalog / describe / query / ingest (NEW)] as CLI
+  [TableResolver] as TR2
+}
+
+' ─── LAYER WIRING ────────────────────────────────────────
+DT --> CLR : JSON-lines commit files
+DT --> CPR : .checkpoint.parquet
+IT --> ICEMETA
+
+CLR --> SM
+CPR --> SM
+SM  --> TC
+TC  --> LNS : local path
+TC  --> HLS : s3a:// / abfss://
+LNS --> LOG
+HLS --> LOG
+
+DTF  --> SM  : read path (unchanged)
+DTF  --> CW  : write path (new)
+CW   --> DT  : atomic commit (add/remove actions)
+COMP --> CW  : rewrite + commit bin-packed files
+VAC  --> DT  : delete files past retired-and-expired
+
+ITF --> IT : read via iceberg-core
+TF  <|.. DTF
+TF  <|.. ITF
+
+QP  --> PP
+QP  --> FSP
+QP  --> PVS
+QP  --> PC
+TF  --> QP : normalized Snapshot (schema + file list)
+
+PTAR --> RGP
+PTAR --> GPE
+PTAR --> PVA
+PTAR --> NTD
+PTAR --> ITC
+PTAR --> PFC
+FOP  --> PTAR : fused decode + residual filter (existing)
+AOP  --> FOP  : consumes filtered Arrow batches
+SOP  --> AOP
+
+WB   --> ATPW : flush threshold hit\n(size or time)
+ATPW --> CW : new Parquet file path\nfor a committed add action
+WB ..> PTAR : read-your-writes\n(not-yet-flushed rows,\nchecked alongside committed files)
+
+TL --> MC
+TL --> AC
+
+DFP --> QP
+DFP --> AOP
+DFP --> WB   : DoPut → buffer first
+DFP --> TR
+DFP --> CAT
+DFSA --> DFP
+
+CLI --> TR2
+TR2 --> CAT
+TR2 --> TL
+CLI --> QP   : direct in-process query
+CLI --> CW   : direct in-process ingest/compact/vacuum
+
+' ─── CLIENTS ─────────────────────────────────────────────
+actor "Python\n(pyarrow.flight)" as PY  #FAECE7
+actor "Java\n(arrow-flight-core)" as JV  #FAECE7
+actor "Go / Rust / JS\n(any Flight client)" as GX #FAECE7
+actor "RAG / LLM\n(MCP tool)" as RAG #FAECE7
+
+PY  --> DFSA : GetFlightInfo · DoGet · DoPut
+JV  --> DFSA
+GX  --> DFSA
+RAG --> DFSA
+
+@enduml

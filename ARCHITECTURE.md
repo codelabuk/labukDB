@@ -1,5 +1,14 @@
 # Architecture walkthrough
 
+> **Note:** this document describes the v1 single-module engine
+> (package `com.labuk.deltaflight`). The project has since been split
+> into the multi-module labukDB layout (package `com.labuk.labukdb`,
+> modules `labukdb-core`/`labukdb-flight`/`labukdb-server-app`/`labukdb-cli`)
+> — see [docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md)
+> for the current module design. The four-layer concepts below (log →
+> planner → decode → flight) are unchanged, just repackaged; this doc
+> gets a full rewrite once the write-path work lands on top of them.
+
 A complete tour of what this project is and how every piece works, meant
 to be readable start to finish. The README covers status and caveats; this
 covers understanding.

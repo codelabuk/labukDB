@@ -48,9 +48,9 @@ dist/
 *.tmp
 *.swp
 
-# Delta CLI catalog — user-specific, should not be committed
-# (stored under ~/.delta-flight-engine/catalog.json, not the repo,
-# but .gitignore it here as a safety net for anyone who runs from the repo root)
+# labukdb CLI catalog — user-specific, should not be committed
+# (stored under ~/.labukdb/catalog.json, not the repo, but .gitignore
+# it here as a safety net for anyone who runs from the repo root)
 catalog.json
 
 # Hadoop local scratch

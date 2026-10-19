@@ -32,7 +32,7 @@ skinparam note {
   FontColor #2C2C2A
 }
 
-title delta-flight-engine v1 — System Architecture\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+title delta-flight-engine v1 — System Architecture (superseded — see labukdb-v2-module-architecture.puml)\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
 
 ' ─── WRITERS ───────────────────────────────────────────
 package "Writers (upstream — not part of this project)" #F1EFE8 {

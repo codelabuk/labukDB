@@ -6,7 +6,10 @@
         <sourceOutputDir name="target/generated-sources/annotations" />
         <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
         <outputRelativeToContentRoot value="true" />
-        <module name="delta-flight-engine" />
+        <module name="labukdb-cli" />
+        <module name="labukdb-flight" />
+        <module name="labukdb-core" />
+        <module name="labukdb-server-app" />
       </profile>
     </annotationProcessing>
   </component>

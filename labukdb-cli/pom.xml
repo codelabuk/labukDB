@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.labuk</groupId>
+    <artifactId>labukdb-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>labukdb-cli</artifactId>
+  <packaging>jar</packaging>
+
+  <!--
+    catalog / describe / query subcommands, kubectl-style. Depends on
+    labukdb-core ONLY — it talks to the engine in-process, no Flight
+    server involved, which also makes it useful for isolating "is this a
+    server problem or an engine problem."
+  -->
+  <dependencies>
+    <dependency>
+      <groupId>com.labuk</groupId>
+      <artifactId>labukdb-core</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <!--
+                Bundles every dependency into one runnable jar, so the CLI
+                becomes `java -jar labukdb-cli.jar <subcommand>` instead of
+                needing a hand-built classpath string. ServicesResourceTransformer
+                is not optional here — Hadoop's FileSystem lookup relies on
+                merged META-INF/services entries across multiple jars;
+                without it, shading silently keeps only one jar's service
+                file and HadoopInputFile lookups break in the fat jar
+                specifically, not in the unshaded classpath case.
+              -->
+              <finalName>labukdb-cli</finalName>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>com.labuk.labukdb.cli.LabukDbCli</mainClass>
+                </transformer>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
