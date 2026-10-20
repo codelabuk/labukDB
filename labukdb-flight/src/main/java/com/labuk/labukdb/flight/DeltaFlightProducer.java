@@ -8,6 +8,7 @@ import com.labuk.labukdb.flight.query.PredicateCodec;
 import com.labuk.labukdb.core.log.Snapshot;
 import com.labuk.labukdb.core.log.SnapshotManager;
 import com.labuk.labukdb.core.log.TableCache;
+import com.labuk.labukdb.core.log.WriteBuffer;
 import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.planner.Predicate;
 import com.labuk.labukdb.core.planner.PartitionValueSubstituter;
@@ -16,13 +17,16 @@ import com.labuk.labukdb.core.planner.ScanPlan;
 import com.labuk.labukdb.core.storage.AdlsConfiguration;
 import com.labuk.labukdb.core.storage.MinioConfiguration;
 import com.labuk.labukdb.core.storage.TableLocation;
+import com.labuk.labukdb.flight.query.FlightWriteRequest;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
 import org.apache.arrow.flight.FlightProducer.StreamListener;
+import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.NoOpFlightProducer;
+import org.apache.arrow.flight.PutResult;
 import org.apache.arrow.flight.SchemaResult;
 import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
@@ -31,10 +35,14 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Ties layers 1-3 together and exposes them over Arrow Flight.
@@ -70,6 +78,20 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final TableCache tableCache = new TableCache();
     private final TableCatalog catalog;
     private final Configuration storageConf;
+
+    /**
+     * Active {@link WriteBuffer}s, keyed by table root + sorted partition
+     * values — reused across separate {@code DoPut} calls so buffering
+     * actually accumulates instead of each call starting a fresh,
+     * empty buffer (which would defeat the point of buffering at all).
+     * Unbounded, no eviction — a first-cut simplification: an idle entry
+     * holds no open file handles, only a small amount of heap, so this
+     * isn't a correctness problem, just not a complete cache policy yet.
+     */
+    private final Map<String, WriteBuffer> writeBuffers = new ConcurrentHashMap<>();
+
+    private static final long DEFAULT_MAX_BUFFERED_ROWS = 100_000;
+    private static final long DEFAULT_MAX_BUFFERED_BYTES = 64L * 1024 * 1024;
 
     public DeltaFlightProducer(BufferAllocator allocator) {
         this(allocator, TableCatalog.atDefaultLocation(), mergedStorageConf());
@@ -125,16 +147,26 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * credentials come from.
      */
     private TableLocation resolveTableRoot(FlightQueryRequest query) {
+        return resolveTableLocation(query.getTable(), query.getTableRoot());
+    }
+
+    /**
+     * Shared by {@code getFlightInfo}/{@code getSchema} (via
+     * {@link #resolveTableRoot}) and {@code acceptPut} — resolves exactly
+     * one of a catalog name or a raw path/URI to a {@link TableLocation},
+     * with remote locations picking up this producer's {@code storageConf}.
+     */
+    private TableLocation resolveTableLocation(String table, String tableRoot) {
         String raw;
-        if (query.getTable() != null) {
-            raw = catalog.resolve(query.getTable())
+        if (table != null) {
+            raw = catalog.resolve(table)
                     .orElseThrow(() -> new IllegalArgumentException(
-                            "No table registered in the catalog under the name '" + query.getTable() + "'"));
-        } else if (query.getTableRoot() != null) {
-            raw = query.getTableRoot();
+                            "No table registered in the catalog under the name '" + table + "'"));
+        } else if (tableRoot != null) {
+            raw = tableRoot;
         } else {
             throw new IllegalArgumentException(
-                    "Query must set either 'table' (a catalog name) or 'tableRoot' (a raw path or URI)");
+                    "Request must set either 'table' (a catalog name) or 'tableRoot' (a raw path or URI)");
         }
         return TableLocation.isRemoteUri(raw)
                 ? TableLocation.forRemote(raw, storageConf)
@@ -249,6 +281,87 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         } finally {
             registry.invalidate(ticketId);
         }
+    }
+
+    /**
+     * Streams incoming Arrow batches into a {@link WriteBuffer} for the
+     * requested table + partition, flushing unconditionally once the
+     * client finishes sending — a successful {@code DoPut} means
+     * "committed," not "buffered somewhere, maybe." Batching across
+     * *separate* {@code DoPut} calls via {@code WriteBuffer}'s own
+     * size/time threshold isn't exercised by this policy (only batching
+     * *within* one call's multiple streamed batches is) — a deliberate
+     * v1 simplification, not an oversight.
+     *
+     * Local disk only, same constraint {@code CommitWriter}/
+     * {@code ArrowToParquetWriter} already have — a remote table location
+     * gets a clear {@code UNIMPLEMENTED} instead of failing confusingly
+     * deep inside the encoder.
+     */
+    @Override
+    public Runnable acceptPut(CallContext context, FlightStream flightStream, StreamListener<PutResult> ackStream) {
+        return () -> {
+            try {
+                FlightWriteRequest request = MAPPER.readValue(
+                        flightStream.getDescriptor().getCommand(), FlightWriteRequest.class);
+                TableLocation tableRoot = resolveTableLocation(request.getTable(), request.getTableRoot());
+
+                if (tableRoot.isRemote()) {
+                    ackStream.onError(CallStatus.UNIMPLEMENTED
+                            .withDescription("DoPut against remote storage (s3a://, abfss://) is not yet "
+                                    + "supported — the write path (CommitWriter/ArrowToParquetWriter) is "
+                                    + "local-disk only today.")
+                            .toRuntimeException());
+                    return;
+                }
+                Map<String, String> partitionValues = request.getPartitionValues();
+                if (partitionValues == null) {
+                    throw new IllegalArgumentException(
+                            "'partitionValues' is required — WriteBuffer buffers one partition at a time");
+                }
+
+                WriteBuffer writeBuffer = writeBufferFor(tableRoot, partitionValues);
+
+                while (flightStream.next()) {
+                    writeBuffer.append(flightStream.getRoot());
+                }
+                if (writeBuffer.bufferedRowCount() > 0) {
+                    writeBuffer.flush();
+                }
+
+                ackStream.onNext(PutResult.empty());
+                ackStream.onCompleted();
+            } catch (IOException e) {
+                ackStream.onError(CallStatus.INTERNAL.withDescription("Failed to write: " + e.getMessage())
+                        .toRuntimeException());
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                ackStream.onError(CallStatus.INVALID_ARGUMENT.withDescription(e.getMessage()).toRuntimeException());
+            } catch (RuntimeException e) {
+                // Same reasoning as getFlightInfo's catch-all.
+                e.printStackTrace();
+                ackStream.onError(CallStatus.INTERNAL
+                        .withDescription(e.getClass().getSimpleName() + ": " + e.getMessage())
+                        .withCause(e)
+                        .toRuntimeException());
+            }
+        };
+    }
+
+    /**
+     * Keyed by table root + sorted partition values, so repeated
+     * {@code DoPut} calls against the same (table, partition) reuse one
+     * buffering {@link WriteBuffer} instead of each starting fresh.
+     */
+    private WriteBuffer writeBufferFor(TableLocation tableRoot, Map<String, String> partitionValues) {
+        String key = tableRoot.raw() + "|" + new TreeMap<>(partitionValues);
+        return writeBuffers.computeIfAbsent(key, k -> {
+            try {
+                return new WriteBuffer(tableRoot.localPath(), partitionValues,
+                        DEFAULT_MAX_BUFFERED_ROWS, DEFAULT_MAX_BUFFERED_BYTES, allocator);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Failed to open WriteBuffer for " + tableRoot, e);
+            }
+        });
     }
 
     /**
