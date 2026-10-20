@@ -24,6 +24,17 @@ public class RemoveFile {
     @JsonProperty("dataChange")
     private boolean dataChange;
 
+    /** No-arg — used by Jackson for JSON deserialization. */
+    public RemoveFile() {
+    }
+
+    /** Used by {@code Compactor} to build a remove action to serialize, not from JSON. */
+    public RemoveFile(String path, Long deletionTimestamp, boolean dataChange) {
+        this.path = path;
+        this.deletionTimestamp = deletionTimestamp;
+        this.dataChange = dataChange;
+    }
+
     public String getPath() {
         return path;
     }

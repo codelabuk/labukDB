@@ -80,11 +80,21 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
 - **`encode/ArrowToParquetWriter`** — the write-side mirror of
   `ParquetToArrowReader`; turns a flushed buffer into a Parquet file that
   `CommitWriter` then references in a commit.
-- **`format/Compactor` and `format/Vacuum`** — bin-pack small files into
-  an `OPTIMIZE`-style commit, and remove orphaned file bytes past a
-  retention window. Needs the same concurrency-safety rigor as
-  `CommitWriter` itself, since it rewrites files a reader or another
-  writer might be mid-snapshot against.
+- **`log/Compactor` and `log/Vacuum`** — ✅ **Done** (placed in `log/`
+  alongside `CommitWriter`, not `format/` — same reasoning that already
+  kept `CommitWriter` out of the `TableFormat`-SPI package). `Compactor`
+  bin-packs all active files for a table+partition into one
+  `OPTIMIZE`-style commit (every action `dataChange=false`, matching real
+  Delta semantics — what lets incremental readers skip compaction commits
+  entirely); no size/age selection heuristic yet, a named future tuning,
+  not a correctness gap. `Vacuum` scans full commit history for stale
+  `remove` actions past a retention window (7 days, matching real Delta's
+  own default) and deletes their bytes — proven to never delete a file
+  still in the *current* active set even when a stale historical commit
+  claims to have removed that same path (the one safety invariant that
+  actually matters). No new concurrency risk from either: old bytes stay
+  on disk until `Vacuum` runs, so an in-flight reader's isolation already
+  holds via `Snapshot`'s existing defensive copy.
 - **`execution/`** — ✅ **Done**: `AggregateOperator` (`GROUP BY` +
   `SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) and `SortLimitOperator` (`ORDER BY`/
   `LIMIT`, built on `arrow-algorithm`'s `IndexSorter`/`DefaultVectorComparators`
@@ -187,7 +197,7 @@ foundation under it is proven:
 2. ✅ **`WriteBuffer`** — the memtable/WAL layer. Done, including real crash recovery.
 3. ✅ **`DoPut` on Flight** — wires the ingest entry point to (1) + (2). Done,
    verified against a real server with a real `pyarrow.flight` client.
-4. **Compaction / vacuum.** Not started.
+4. ✅ **Compaction / vacuum.** Done — `Compactor` + `Vacuum`, real-table verified.
 5. ✅ **`execution/`** — `AggregateOperator` + `SortLimitOperator` done,
    standalone and composed; not yet wired into `flight` (see above).
 6. **Multi-writer OCC** — deferred, per the recommendation above, until

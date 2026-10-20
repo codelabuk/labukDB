@@ -42,6 +42,12 @@ public class SingleAction {
         return a;
     }
 
+    public static SingleAction ofRemove(RemoveFile remove) {
+        SingleAction a = new SingleAction();
+        a.remove = remove;
+        return a;
+    }
+
     public static SingleAction ofMetaData(MetadataAction metaData) {
         SingleAction a = new SingleAction();
         a.metaData = metaData;

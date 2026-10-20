@@ -3,6 +3,7 @@ package com.labuk.labukdb.core.log;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.labuk.labukdb.core.encode.ArrowToParquetWriter;
 import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.log.action.RemoveFile;
 import com.labuk.labukdb.core.log.action.SingleAction;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -10,6 +11,7 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Map;
 import java.util.UUID;
 
@@ -67,23 +69,63 @@ public final class CommitWriter {
         Snapshot current = snapshotManager.latest();
         long nextVersion = current.getVersion() + 1;
 
-        String relativePath = buildRelativePath(current, partitionValues);
-        File dataFile = tableRoot.resolve(relativePath).toFile();
-        Files.createDirectories(dataFile.getParentFile().toPath());
-        parquetWriter.write(dataFile, batch);
-
-        AddFile addFile = new AddFile(
-                relativePath.replace('\\', '/'),
-                partitionValues,
-                dataFile.length(),
-                System.currentTimeMillis(),
-                true,
-                null);
+        AddFile addFile = encodeToNewFile(current, batch, partitionValues, true);
 
         String commitLine = mapper.writeValueAsString(SingleAction.ofAdd(addFile));
         storage.createCommitFile(CommitFileNames.jsonFileName(nextVersion), commitLine + "\n");
 
         return nextVersion;
+    }
+
+    /**
+     * Replaces {@code filesToRemove} with one new file encoded from
+     * {@code mergedBatch}, as a single atomic commit — what {@code Compactor}
+     * uses. Every action in this commit, both the removes and the add, has
+     * {@code dataChange=false}: compaction doesn't change the table's
+     * logical data, only which physical file holds it, which is exactly
+     * what lets incremental/change-data-feed readers safely skip a
+     * compaction commit entirely rather than reprocessing unchanged data.
+     *
+     * Removing the log entries here does not delete the old files' bytes
+     * from disk — that's {@code Vacuum}'s job, deliberately separate, so
+     * an in-flight reader that resolved its snapshot before this commit
+     * can still legally read a file this commit just removed.
+     *
+     * @return the new table version
+     */
+    public long replaceFiles(Collection<AddFile> filesToRemove, VectorSchemaRoot mergedBatch,
+                              Map<String, String> partitionValues) throws IOException {
+        Snapshot current = snapshotManager.latest();
+        long nextVersion = current.getVersion() + 1;
+
+        AddFile addFile = encodeToNewFile(current, mergedBatch, partitionValues, false);
+
+        StringBuilder commit = new StringBuilder();
+        for (AddFile removed : filesToRemove) {
+            RemoveFile removeFile = new RemoveFile(removed.getPath(), System.currentTimeMillis(), false);
+            commit.append(mapper.writeValueAsString(SingleAction.ofRemove(removeFile))).append('\n');
+        }
+        commit.append(mapper.writeValueAsString(SingleAction.ofAdd(addFile))).append('\n');
+
+        storage.createCommitFile(CommitFileNames.jsonFileName(nextVersion), commit.toString());
+        return nextVersion;
+    }
+
+    /** Shared by {@link #appendBatch} and {@link #replaceFiles} — encodes a batch under the table's partition layout, doesn't commit anything itself. */
+    private AddFile encodeToNewFile(Snapshot current, VectorSchemaRoot batch, Map<String, String> partitionValues,
+                                     boolean dataChange) throws IOException {
+        String relativePath = buildRelativePath(current, partitionValues);
+        File dataFile = tableRoot.resolve(relativePath).toFile();
+        Files.createDirectories(dataFile.getParentFile().toPath());
+        parquetWriter.write(dataFile, batch);
+
+        return new AddFile(
+                relativePath.replace('\\', '/'),
+                partitionValues,
+                dataFile.length(),
+                System.currentTimeMillis(),
+                dataChange,
+                null);
     }
 
     /**
