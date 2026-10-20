@@ -233,9 +233,53 @@ Local disk, S3/MinIO (`s3a://`, via optional `hadoop-aws`), and ADLS Gen2
 entry point, `TableLocation`, by URI scheme. Both dependencies are
 optional — a local-only consumer isn't forced to pull in either SDK.
 
-Currently: the log/metadata layer is fully storage-abstracted; the
-Parquet *data* read path in `decode/` still assumes local files, so a
-genuine end-to-end remote query isn't wired through yet.
+**Read path:** fully remote-capable — log/metadata and the Parquet data
+read in `decode/` both dispatch through `TableLocation`, the same path
+`DeltaFlightProducer` uses for every query.
+
+**Write path:** the commit log's atomic append (`CommitWriter`'s
+underlying `createCommitFile`) is remote-capable for all three backends
+and **verified against a real MinIO cluster** (not just implemented —
+see Status below). The Parquet *data file* write (`ArrowToParquetWriter`)
+is still local-disk only — writing a new table version against a remote
+table doesn't fully work end-to-end yet.
+
+### Configuring a remote backend
+
+No config file today — the CLI and Flight server both read connector
+settings from environment variables automatically whenever a table
+location uses a remote URI scheme (`TableResolver` and
+`DeltaFlightProducer`, respectively):
+
+| Backend | Environment variables | Example location |
+|---|---|---|
+| Local disk | *(none)* | `/path/to/table` or `D:\path\to\table` |
+| MinIO | `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | `s3a://bucket/table` |
+| S3 (real AWS) | *(none specific to this project)* — falls back to Hadoop's default AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, or an IAM role) when no `MINIO_*` vars are set | `s3a://bucket/table` |
+| ADLS Gen2 | `ADLS_STORAGE_ACCOUNT`, `ADLS_AUTH_TYPE` (`SharedKey` or `OAuth`), then `ADLS_ACCOUNT_KEY` **or** `ADLS_TENANT_ID`/`ADLS_CLIENT_ID`/`ADLS_CLIENT_SECRET` | `abfss://container@account.dfs.core.windows.net/table` |
+
+```
+export MINIO_ENDPOINT=https://your-minio-host
+export MINIO_ACCESS_KEY=...
+export MINIO_SECRET_KEY=...
+bin/labukdb catalog add logs s3a://bucket/path/to/table
+bin/labukdb describe logs
+```
+
+**Embedding `labukdb-core` as a library:** there's no env-var
+auto-detection at that layer — build the `Configuration` yourself and
+pass it explicitly, since the core engine has no opinion on where config
+should come from:
+
+```java
+Configuration conf = MinioConfiguration.forMinio(endpoint, accessKey, secretKey);
+// or AdlsConfiguration.forSharedKey(account, key) / .forServicePrincipal(...)
+TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
+```
+
+`MinioConfiguration.fromEnvironment()` / `AdlsConfiguration.fromEnvironment()`
+are available to call directly too, if you want the same env-var
+convenience the CLI uses inside your own application.
 
 ## Python client & RAG demo
 
