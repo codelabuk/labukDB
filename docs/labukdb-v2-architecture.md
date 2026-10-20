@@ -85,11 +85,20 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   retention window. Needs the same concurrency-safety rigor as
   `CommitWriter` itself, since it rewrites files a reader or another
   writer might be mid-snapshot against.
-- **`execution/`** — `FilterOperator` (formalizes the existing residual-
-  predicate pass), `AggregateOperator` (`GROUP BY` + `SUM`/`COUNT`/
-  `MIN`/`MAX`/`AVG`), `SortLimitOperator`. This is the piece that was
-  missing to call this a "database" rather than a scan gateway — not a
-  general SQL optimizer, just enough for real workloads.
+- **`execution/`** — ✅ **Done**: `AggregateOperator` (`GROUP BY` +
+  `SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) and `SortLimitOperator` (`ORDER BY`/
+  `LIMIT`, built on `arrow-algorithm`'s `IndexSorter`/`DefaultVectorComparators`
+  rather than hand-rolled comparison logic), proven individually and
+  composed together, tested including a 50-row case that genuinely
+  exercises `IndexSorter`'s quicksort path, not just small-array
+  insertion sort. `FilterOperator` deliberately **not** built — the
+  existing fused residual-predicate pass in `decode/GroupPredicateEvaluator`
+  already filters rows during decode; a separate post-decode operator
+  would have no real caller yet (same premature-abstraction reasoning
+  that deferred `TableFormat`). **Not yet wired into `flight`/
+  `DeltaFlightProducer`** — `GetFlightInfo`'s one-endpoint-per-file model
+  doesn't fit `GROUP BY`'s need to combine rows across files without a
+  real protocol decision, named but not answered here.
 
 `flight/DoPut` is the ingest entry point: it hands incoming Arrow batches
 to `WriteBuffer` first, not straight to `ArrowToParquetWriter`.
@@ -174,18 +183,13 @@ Not all five new subsystems carry equal risk — ordered to get something
 demoable early and defer the highest-risk, least-verified piece until the
 foundation under it is proven:
 
-1. **Single-writer commit path, no `WriteBuffer` yet** — "append one
-   commit atomically, read it back correctly," one Parquet file per
-   write. Proves `ArrowToParquetWriter` and commit-JSON construction
-   before anything else adds complexity on top.
-2. **`WriteBuffer`** — insert the memtable/WAL layer between `DoPut` and
-   (1), so file count stops being one-per-write. Do this *before* wiring
-   `DoPut` into the public API, not after — retrofitting a buffer under
-   an API clients already depend on is strictly harder.
-3. **`DoPut` on Flight** — wires the ingest entry point to (1) + (2).
-4. **Compaction / vacuum.**
-5. **`execution/`** — independent of the write path, can happen in
-   parallel with 1–4.
+1. ✅ **Single-writer commit path** — `CommitWriter` + `ArrowToParquetWriter`. Done.
+2. ✅ **`WriteBuffer`** — the memtable/WAL layer. Done, including real crash recovery.
+3. ✅ **`DoPut` on Flight** — wires the ingest entry point to (1) + (2). Done,
+   verified against a real server with a real `pyarrow.flight` client.
+4. **Compaction / vacuum.** Not started.
+5. ✅ **`execution/`** — `AggregateOperator` + `SortLimitOperator` done,
+   standalone and composed; not yet wired into `flight` (see above).
 6. **Multi-writer OCC** — deferred, per the recommendation above, until
    the per-backend atomic-write verification in
    [Concurrent writes](#concurrent-writes) is actually done. v1 ships

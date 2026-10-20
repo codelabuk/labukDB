@@ -10,6 +10,7 @@
         <module name="labukdb-flight" />
         <module name="labukdb-core" />
         <module name="labukdb-server-app" />
+        <module name="labukdb-format-iceberg" />
       </profile>
     </annotationProcessing>
   </component>
