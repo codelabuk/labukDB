@@ -148,22 +148,25 @@ and it's not uniform:
 
 | Backend | Atomic create-if-absent | Status |
 |---|---|---|
-| Local disk | `Files.createFile(path, CREATE_NEW)` | Trivial, already atomic |
-| S3 | `If-None-Match: *` conditional PUT | Native only since 2024 — whether `hadoop-aws`'s `S3AFileSystem` exposes this cleanly, or whether this needs the raw S3 SDK instead, is **unverified** |
-| MinIO | Depends on S3 API version emulated | **Unverified** |
-| ADLS Gen2 | Lease / `If-None-Match` via the `abfs` driver | **Unverified** |
+| Local disk | `Files.createFile(path, CREATE_NEW)` | Done, trivially atomic |
+| S3 (native AWS) | `If-None-Match: *` conditional PUT, via Hadoop ≥3.4.2's S3A support ([HADOOP-19256](https://issues.apache.org/jira/browse/HADOOP-19256)) | **Implemented** (`log/HadoopLogStorage`, Hadoop bumped to 3.4.3) — verified only via local-filesystem substitution (`HadoopLogStorageTest`), **not a real AWS endpoint** |
+| MinIO | Same S3A code path | **Implemented and verified against a real cluster** (`quay.io/minio/minio:latest`) — create, read-back, conflicting second create correctly threw `FileAlreadyExistsException`, original content survived. Not a guarantee for every MinIO build, but this common image works. |
+| ADLS Gen2 | Create-without-overwrite-first, via `abfs` ([HADOOP-17215](https://issues.apache.org/jira/browse/HADOOP-17215), already in Hadoop 3.3.0+) | **Implemented**, same code path as S3/MinIO — **unverified against a real ADLS endpoint** |
 
 Real Delta Lake OSS historically needed an external coordinator (a
 DynamoDB table) for S3 specifically, before S3 gained native conditional
-writes. This project would hit the same problem if it assumed otherwise
-without checking.
+writes. This project would have hit the same problem if it had assumed
+otherwise without checking — which is exactly why this was researched
+before being implemented, not assumed.
 
-**Recommendation:** scope labukDB v1 to **single-writer-per-table** — no
-concurrent-commit races, because only one process ever writes a given
-table at a time. Still a complete, useful database. This defers true
-multi-writer OCC (and the per-backend verification it depends on) to v2,
-once each backend's atomic-write primitive is actually confirmed rather
-than assumed.
+**Where this leaves the single-writer-per-table recommendation:** the
+atomic-write primitive itself is now implemented and real-verified for
+local disk and MinIO, implemented-but-unverified for S3 and ADLS. That
+derisks the *foundation* multi-writer OCC would sit on, but OCC's
+conflict-detection/retry logic itself (steps 4–5 above) still isn't
+built — labukDB remains single-writer-per-table until that's done, not
+because the primitive is in doubt anymore but because the algorithm on
+top of it hasn't been written yet.
 
 ## Build order
 

@@ -28,12 +28,16 @@ import java.util.List;
  * {@code Configuration} however fits their deployment (env vars, a
  * properties file, whatever), and hand it in.
  *
- * <b>Unverified against real S3/MinIO/ADLS</b> — this environment has no
- * way to test that. What's tested (see {@code SnapshotManagerTest}) is
- * that this class produces identical results to {@link LocalNioLogStorage}
- * when both point at the same local directory, since Hadoop's local
- * filesystem implementation should behave equivalently for local paths —
- * that's the part actually exercised, not a real S3 endpoint.
+ * <b>Read path (listing/reading commits):</b> unverified against real
+ * S3/MinIO/ADLS beyond what's described below — {@code SnapshotManagerTest}
+ * proves this class produces identical results to {@link LocalNioLogStorage}
+ * for the same local directory, which exercises Hadoop's local filesystem
+ * dispatch, not a real remote endpoint.
+ *
+ * <b>Write path ({@code createCommitFile}):</b> verified against a real
+ * MinIO cluster — see the atomicity breakdown below. S3 and ADLS remain
+ * verified only via local-filesystem substitution ({@code HadoopLogStorageTest}),
+ * not a real endpoint.
  *
  * <h2>{@code createCommitFile} — atomicity per backend</h2>
  * Implemented via the standard {@code FileSystem.create(path, overwrite=false)}
@@ -46,10 +50,14 @@ import java.util.List;
  *       PUT at stream close (<a href="https://issues.apache.org/jira/browse/HADOOP-19256">HADOOP-19256</a>,
  *       {@code fs.s3a.create.conditional.enabled}, on by default). This
  *       project pins Hadoop 3.4.3.</li>
- *   <li><b>MinIO:</b> same code path as S3, but actual atomicity depends
- *       on whether that specific MinIO deployment honors the conditional
- *       header — <b>not guaranteed by this project</b>; verify against
- *       your own deployment before relying on it.</li>
+ *   <li><b>MinIO:</b> same code path as S3. <b>Verified against a real
+ *       cluster</b> ({@code quay.io/minio/minio:latest}, 2026-10-20) —
+ *       create, read-back, a conflicting second create correctly threw
+ *       {@link FileAlreadyExistsException}, and the original content
+ *       survived untouched. Not a universal guarantee for every MinIO
+ *       version/build — a different deployment should still be checked —
+ *       but this specific, common image does honor the conditional-write
+ *       header S3A relies on.</li>
  *   <li><b>ADLS Gen2:</b> protected by Hadoop's create-without-overwrite-first
  *       pattern since Hadoop 3.3.0 (<a href="https://issues.apache.org/jira/browse/HADOOP-17215">HADOOP-17215</a>)
  *       — plausibly safe given ADLS's API has a real create-vs-overwrite
