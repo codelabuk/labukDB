@@ -59,7 +59,7 @@ system alone.
 | Module | Contains (today's package) | Depends on | Produces |
 |---|---|---|---|
 | `labukdb-core` | `log/`, `planner/`, `decode/`, `storage/`, `catalog/` (reused) + `encode/`, `execution/`, `format/` (new) | — | embeddable library jar |
-| `labukdb-format-iceberg` | *(new)* `IcebergTableFormat`, delegating manifest parsing to `iceberg-core` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional) |
+| `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat`, delegating manifest/table loading to `iceberg-core:1.12.0`'s `HadoopTables` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional) |
 | `labukdb-flight` | `flight/` (adds `DoPut`) | `labukdb-core` [+ `labukdb-format-iceberg`] | library jar |
 | `labukdb-server-app` | `DeltaFlightServerApp` → `LabukDbServerApp` | `labukdb-core`, `labukdb-flight` | shaded standalone server jar |
 | `labukdb-cli` | `cli/` | `labukdb-core` in-process — no Flight needed, same as today | shaded CLI executable |
@@ -202,10 +202,15 @@ v1 core is the current priority; these are sequenced, not shelved.
 
 | Phase | Scope | Status |
 |---|---|---|
-| v1 core | `format/TableFormat`, `WriteBuffer`, `CommitWriter` (single-writer), `encode/`, `Compactor`/`Vacuum`, `execution/` | Not started — see [Build order](#build-order) above, this is the current priority |
-| Multi-format | `labukdb-format-iceberg` module, using `iceberg-core` (not hand-rolled) | Not started |
+| `CommitWriter` (single-writer) + `encode/` | Build-order steps 1 | ✅ Done — tested against a fixture and a real table |
+| `WriteBuffer` | Build-order step 2 | ✅ Done — auto-flush, crash recovery, tested |
+| Remote atomic commits (S3/MinIO/ADLS) | `HadoopLogStorage.createCommitFile`, Hadoop bumped to 3.4.3 | ✅ Implemented; **MinIO real-infra verified**, S3/ADLS implemented-but-unverified |
+| `format/TableFormat` + `DeltaTableFormat` | Additive SPI prep | ✅ Done, tested standalone |
+| **Multi-format — `labukdb-format-iceberg`** | `IcebergTableFormat`, using `iceberg-core:1.12.0` (not hand-rolled) | ✅ **Done** — read-only, path-based (`HadoopTables`, no catalog service). Validated the `TableFormat` shape as intended: surfaced two real mismatches (`atVersion`'s Delta-sequential assumption vs. Iceberg's non-sequential `snapshotId`; `schemaString`'s Delta-JSON shape vs. Iceberg's typed `Schema`) — named, not silently papered over. Also empirically proved `decode/ParquetToArrowReader` is format-agnostic: reads an Iceberg-committed file with zero changes. Tested against a self-built fixture table (`iceberg-core`'s own create API), not a Spark/Trino-written one — same caveat `CheckpointReader` carries for Delta checkpoints. |
+| `flight/DoPut` | Ingest endpoint | Not started — next, now that `WriteBuffer` exists to wire it to |
+| `TableFormat` wired into `planner`/`flight`/`cli` | Still deferred | Two implementations now exist and have already informed the interface (see mismatches above) — wiring itself still not done |
 | Read scale-out | Self-describing Flight tickets (encode the scan directly in the ticket bytes instead of a `TicketRegistry` lookup), stateless server replicas behind a load balancer | Not started — cheap once started, no new distributed-systems machinery needed since snapshot resolution is already stateless against shared object storage |
-| Multi-writer OCC across machines | Per-backend atomic create-if-absent verification (S3/MinIO/ADLS — see [Concurrent writes](#concurrent-writes)), then OCC conflict/retry | Not started — falls out naturally once verified, no extra coordination service needed |
+| Multi-writer OCC across machines | Per-backend atomic create-if-absent verification (S3/MinIO/ADLS — see [Concurrent writes](#concurrent-writes)), then OCC conflict/retry | Atomic-write primitive confirmed real on MinIO; conflict-detection/retry algorithm itself not started |
 | **Distributed ingestion fleet** | Router + sharded Ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer — IOx's Router/Ingester split | **Planned, not yet designed.** Genuinely the largest remaining piece — closer to a distributed-systems project than an extension of the single-node write path, and needs its own dedicated design pass once v1 core is real |
 | **Distributed query execution** | Splitting one query's work across multiple compute nodes (join/aggregate pushdown across a fleet, not just client-side fan-out over `FlightEndpoint`s) | **Planned, not yet designed.** Needs a real distributed query planner; revisit once `execution/` exists single-node and its limits are actually felt |
 

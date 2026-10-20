@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.labuk</groupId>
+    <artifactId>labukdb-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>labukdb-format-iceberg</artifactId>
+  <packaging>jar</packaging>
+
+  <!--
+    IcebergTableFormat — the second TableFormat implementation (see
+    labukdb-core's format/TableFormat), validating that interface's shape
+    against a real second format instead of just DeltaTableFormat.
+    Optional module: a Delta-only consumer of labukdb-core never needs to
+    pull in iceberg-core's dependency tree.
+
+    iceberg-core does NOT declare a hard dependency on Hadoop in its own
+    POM (confirmed by inspecting it directly) — it works here because
+    labukdb-core already brings hadoop-client onto the classpath for
+    HadoopTables' org.apache.hadoop.conf.Configuration usage.
+  -->
+  <dependencies>
+    <dependency>
+      <groupId>com.labuk</groupId>
+      <artifactId>labukdb-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-core</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -23,6 +23,7 @@
   -->
   <modules>
     <module>labukdb-core</module>
+    <module>labukdb-format-iceberg</module>
     <module>labukdb-flight</module>
     <module>labukdb-server-app</module>
     <module>labukdb-cli</module>
@@ -36,6 +37,7 @@
     <parquet.version>1.13.1</parquet.version>
     <arrow.version>16.1.0</arrow.version>
     <hadoop.version>3.4.3</hadoop.version>
+    <iceberg.version>1.12.0</iceberg.version>
     <surefire.version>3.2.5</surefire.version>
     <shade.version>3.5.1</shade.version>
   </properties>
@@ -63,6 +65,12 @@
         <groupId>com.fasterxml.jackson.core</groupId>
         <artifactId>jackson-databind</artifactId>
         <version>${jackson.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>org.apache.iceberg</groupId>
+        <artifactId>iceberg-core</artifactId>
+        <version>${iceberg.version}</version>
       </dependency>
 
       <dependency>
