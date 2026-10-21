@@ -95,6 +95,42 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   actually matters). No new concurrency risk from either: old bytes stay
   on disk until `Vacuum` runs, so an in-flight reader's isolation already
   holds via `Snapshot`'s existing defensive copy.
+- **`log/TableMerger`** — ✅ **Done**: upsert/MERGE by key, the
+  foundational piece a CDC source (e.g. Debezium) needs — `CommitWriter`
+  alone can only blind-append or compact, never apply an update/delete
+  by key. One table + partition per call: `inserts`/`updates`/`deletes`
+  as three separate `VectorSchemaRoot`s (not one batch with an
+  operation-indicator column), applied in that order against whatever's
+  currently in the partition, committed as a single atomic
+  `CommitWriter.replaceFiles(..., dataChange=true)` — `true` here, not
+  `Compactor`'s `false`, since row values genuinely change. **The key is
+  supplied fresh on every call, never stored as table metadata** — this
+  deliberately matches real Delta `MERGE INTO`'s own behavior (its `ON`
+  clause is always specified at query time, confirmed via Databricks'
+  docs), not Iceberg's `identifier-field-ids` (which IS persistent schema
+  metadata — but that's Iceberg's protocol, and `CommitWriter`/`TableMerger`
+  write Delta; storing a private `keyColumns` field in Delta's `metaData`
+  action would be a non-standard extension a real Spark/delta-rs/DuckDB
+  client wouldn't understand). Keys are scoped to their partition — no
+  cross-partition search; a key whose partition value changes over its
+  lifetime needs an explicit delete-then-insert orchestrated by the
+  caller. Guards against a correctness gap `Compactor` doesn't have to
+  worry about: before committing, re-checks that the partition's active
+  file set is *exactly* what was read at the start of the call, not just
+  "nothing I'm removing has vanished" (`replaceFiles`'s own check) —
+  catching a concurrent writer having *added* a file to the same
+  partition, which could otherwise collide at the key level. Verified
+  with a real two-thread race (a `merge()` call and a plain concurrent
+  `appendBatch` into the same partition, both landing with no data lost)
+  and a real-table smoke test (insert → update → delete against a copy
+  of `logs_delta`). Residual, named limitations: a narrow window remains
+  between that freshness check and the actual atomic write (closing it
+  needs a server-side "expected file set" precondition, out of scope);
+  every retry re-reads/re-decodes the whole partition, same cost
+  `Compactor` already accepts; no schema-type validation beyond "does
+  this named column exist." The Debezium connector itself (consuming its
+  embedded-engine change-event stream and calling this) is the next,
+  separate step.
 - **`execution/`** — ✅ **Done**: `AggregateOperator` (`GROUP BY` +
   `SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) and `SortLimitOperator` (`ORDER BY`/
   `LIMIT`, built on `arrow-algorithm`'s `IndexSorter`/`DefaultVectorComparators`
@@ -212,6 +248,9 @@ foundation under it is proven:
 6. ✅ **Multi-writer OCC (local disk)** — done, see above. Remote OCC
    (S3/MinIO/ADLS) remains a separate, later piece — `CommitWriter` is
    still local-only.
+7. ✅ **`TableMerger` — upsert/MERGE by key.** Done, see above. The
+   Debezium connector that would actually drive it is the next,
+   separate step — not started yet.
 
 ## Phase roadmap beyond v1 core
 

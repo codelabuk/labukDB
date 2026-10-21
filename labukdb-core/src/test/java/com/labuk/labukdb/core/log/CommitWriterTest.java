@@ -247,7 +247,7 @@ class CommitWriterTest {
 
             try (VectorSchemaRoot merged = buildBatch(allocator, new String[] {"merged"}, new long[] {99})) {
                 assertThrows(ConcurrentModificationException.class,
-                        () -> writer.replaceFiles(filesToCompact, merged, Map.of()),
+                        () -> writer.replaceFiles(filesToCompact, merged, Map.of(), false),
                         "one of the files to compact was already removed by a concurrent commit -- must not retry blindly");
             }
         }

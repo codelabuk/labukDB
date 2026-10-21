@@ -67,7 +67,11 @@ public final class Compactor {
             }
 
             CommitWriter commitWriter = new CommitWriter(tableRoot);
-            return commitWriter.replaceFiles(filesToCompact, combined, partitionValues);
+            // Bin-packing doesn't change the table's logical data, only
+            // which physical file holds it — dataChange=false, same as
+            // real Delta's OPTIMIZE, so change-data-feed-style readers can
+            // safely skip this commit without reprocessing unchanged rows.
+            return commitWriter.replaceFiles(filesToCompact, combined, partitionValues, false);
         } finally {
             if (combined != null) {
                 combined.close();

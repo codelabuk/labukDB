@@ -103,6 +103,21 @@ public final class CommitWriter {
      * an in-flight reader that resolved its snapshot before this commit
      * can still legally read a file this commit just removed.
      *
+     * <b>{@code dataChange}</b> — {@code false} for compaction ({@code
+     * Compactor}'s own call site), since bin-packing doesn't change the
+     * table's logical data, only which physical file holds it; {@code
+     * true} for a key-level merge/upsert ({@code TableMerger}), since row
+     * values genuinely change. Incremental/change-data-feed readers rely
+     * on this distinction to safely skip a compaction commit without
+     * reprocessing unchanged data — getting it wrong for a real data
+     * change would silently hide that change from such a reader.
+     *
+     * <b>{@code mergedBatch} with zero rows</b> commits removes-only, no
+     * add action — needed when every row in {@code filesToRemove} was
+     * deleted and nothing survived. {@code Compactor} never hits this
+     * (it only runs when files already exist to merge); additive for
+     * {@code TableMerger}'s "deleted everything in this partition" case.
+     *
      * <b>A known, minor tradeoff from retrying only the commit, not the
      * encode:</b> {@code mergedBatch} is encoded to a physical Parquet
      * file once, up front, before any retry/conflict-check attempt —
@@ -120,9 +135,14 @@ public final class CommitWriter {
      * @return the new table version
      */
     public long replaceFiles(Collection<AddFile> filesToRemove, VectorSchemaRoot mergedBatch,
-                              Map<String, String> partitionValues) throws IOException {
-        Snapshot initial = snapshotManager.latest();
-        AddFile addFile = encodeToNewFile(initial, mergedBatch, partitionValues, false);
+                              Map<String, String> partitionValues, boolean dataChange) throws IOException {
+        AddFile addFile;
+        if (mergedBatch.getRowCount() == 0) {
+            addFile = null;
+        } else {
+            Snapshot initial = snapshotManager.latest();
+            addFile = encodeToNewFile(initial, mergedBatch, partitionValues, dataChange);
+        }
 
         // Unlike appendBatch, this DOES depend on filesToRemove still being
         // present — re-checked against the freshly-resolved snapshot on
@@ -145,7 +165,9 @@ public final class CommitWriter {
             for (AddFile removed : filesToRemove) {
                 actions.add(SingleAction.ofRemove(new RemoveFile(removed.getPath(), System.currentTimeMillis(), false)));
             }
-            actions.add(SingleAction.ofAdd(addFile));
+            if (addFile != null) {
+                actions.add(SingleAction.ofAdd(addFile));
+            }
             return actions;
         });
     }
