@@ -1,18 +1,24 @@
-# lakehouse-flight
+# labukDB
 
 [![CI](https://github.com/codelabuk/lakehouse-flight/actions/workflows/ci.yml/badge.svg)](https://github.com/codelabuk/lakehouse-flight/actions)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-**A from-scratch Delta Lake read engine, served over Apache Arrow Flight.**
+**A from-scratch Delta Lake database — reads and writes, local or remote,
+embeddable or served over Apache Arrow Flight.**
 
-It reads Delta tables — local disk, S3, MinIO, or ADLS — prunes files down
-using a four-level pushdown pipeline, and streams the surviving rows out as
-Arrow IPC to any client in any language. No `delta-rs`, no `delta-kernel`,
-no DuckDB in the read path: the transaction log, the pruning, and the
-Parquet decode are all implemented here, one small and independently
-testable layer at a time.
+It reads and writes real Delta tables — local disk, S3, MinIO, or ADLS —
+prunes files down using a four-level pushdown pipeline on read, and
+streams rows in or out as Arrow IPC to any client in any language. It also
+reads (not yet writes) Iceberg tables. No `delta-rs`, no `delta-kernel`,
+no DuckDB/Spark in the path: the transaction log, pruning, Parquet
+encode/decode, and the write path (append, upsert/MERGE by key,
+compaction, vacuum, multi-writer concurrency, table creation) are all
+implemented here, one small and independently testable layer at a time.
 
-For a full guided tour of how it works, see **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+For a full guided tour of how it works, see **[ARCHITECTURE.md](ARCHITECTURE.md)**
+(the original read-path walkthrough) and
+**[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md)**
+(the current module design, including everything the write path added).
 This README covers what the project is, how the pieces fit together at a
 glance, and how to build and run it.
 
@@ -20,27 +26,37 @@ glance, and how to build and run it.
 
 ## What this is
 
-- **A read engine, not a SQL engine.** One operator — scan with pushdown.
-  No joins, no aggregations.
+- **A real database, not just a reader.** Append, upsert/MERGE by key,
+  compaction, vacuum, multi-writer optimistic concurrency, and creating a
+  brand-new table from nothing are all implemented and tested — this
+  stopped being read-only a while ago.
 - **Built from `_delta_log` up.** Every layer (log parsing, pruning,
-  Parquet decode, Flight serving) is its own package, readable and tested
-  on its own.
+  Parquet encode/decode, the write path, Flight serving) is its own
+  package, readable and tested on its own.
 - **A real Flight server.** Any language with an Arrow Flight client
-  binding — Python, Java, Go, Rust, JS — talks to it unmodified.
+  binding — Python, Java, Go, Rust, JS — talks to it unmodified, for both
+  reads (`DoGet`) and writes (`DoPut`).
+- **Embeddable too.** `labukdb-core` has no Flight/gRPC dependency — use
+  it as a plain library in your own JVM process, DuckDB-style, or run the
+  Flight server for network access, Postgres-style.
 - **Honest about its gaps.** See [Status & known limitations](#status--known-limitations)
   below rather than a marketing pass.
 
 ## What this is not
 
-- **Not a Spark replacement** — different scope entirely.
-- **Not a writer** — read-only by design; Spark/Flink handle writes.
-- **Not a full query engine** — reach for DuckDB or Trino if you need SQL.
+- **Not a SQL engine.** `GROUP BY`/`ORDER BY`/`LIMIT` exist as standalone
+  operators (`execution/`) but aren't wired into query serving yet — see
+  Status below. No joins.
+- **Not a Spark replacement** — different scope entirely, though it now
+  overlaps more than it used to (it writes real Delta tables Spark can
+  also read).
+- **Not Iceberg-write-capable yet** — Iceberg support is read-only.
 
 Companion project to `local-lakehouse-lab` (not part of it): that project
-is the *producer* story — Spark/Flink writing Delta tables, plus a DuckDB
-query layer. This one is the from-scratch *consumer* story, reading the
-same `_delta_log` + Parquet output with its own log parsing, pruning, and
-decode instead of delegating to an existing engine.
+is a Spark/Flink + DuckDB stack. This one is the from-scratch story —
+reading and writing the same `_delta_log` + Parquet format with its own
+log parsing, pruning, encode/decode, and write path instead of delegating
+to an existing engine.
 
 ## Why build this instead of using delta-kernel / DuckDB
 
@@ -49,40 +65,41 @@ below is deliberately small enough to reason about end to end.
 
 ---
 
-## The four layers
+## The layers
 
 ```
-Writers (Spark batch, Spark streaming, Flink) → Delta table
-                                                    │
-   ┌────────────────────────────────────────────────┴──┐
-   │  1. log/       parse the log, resolve a snapshot   │
-   │  2. planner/   decide which files to even open     │
-   │  3. decode/    Parquet → Arrow, filter rows         │
-   │  4. flight/    serve over gRPC                      │
-   └───────────────────────────────────────────────────┘
-                          │
-        Python / Java / LLM / dashboards / MCP
+  Read:  Delta/Iceberg table → 1. log/ (resolve) → 2. planner/ (prune) → 3. decode/ (Parquet → Arrow) ─┐
+  Write: Delta table ← log/ (commit: append/MERGE/compact/vacuum/create) ← encode/ (Arrow → Parquet) ──┤
+                                                                                                          │
+                                              4. flight/  (DoGet / DoPut)  ←───────────────────────────┘
+                                                        │
+                        Python / Java / Go / Rust / JS / LLM / dashboards / MCP
 ```
 
-| Layer | Package | Job | Key types |
+| Area | Package | Job | Key types |
 |---|---|---|---|
-| 1 | `log/` | Parse the commit log, resolve a snapshot at a version, timestamp, or `latest()`. Incrementally cached; falls back to checkpoints where available. | `CommitLogReader`, `SnapshotManager`, `CheckpointReader` |
-| 2 | `planner/` | Decide which files can be skipped, without opening them, using partition values and file-level stats from the log. Fail-open: anything it can't decide, it keeps. | `Predicate`, `PartitionPruner`, `FileStatsPruner`, `QueryPlanner` |
-| 3 | `decode/` | For each surviving file: prune row groups via Parquet footer stats, decode only the requested columns, apply the residual filter row-by-row, and reconstruct partition columns as constants. Decode and filter are fused into one pass. | `RowGroupPruner`, `GroupPredicateEvaluator`, `ParquetToArrowReader` |
-| 4 | `flight/` | Serve it. `GetFlightInfo` plans and returns one `FlightEndpoint` per surviving file; `DoGet` lazily decodes exactly the file its ticket refers to. | `DeltaFlightProducer`, `LabukDbServerApp` |
+| Read | `log/` | Parse the commit log, resolve a snapshot at a version, timestamp, or `latest()`. Incrementally cached; falls back to checkpoints where available. | `CommitLogReader`, `SnapshotManager`, `CheckpointReader` |
+| Read | `planner/` | Decide which files can be skipped, without opening them, using partition values and file-level stats from the log. Fail-open: anything it can't decide, it keeps. | `Predicate`, `PartitionPruner`, `FileStatsPruner`, `QueryPlanner` |
+| Read | `decode/` | For each surviving file: prune row groups via Parquet footer stats, decode only the requested columns, apply the residual filter row-by-row, and reconstruct partition columns as constants. Decode and filter are fused into one pass. | `RowGroupPruner`, `GroupPredicateEvaluator`, `ParquetToArrowReader` |
+| Write | `encode/` | Arrow → Parquet (the write mirror of `decode/`), and Arrow `Schema` → Delta's JSON `schemaString` for creating a table. | `ArrowToParquetWriter`, `ArrowToDeltaSchema` |
+| Write | `log/` | Append a batch, upsert/MERGE by key, compact small files, vacuum expired ones, create a brand-new table — all as atomic commits with multi-writer optimistic concurrency control. | `CommitWriter`, `WriteBuffer`, `TableMerger`, `Compactor`, `Vacuum`, `TableCreator` |
+| Both | `flight/` | Serve it. `GetFlightInfo`/`DoGet` for reads — plans and returns one `FlightEndpoint` per surviving file, decodes lazily per ticket. `DoPut` for writes — streams incoming batches into a buffer, flushes to a committed file. | `DeltaFlightProducer`, `LabukDbServerApp` |
+| — | `execution/` | `GROUP BY` aggregation and `ORDER BY`/`LIMIT`, standalone — not yet wired into `flight/` (see Status below). | `AggregateOperator`, `SortLimitOperator` |
 
 Supporting packages: `storage/` (local/S3/MinIO/ADLS location resolution),
-`catalog/` (name → table-root registry), `cli/` (the `labukdb` tool).
+`catalog/` (name → table-root registry), `cli/` (the `labukdb` tool),
+`format/` (the `TableFormat` SPI Delta and Iceberg both implement, prepped
+for multi-format but not yet wired into `planner`/`flight`/`cli`).
 
-**Multi-module since the labukDB restructuring:** these four layers now
-live in separate Maven modules — `labukdb-core` (log/planner/decode/
-storage/catalog, no Flight dependency, embeddable like DuckDB),
-`labukdb-flight` (Flight serving), `labukdb-server-app` (the runnable
-server jar), `labukdb-cli` (the `labukdb` binary, depends on
-`labukdb-core` only). See
+**Multi-module:** `labukdb-core` (everything above except `flight/`, no
+Flight/gRPC dependency, embeddable like DuckDB), `labukdb-flight` (Flight
+serving), `labukdb-format-iceberg` (optional, read-only Iceberg support),
+`labukdb-server-app` (the runnable server jar), `labukdb-cli` (the
+`labukdb` binary — `catalog`/`describe`/`query` only today, no write
+subcommands yet). See
 [docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
-the full module design and what's planned on top of it (write support,
-Iceberg, etc.).
+the full module design, every write-path decision, and what's still
+planned on top of it.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full walkthrough of each
 layer, including why a table is a log and not a folder, how pruning stays
@@ -217,6 +234,35 @@ side-by-side pruned vs. unpruned file count), and `DeltaFlightProducer`
 (in `labukdb-flight`) for exactly this same sequence wired into
 `GetFlightInfo`/`DoGet`.
 
+### Writing
+
+Creating a table, then appending to it — `TableCreator` and
+`CommitWriter` both take a `TableLocation`, so this works identically
+against a local path or an `s3a://`/`abfss://` URI (given the right
+`Configuration` — see [Configuring a remote backend](#configuring-a-remote-backend)):
+
+```java
+import com.labuk.labukdb.core.log.CommitWriter;
+import com.labuk.labukdb.core.log.TableCreator;
+import com.labuk.labukdb.core.storage.TableLocation;
+import org.apache.arrow.vector.types.pojo.*;
+
+TableLocation location = TableLocation.forLocal(Path.of("/path/to/new/table"));
+Field service = new Field("service", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+
+new TableCreator().createTable(location, new Schema(List.of(service, amount)),
+        List.of("level"), null);   // partitioned by "level", no table properties
+
+// ... build a VectorSchemaRoot batch, then:
+CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", "ERROR"));
+```
+
+`TableMerger.merge(...)` does insert/update/delete by key on top of this
+(local disk only today) — see its javadoc for the exact semantics
+(three separate batches, not an operation-indicator column; key supplied
+per call, not stored table metadata).
+
 ---
 
 ## The catalog
@@ -228,21 +274,33 @@ Unity Catalog, and doesn't try to be.
 
 ## Storage backends
 
-Local disk, S3/MinIO (`s3a://`, via optional `hadoop-aws`), and ADLS Gen2
-(`abfss://`, via optional `hadoop-azure`) are all resolved through one
-entry point, `TableLocation`, by URI scheme. Both dependencies are
-optional — a local-only consumer isn't forced to pull in either SDK.
+Local disk, S3/MinIO (`s3a://`), and ADLS Gen2 (`abfss://`) are all
+resolved through one entry point, `TableLocation`, by URI scheme.
+`hadoop-aws`/`hadoop-azure` are `optional` in `labukdb-core`'s own pom —
+a library consumer embedding just `labukdb-core` isn't forced to pull in
+either cloud SDK. The **shipped** `labukdb-server-app.jar`/`labukdb-cli.jar`
+are different: both declare these non-optional, since they're the actual
+runnable binaries the README advertises as able to read/write `s3a://`/
+`abfss://` tables — without that override, the shaded jars would silently
+ship with zero S3A/ADLS classes. Real, measured cost of that: both jars
+are ~780MB, dominated by AWS SDK v2's all-services "bundle" (not just
+S3 — `hadoop-aws` pulls in every AWS service client). An open, undecided
+trade-off — accept the size, split into lean/cloud build variants, or
+something else.
 
 **Read path:** fully remote-capable — log/metadata and the Parquet data
 read in `decode/` both dispatch through `TableLocation`, the same path
-`DeltaFlightProducer` uses for every query.
+`DeltaFlightProducer` uses for every query. Live-verified against a real
+MinIO cluster (scan, partition pruning, decode).
 
-**Write path:** the commit log's atomic append (`CommitWriter`'s
-underlying `createCommitFile`) is remote-capable for all three backends
-and **verified against a real MinIO cluster** (not just implemented —
-see Status below). The Parquet *data file* write (`ArrowToParquetWriter`)
-is still local-disk only — writing a new table version against a remote
-table doesn't fully work end-to-end yet.
+**Write path:** also fully remote-capable now — `CommitWriter`,
+`ArrowToParquetWriter`, `WriteBuffer`, and `TableCreator` all dispatch
+through `TableLocation`, local or remote, the same pattern the read path
+uses. Live-verified against a real MinIO cluster end to end: creating a
+brand-new table, appending data to it, and reading it back — both as a
+library call and through a real `DoPut`/`DoGet` round trip over Flight.
+`Compactor`, `Vacuum`, and `TableMerger` (upsert/MERGE) remain local-disk
+only by design — not yet extended to remote.
 
 ### Configuring a remote backend
 
@@ -297,11 +355,11 @@ convenience the CLI uses inside your own application.
 
 ## Status & known limitations
 
-**Type support (`decode/`):** INT32, INT64, FLOAT, DOUBLE, BOOLEAN, BINARY
-(UTF-8), INT96 (Spark's legacy timestamp encoding, decoded via
-`Int96TimestampCodec`), and `LIST<float/double/int/long/string>` for flat
-vector/array columns. Not yet supported: DECIMAL, nested `LIST<LIST<...>>`,
-MAP, STRUCT.
+**Type support (`decode/`/`encode/`):** INT32, INT64, FLOAT, DOUBLE,
+BOOLEAN, BINARY/UTF-8, timestamp (INT96 legacy on read via
+`Int96TimestampCodec`, a modern `TIMESTAMP` logical type on write), and
+`LIST<float/double/int/long/string>` for flat vector/array columns (read
+only). Not yet supported: DECIMAL, nested `LIST<LIST<...>>`, MAP, STRUCT.
 
 **Pruning:** `LIKE` filters correctly but don't get range-based pruning at
 the file/row-group level yet — correctness isn't affected, since the
@@ -319,10 +377,44 @@ Multi-part checkpoints aren't supported (fail loudly, not silently).
 caching (`ParquetFooterCache`) are both in place. A decoded-row-batch LRU
 for hot files is not yet implemented.
 
-**Flight surface:** `GetFlightInfo`, `DoGet`, and `ListFlights` are
-implemented. `DoPut`, `DoAction`, `DoExchange` are unimplemented —
-genuinely out of scope for a read-only, single-table-at-a-time engine
-right now.
+**Flight surface:** `GetFlightInfo`, `DoGet`, `DoPut`, and `ListFlights`
+are implemented, local and remote. `DoAction`/`DoExchange` are
+unimplemented — there's no CREATE TABLE RPC and no push-based
+tailing/subscription yet.
+
+**Write support:**
+- **Append** (`CommitWriter.appendBatch`, `WriteBuffer`/`DoPut`) — done,
+  local and remote, with multi-writer optimistic concurrency control
+  (bounded retry, conflict detection — real 10-thread concurrency tests).
+- **Upsert/MERGE by key** (`TableMerger`) — done, **local disk only**.
+  The key is supplied fresh on every call, not stored as table metadata —
+  matches real Delta `MERGE INTO`'s own behavior rather than inventing a
+  non-standard extension to the Delta protocol.
+- **Compaction and vacuum** (`Compactor`, `Vacuum`) — done, **local disk
+  only**. No size/age heuristic for which files to compact yet (merges
+  everything in a partition every time); no orphan-file detection in
+  `Vacuum` (only acts on files a `remove` action actually named).
+- **CREATE TABLE** (`TableCreator`) — done, local and remote, live-MinIO-
+  verified. Library capability only — no Flight `DoAction` RPC or CLI
+  subcommand yet.
+- **Not implemented:** writing to Iceberg tables (read-only today); CLI
+  write subcommands (`ingest`/`compact`/`vacuum`/`create-table` — the CLI
+  is `catalog`/`describe`/`query` only); `execution/`'s `GROUP BY`/
+  `ORDER BY` operators aren't wired into `flight/` (`GetFlightInfo`'s
+  one-endpoint-per-file model doesn't fit `GROUP BY`'s need to combine
+  rows across files, a real protocol decision not yet made); remote
+  multi-writer OCC has the right exception-handling in place but hasn't
+  been separately stress-tested under concurrent remote writers the way
+  local disk has.
+
+**A known, pre-existing flaky test:** `FlightIntegrationTest`
+intermittently fails (~1-in-4 observed) with a Flight/gRPC buffer-release
+timing error during teardown — confirmed not tied to any specific code
+path (it hits read-only tests as often as write ones), and Arrow's own
+issue tracker has the identical failure on Arrow's own Flight test suite,
+already concluded to be a flake
+([ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448)), not a
+real bug.
 
 ---
 
@@ -336,13 +428,13 @@ versions):
 | [Apache Parquet (`parquet-mr`)](https://parquet.apache.org/) | Footer statistics, row-group reads, the `Group` record API `GroupPredicateEvaluator` and `CheckpointReader` decode against |
 | [Apache Arrow](https://arrow.apache.org/) | The in-memory columnar format every decoded row lands in (`arrow-vector`) |
 | [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) | The gRPC-based wire protocol `flight/` serves over — this is *why* any language's Flight client works unmodified |
-| [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction for `log/` and `decode/` — no MapReduce/YARN/HDFS daemons involved, see [HADOOP_USAGE.md](HADOOP_USAGE.md) |
-| [Jackson](https://github.com/FasterXML/jackson) | Parsing the `_delta_log` JSON commit files |
+| [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction for `log/`, `decode/`, and `encode/` (read and write) — no MapReduce/YARN/HDFS daemons involved, see [HADOOP_USAGE.md](HADOOP_USAGE.md) |
+| [Jackson](https://github.com/FasterXML/jackson) | Parsing and writing the `_delta_log` JSON commit files |
 
 ## Inspired by, deliberately not depending on
 
-The point of this project is understanding the mechanics of a Delta reader
-first-hand, so these were read as references, not pulled in as
+The point of this project is understanding the mechanics of a Delta
+database first-hand, so these were read as references, not pulled in as
 dependencies:
 
 - **[Delta Lake transaction log protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)** —
@@ -367,22 +459,32 @@ dependencies:
 
 ## Roadmap
 
+### Write path
+| Item | Notes |
+|---|---|
+| Iceberg write support | `IcebergTableFormat` is read-only today; `CommitWriter`'s Delta-specific write path has no Iceberg equivalent yet |
+| `TableMerger`/`Compactor`/`Vacuum` for remote tables | All three remain local-disk only by design; `CommitWriter`/`ArrowToParquetWriter`/`WriteBuffer` already aren't |
+| Debezium CDC connector | Consumes Debezium's embedded-engine (no Kafka needed) change-event stream and calls `TableMerger` — `TableMerger` itself (the foundational piece) is done |
+| CLI write subcommands | `ingest`/`compact`/`vacuum`/`create-table` — the write-path classes all exist as library capabilities, none are exposed via the CLI yet |
+| Flight `DoAction` for CREATE TABLE | `TableCreator` is a library capability only; needs its own request/response shape decision |
+| Remote multi-writer OCC stress-testing | Conflict-retry logic handles both local (NIO) and remote (Hadoop) exception types; not separately stress-tested under concurrent remote writers the way local disk is |
+| Orphan-file detection | `Vacuum` only acts on files an explicit `remove` action named — a file written but never committed (e.g. a crash mid-write) is never found, the same gap Iceberg's separate `DeleteOrphanFiles` covers |
+
 ### Core engine
 | Item | Notes |
 |---|---|
-| Nested `LIST<LIST<...>>`, MAP, STRUCT | `LIST<primitive>` already supported |
-| Checkpoint multi-part support | Single-part works today |
+| Nested `LIST<LIST<...>>`, MAP, STRUCT | `LIST<primitive>` already supported, read-only |
+| Checkpoint multi-part support for writes | Multi-part checkpoints are read-supported; `CommitWriter` doesn't write checkpoints at all yet (every version replays from JSON) |
 | Row-data caching (LRU) | Metadata is cached; scanned rows are not |
-| Streaming subscriptions (`DoExchange`) | Push-based freshness, not pull |
-| Remote Parquet reads in `decode/` | Storage abstraction stops at the log layer today |
+| `execution/` wired into `flight/` | `GROUP BY`/`ORDER BY` exist standalone; `GetFlightInfo`'s one-endpoint-per-file model doesn't fit `GROUP BY`'s cross-file combine need — a real protocol decision, not yet made |
+| Streaming/tailing subscriptions (`DoExchange`) | Push-based freshness for readers, not pull — separate from the CDC-ingestion direction above |
 
-### Lakehouse gateway (primary next target)
+### Multi-format
 | Item | Notes |
 |---|---|
-| Iceberg metadata reader | Avro manifest lists/files — different from Delta's JSON log |
-| Multi-format dispatcher | One catalog entry knows its format; `GetFlightInfo` routes accordingly |
-| Parquet-only tables | No transaction log — direct file listing with stats |
-| Single Flight interface across Delta + Iceberg + Parquet | The headline feature |
+| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — read-only, path-based, tested against a self-built fixture rather than a Spark/Trino-written table |
+| `TableFormat` wired into `planner`/`flight`/`cli` | The SPI exists and is implemented by both Delta and Iceberg, but nothing actually dispatches through it yet |
+| Parquet-only tables (no transaction log) | Direct file listing with stats, no commit log |
 
 ### AI / LLM
 | Item | Notes |
@@ -401,7 +503,9 @@ dependencies:
 ### Infrastructure
 | Item | Notes |
 |---|---|
-| Distributed Flight / load balancing | Needs self-describing tickets — `TicketRegistry` is currently in-memory, single-instance |
+| Distributed Flight / load balancing (reads) | Needs self-describing tickets — `TicketRegistry` is currently in-memory, single-instance |
+| Distributed ingestion fleet | Router + sharded ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer. **Planned, not designed** — genuinely the largest remaining piece, closer to a distributed-systems project than an extension of the single-node write path; deliberately deferred until the single-node write path (above) is solid |
+| Distributed query execution | Splitting one query's work across multiple compute nodes, not just client-side fan-out over `FlightEndpoint`s. **Planned, not designed** |
 | Authentication / authorization | Token-based access control on Flight endpoints |
 | Docker / Helm chart | Deployable as a service, not just a JAR |
 
