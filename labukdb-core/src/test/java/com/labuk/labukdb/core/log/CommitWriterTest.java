@@ -18,9 +18,18 @@ import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.ConcurrentModificationException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -144,6 +153,103 @@ class CommitWriterTest {
              VectorSchemaRoot batch = buildBatch(allocator, new String[] {"a"}, new long[] {1})) {
             assertThrows(IllegalArgumentException.class,
                     () -> new CommitWriter(tableRoot).appendBatch(batch, Map.of()));
+        }
+    }
+
+    /**
+     * Real concurrency, not a simulated single conflict: N independent
+     * {@link CommitWriter}s (simulating N separate processes, not one
+     * shared instance) race {@code appendBatch} against the same table at
+     * once. With plain {@code CREATE_NEW} semantics and no retry logic,
+     * only one of these would ever land and the rest would throw — this
+     * is the actual proof the optimistic-concurrency retry loop survives
+     * real contention, not just a hand-simulated one-shot conflict.
+     */
+    @Test
+    void appendBatch_concurrentWriters_allCommitsLandWithNoLostUpdates(@TempDir Path tableRoot) throws Exception {
+        writeInitialCommit(tableRoot, List.of());
+        int writerCount = 10;
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            ExecutorService pool = Executors.newFixedThreadPool(writerCount);
+            CountDownLatch startGate = new CountDownLatch(1);
+            List<Future<Long>> futures = new ArrayList<>();
+
+            for (int i = 0; i < writerCount; i++) {
+                int id = i;
+                futures.add(pool.submit(() -> {
+                    startGate.await();
+                    CommitWriter writer = new CommitWriter(tableRoot);
+                    try (VectorSchemaRoot batch = buildBatch(allocator, new String[] {"writer-" + id}, new long[] {id})) {
+                        return writer.appendBatch(batch, Map.of());
+                    }
+                }));
+            }
+
+            startGate.countDown(); // release all writers at once -- maximizes real collisions
+            Set<Long> versions = new HashSet<>();
+            for (Future<Long> future : futures) {
+                versions.add(future.get(30, TimeUnit.SECONDS));
+            }
+            pool.shutdown();
+
+            assertEquals(writerCount, versions.size(),
+                    "every writer landed under a distinct version -- none lost, none double-assigned");
+
+            Snapshot finalSnapshot = new SnapshotManager(tableRoot).latest();
+            assertEquals(writerCount, finalSnapshot.getVersion());
+            assertEquals(writerCount, finalSnapshot.getActiveFiles().size());
+
+            Set<String> expectedServices = new HashSet<>();
+            for (int i = 0; i < writerCount; i++) {
+                expectedServices.add("writer-" + i);
+            }
+            Set<String> actualServices = new HashSet<>();
+            for (AddFile file : finalSnapshot.getActiveFiles()) {
+                File dataFile = tableRoot.resolve(file.getPath()).toFile();
+                try (VectorSchemaRoot readBack = new ParquetToArrowReader().read(
+                        dataFile, allocator, List.of("service"), null, Map.of())) {
+                    actualServices.add(new String(
+                            ((VarCharVector) readBack.getVector("service")).get(0), StandardCharsets.UTF_8));
+                }
+            }
+            assertEquals(expectedServices, actualServices, "every writer's row is present and correct -- no lost updates");
+        }
+    }
+
+    @Test
+    void replaceFiles_fileAlreadyRemovedByConcurrentCommit_throwsInsteadOfRetryingBlindly(@TempDir Path tableRoot) throws Exception {
+        writeInitialCommit(tableRoot, List.of());
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            CommitWriter writer = new CommitWriter(tableRoot);
+            try (VectorSchemaRoot b1 = buildBatch(allocator, new String[] {"a"}, new long[] {1})) {
+                writer.appendBatch(b1, Map.of());
+            }
+            try (VectorSchemaRoot b2 = buildBatch(allocator, new String[] {"b"}, new long[] {2})) {
+                writer.appendBatch(b2, Map.of());
+            }
+
+            Snapshot beforeCompact = new SnapshotManager(tableRoot).latest();
+            List<AddFile> filesToCompact = new ArrayList<>(beforeCompact.getActiveFiles());
+            assertEquals(2, filesToCompact.size());
+            AddFile alreadyRemovedElsewhere = filesToCompact.get(0);
+
+            // Simulate a concurrent writer (e.g. a racing Compactor) that
+            // already removed one of these files, committed directly as the
+            // next version -- same raw-JSON-commit convention writeInitialCommit
+            // already uses elsewhere in this file.
+            long nextVersion = beforeCompact.getVersion() + 1;
+            String competingRemove = "{\"remove\":{\"path\":\""
+                    + alreadyRemovedElsewhere.getPath().replace("\\", "\\\\")
+                    + "\",\"deletionTimestamp\":" + System.currentTimeMillis() + ",\"dataChange\":false}}\n";
+            Files.writeString(tableRoot.resolve("_delta_log").resolve(CommitFileNames.jsonFileName(nextVersion)), competingRemove);
+
+            try (VectorSchemaRoot merged = buildBatch(allocator, new String[] {"merged"}, new long[] {99})) {
+                assertThrows(ConcurrentModificationException.class,
+                        () -> writer.replaceFiles(filesToCompact, merged, Map.of()),
+                        "one of the files to compact was already removed by a concurrent commit -- must not retry blindly");
+            }
         }
     }
 }

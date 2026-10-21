@@ -178,14 +178,23 @@ writes. This project would have hit the same problem if it had assumed
 otherwise without checking — which is exactly why this was researched
 before being implemented, not assumed.
 
-**Where this leaves the single-writer-per-table recommendation:** the
-atomic-write primitive itself is now implemented and real-verified for
-local disk and MinIO, implemented-but-unverified for S3 and ADLS. That
-derisks the *foundation* multi-writer OCC would sit on, but OCC's
-conflict-detection/retry logic itself (steps 4–5 above) still isn't
-built — labukDB remains single-writer-per-table until that's done, not
-because the primitive is in doubt anymore but because the algorithm on
-top of it hasn't been written yet.
+**Update — multi-writer OCC is now done, for local disk.** `CommitWriter.appendBatch`
+and `.replaceFiles` both retry under optimistic concurrency control when
+the atomic commit-file create loses a race, bounded (10 attempts) with
+randomized backoff. `appendBatch` retries unconditionally (a blind append
+never conflicts with another, at the data level — only who gets which
+version number). `replaceFiles` re-checks on every attempt that its
+`filesToRemove` are still in the active set, and throws
+`ConcurrentModificationException` rather than retrying blindly if another
+writer already removed one of them. Verified with a real 10-thread
+concurrent-`appendBatch` stress test (no lost updates, no duplicate
+version numbers, across 3 repeated runs) and a real-table smoke test (5
+genuinely concurrent writers against a copy of `logs_delta`, all 5
+landed correctly). Remote (S3/MinIO/ADLS) OCC is still out of scope —
+`CommitWriter` itself remains local-disk only, and the two backends'
+`FileAlreadyExistsException` types are unrelated classes (NIO's vs
+Hadoop's) that a remote-OCC pass would need to handle explicitly, not
+assume are interchangeable.
 
 ## Build order
 
@@ -200,10 +209,9 @@ foundation under it is proven:
 4. ✅ **Compaction / vacuum.** Done — `Compactor` + `Vacuum`, real-table verified.
 5. ✅ **`execution/`** — `AggregateOperator` + `SortLimitOperator` done,
    standalone and composed; not yet wired into `flight` (see above).
-6. **Multi-writer OCC** — deferred, per the recommendation above, until
-   the per-backend atomic-write verification in
-   [Concurrent writes](#concurrent-writes) is actually done. v1 ships
-   single-writer-per-table instead.
+6. ✅ **Multi-writer OCC (local disk)** — done, see above. Remote OCC
+   (S3/MinIO/ADLS) remains a separate, later piece — `CommitWriter` is
+   still local-only.
 
 ## Phase roadmap beyond v1 core
 
@@ -224,7 +232,8 @@ v1 core is the current priority; these are sequenced, not shelved.
 | `flight/DoPut` | Ingest endpoint | Not started — next, now that `WriteBuffer` exists to wire it to |
 | `TableFormat` wired into `planner`/`flight`/`cli` | Still deferred | Two implementations now exist and have already informed the interface (see mismatches above) — wiring itself still not done |
 | Read scale-out | Self-describing Flight tickets (encode the scan directly in the ticket bytes instead of a `TicketRegistry` lookup), stateless server replicas behind a load balancer | Not started — cheap once started, no new distributed-systems machinery needed since snapshot resolution is already stateless against shared object storage |
-| Multi-writer OCC across machines | Per-backend atomic create-if-absent verification (S3/MinIO/ADLS — see [Concurrent writes](#concurrent-writes)), then OCC conflict/retry | Atomic-write primitive confirmed real on MinIO; conflict-detection/retry algorithm itself not started |
+| Multi-writer OCC — local disk | Retry + conflict detection in `CommitWriter` | ✅ **Done** — real 10-thread + real-table concurrency tests, see "Concurrent writes" above |
+| Multi-writer OCC — remote (S3/MinIO/ADLS) | Same algorithm, but needs each backend's own `FileAlreadyExistsException` handling verified, not assumed from the local case | Not started |
 | **Distributed ingestion fleet** | Router + sharded Ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer — IOx's Router/Ingester split | **Planned, not yet designed.** Genuinely the largest remaining piece — closer to a distributed-systems project than an extension of the single-node write path, and needs its own dedicated design pass once v1 core is real |
 | **Distributed query execution** | Splitting one query's work across multiple compute nodes (join/aggregate pushdown across a fleet, not just client-side fan-out over `FlightEndpoint`s) | **Planned, not yet designed.** Needs a real distributed query planner; revisit once `execution/` exists single-node and its limits are actually felt |
 

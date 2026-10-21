@@ -19,6 +19,15 @@
     `java -jar labukdb-server-app.jar` works directly instead of needing
     a hand-built classpath string — the same convenience labukdb-cli
     already had, now extended to the server.
+
+    hadoop-aws/hadoop-azure are `optional` in labukdb-core's own pom
+    (deliberately, so an embedding consumer who never touches remote
+    storage doesn't get either cloud SDK forced on them) — but this is
+    the actual runnable server binary README advertises as able to serve
+    s3a:// / abfss:// tables over Flight, so it must pull them in for
+    real. Without this override, `optional=true` propagates from the
+    parent's dependencyManagement and the shaded jar silently ships with
+    zero S3A/ADLS classes — verified: it did, before this was added.
   -->
   <dependencies>
     <dependency>
@@ -28,6 +37,16 @@
     <dependency>
       <groupId>com.labuk</groupId>
       <artifactId>labukdb-flight</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <optional>false</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-azure</artifactId>
+      <optional>false</optional>
     </dependency>
   </dependencies>
 

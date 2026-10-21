@@ -18,11 +18,29 @@
     labukdb-core ONLY — it talks to the engine in-process, no Flight
     server involved, which also makes it useful for isolating "is this a
     server problem or an engine problem."
+
+    hadoop-aws/hadoop-azure are `optional` in labukdb-core's own pom (so
+    an embedding library consumer isn't forced into either cloud SDK),
+    but the README explicitly advertises
+    `bin/labukdb catalog add logs s3a://bucket/path/to/table` — this
+    shaded binary genuinely needs to resolve s3a:// at runtime, so the
+    override to non-optional belongs here, same reasoning as
+    labukdb-server-app's pom.
   -->
   <dependencies>
     <dependency>
       <groupId>com.labuk</groupId>
       <artifactId>labukdb-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <optional>false</optional>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-azure</artifactId>
+      <optional>false</optional>
     </dependency>
 
     <dependency>
