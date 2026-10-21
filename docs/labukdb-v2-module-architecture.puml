@@ -38,7 +38,8 @@ title labukDB v2 — Multi-Module Architecture (planned)\nCopyright 2026 Afzal a
 legend top left
   |= color |= meaning |
   |<#EEEDFE>| reused from delta-flight-engine v1, package renamed com.labuk.deltaflight → com.labuk.labukdb |
-  |<#FFF1CF>| new in v2 — does not exist yet |
+  |<#D9F2C4>| new in v2 — built and verified |
+  |<#FFF1CF>| new in v2 — still planned, does not exist yet |
 endlegend
 
 ' ─── EXTERNAL WRITERS ───────────────────────────────────
@@ -79,36 +80,44 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [AdlsConfiguration]  as AC
   }
 
-  package "format/ — TableFormat SPI" #FFF1CF {
-    [TableFormat\n(interface: snapshot → schema +\npartitionSpec + List<DataFileRef>)] as TF #FFF1CF
-    [DeltaTableFormat\n(wraps log/ below)] as DTF #EEEDFE
-    [WriteBuffer / Ingester\n(in-memory per-table buffer,\nWAL-backed, flush on\nsize/time threshold)] as WB #FFF1CF
-    [CommitWriter\n(optimistic concurrency,\natomic commit, conflict retry —\nv1 scope: single-writer-per-table,\nsee note)] as CW #FFF1CF
-    [Compactor\n(bin-pack small files,\nOPTIMIZE-style commit)] as COMP #FFF1CF
-    [Vacuum\n(remove orphaned files\npast retention window)] as VAC #FFF1CF
-
-    note right of CW
-      Atomic create-if-absent commit,
-      per storage backend:
-      · local disk — trivial (CREATE_NEW)
-      · S3 — native since 2024
-        (If-None-Match: *) — needs
-        verifying hadoop-aws exposes it
-      · MinIO — needs verifying
-      · ADLS Gen2 — needs verifying
-        (lease / If-None-Match via abfs)
-      True multi-writer OCC deferred
-      to v2 pending that verification.
-    end note
+  package "format/ — TableFormat SPI (built, additive-only --\nnot yet wired into planner/flight/cli)" #D9F2C4 {
+    [TableFormat\n(interface: snapshot → schema +\npartitionSpec + List<DataFileRef>)] as TF #D9F2C4
+    [DeltaTableFormat\n(wraps log/ below)] as DTF #D9F2C4
   }
 
-  package "log/ — commit log (reused, now write-capable)" #EEEDFE {
+  package "log/ — commit log + write path (reused + new in v2)" #EEEDFE {
     [CommitLogReader] as CLR
     [CheckpointReader\n(single + multi-part)] as CPR
     [SnapshotManager\n(latest/atVersion/atTimestamp)] as SM
     [TableCache] as TC
     [LocalNioLogStorage] as LNS
     [HadoopLogStorage\n(S3/MinIO/ADLS)] as HLS
+    [WriteBuffer\n(in-memory per-table buffer,\nWAL-backed, flush on\nsize/time threshold)] as WB #D9F2C4
+    [CommitWriter\n(atomic commit, multi-writer OCC\non local disk — see note)] as CW #D9F2C4
+    [Compactor\n(bin-pack small files,\nOPTIMIZE-style commit,\ndataChange=false)] as COMP #D9F2C4
+    [Vacuum\n(remove orphaned files\npast retention window)] as VAC #D9F2C4
+    [TableMerger\n(upsert/MERGE by key —\nthe foundation a CDC source\nlike Debezium needs,\ndataChange=true)] as TMRG #D9F2C4
+
+    note right of CW
+      Atomic create-if-absent commit,
+      per storage backend:
+      · local disk — trivial (CREATE_NEW)
+      · MinIO — verified against a
+        real cluster (quay.io/minio/minio)
+      · S3 (native AWS) — implemented,
+        not yet verified against a
+        real AWS endpoint
+      · ADLS Gen2 — implemented,
+        not yet verified against a
+        real ADLS endpoint
+      Multi-writer OCC done for local
+      disk (appendBatch retries
+      unconditionally; replaceFiles/
+      TableMerger re-check their file
+      set on every attempt). Remote
+      OCC not started — CommitWriter
+      itself is still local-disk only.
+    end note
   }
 
   package "planner/ — pruning (reused, format-agnostic)" #EEEDFE {
@@ -129,15 +138,22 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [ParquetFooterCache] as PFC
   }
 
-  package "encode/ — Arrow → Parquet" #FFF1CF {
-    [ArrowToParquetWriter\n(mirror of ParquetToArrowReader)] as ATPW #FFF1CF
+  package "encode/ — Arrow → Parquet" #D9F2C4 {
+    [ArrowToParquetWriter\n(mirror of ParquetToArrowReader)] as ATPW #D9F2C4
   }
 
-  package "execution/ — query operators" #FFF1CF {
-    [FilterOperator\n(formalizes existing\nresidual-predicate pass)] as FOP #FFF1CF
-    [AggregateOperator\n(GROUP BY, SUM/COUNT/\nMIN/MAX/AVG)] as AOP #FFF1CF
-    [SortLimitOperator\n(ORDER BY ... LIMIT)] as SOP #FFF1CF
+  package "execution/ — query operators (standalone; not yet wired into flight/)" #D9F2C4 {
+    [AggregateOperator\n(GROUP BY, SUM/COUNT/\nMIN/MAX/AVG)] as AOP #D9F2C4
+    [SortLimitOperator\n(ORDER BY ... LIMIT)] as SOP #D9F2C4
   }
+
+  note bottom of AOP
+    No FilterOperator — deliberately
+    not built. decode/'s existing fused
+    residual-predicate pass already
+    covers this; a separate post-decode
+    operator would have no real caller.
+  end note
 
   package "catalog/ — name → location (reused)" #EEEDFE {
     [TableCatalog\n(name → location + format,\n~/.labukdb/catalog.json)] as CAT
@@ -145,22 +161,22 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
 }
 
 ' ─── optional format module ──────────────────────────────
-package "labukdb-format-iceberg  (optional — pulls in iceberg-core)" #FFF1CF {
-  [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core)] as ITF #FFF1CF
+package "labukdb-format-iceberg  (optional — pulls in iceberg-core)" #D9F2C4 {
+  [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core — READ-ONLY,\nno Iceberg write support yet)] as ITF #D9F2C4
 }
 
 ' ─── labukdb-flight ───────────────────────────────────────
 package "labukdb-flight  (depends on core [+ format-iceberg])" #EEEDFE {
-  [LabukDbFlightProducer\nGetFlightInfo · DoGet\nDoPut (NEW) · GetSchema · ListFlights] as DFP
+  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(remote s3a://abfss:// reads live-\nverified; DoPut rejects remote)] as DFP
   [TicketRegistry] as TR
 }
 
 package "labukdb-server-app" #EEEDFE {
-  [LabukDbServerApp\n(bootstrap main, port 9443)] as DFSA
+  [LabukDbServerApp\n(bootstrap main, shaded jar)] as DFSA
 }
 
 package "labukdb-cli  (depends on core in-process, no server)" #EEEDFE {
-  [LabukDbCli\ncatalog / describe / query / ingest (NEW)] as CLI
+  [LabukDbCli\ncatalog / describe / query\n(no ingest/compact/vacuum yet)] as CLI
   [TableResolver] as TR2
 }
 
@@ -178,9 +194,10 @@ LNS --> LOG
 HLS --> LOG
 
 DTF  --> SM  : read path (unchanged)
-DTF  --> CW  : write path (new)
 CW   --> DT  : atomic commit (add/remove actions)
-COMP --> CW  : rewrite + commit bin-packed files
+COMP --> CW  : rewrite + commit bin-packed files\n(dataChange=false)
+TMRG --> PTAR : decode existing partition files
+TMRG --> CW  : insert/update/delete by key,\ncommit via replaceFiles\n(dataChange=true)
 VAC  --> DT  : delete files past retired-and-expired
 
 ITF --> IT : read via iceberg-core
@@ -191,7 +208,7 @@ QP  --> PP
 QP  --> FSP
 QP  --> PVS
 QP  --> PC
-TF  --> QP : normalized Snapshot (schema + file list)
+TF  .[#993C1D].> QP : NOT wired yet -- two real shape\nmismatches surfaced (atVersion's\nsequential-version assumption vs.\nIceberg's snapshotId; schemaString's\nDelta-JSON shape vs. Iceberg's typed Schema)
 
 PTAR --> RGP
 PTAR --> GPE
@@ -199,8 +216,7 @@ PTAR --> PVA
 PTAR --> NTD
 PTAR --> ITC
 PTAR --> PFC
-FOP  --> PTAR : fused decode + residual filter (existing)
-AOP  --> FOP  : consumes filtered Arrow batches
+AOP  --> PTAR : consumes already-decoded,\nalready-filtered Arrow batches\n(decode/'s own fused residual filter,\nno separate FilterOperator)
 SOP  --> AOP
 
 WB   --> ATPW : flush threshold hit\n(size or time)
@@ -211,7 +227,7 @@ TL --> MC
 TL --> AC
 
 DFP --> QP
-DFP --> AOP
+DFP .[#993C1D].> AOP : NOT wired yet -- GetFlightInfo's\none-endpoint-per-file model doesn't\nfit GROUP BY's cross-file combine need
 DFP --> WB   : DoPut → buffer first
 DFP --> TR
 DFP --> CAT
@@ -220,8 +236,7 @@ DFSA --> DFP
 CLI --> TR2
 TR2 --> CAT
 TR2 --> TL
-CLI --> QP   : direct in-process query
-CLI --> CW   : direct in-process ingest/compact/vacuum
+CLI --> QP   : direct in-process query\n(catalog / describe / query only --\nno ingest/compact/vacuum subcommand yet)
 
 ' ─── CLIENTS ─────────────────────────────────────────────
 actor "Python\n(pyarrow.flight)" as PY  #FAECE7
