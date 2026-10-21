@@ -37,6 +37,7 @@ import org.apache.hadoop.conf.Configuration;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -78,6 +79,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final TableCache tableCache = new TableCache();
     private final TableCatalog catalog;
     private final Configuration storageConf;
+    private final Path walRoot;
 
     /**
      * Active {@link WriteBuffer}s, keyed by table root + sorted partition
@@ -94,12 +96,12 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private static final long DEFAULT_MAX_BUFFERED_BYTES = 64L * 1024 * 1024;
 
     public DeltaFlightProducer(BufferAllocator allocator) {
-        this(allocator, TableCatalog.atDefaultLocation(), mergedStorageConf());
+        this(allocator, TableCatalog.atDefaultLocation(), mergedStorageConf(), DEFAULT_WAL_ROOT);
     }
 
     /** Explicit-catalog constructor — mainly for tests that need an isolated catalog file. */
     public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog) {
-        this(allocator, catalog, mergedStorageConf());
+        this(allocator, catalog, mergedStorageConf(), DEFAULT_WAL_ROOT);
     }
 
     /**
@@ -124,9 +126,19 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      *                    {@link MinioConfiguration}. Unused for local tables.
      */
     public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf) {
+        this(allocator, catalog, storageConf, DEFAULT_WAL_ROOT);
+    }
+
+    /**
+     * Explicit {@code walRoot} — mainly for tests that need an isolated
+     * WAL staging directory instead of the real {@code ~/.labukdb/wal}
+     * default, same reasoning as the explicit-catalog constructor above.
+     */
+    public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf, Path walRoot) {
         this.allocator = allocator;
         this.catalog = catalog;
         this.storageConf = storageConf;
+        this.walRoot = walRoot;
     }
 
     /**
@@ -293,10 +305,12 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * *within* one call's multiple streamed batches is) — a deliberate
      * v1 simplification, not an oversight.
      *
-     * Local disk only, same constraint {@code CommitWriter}/
-     * {@code ArrowToParquetWriter} already have — a remote table location
-     * gets a clear {@code UNIMPLEMENTED} instead of failing confusingly
-     * deep inside the encoder.
+     * Local or remote (S3/MinIO/ADLS) — {@code CommitWriter}/
+     * {@code ArrowToParquetWriter}/{@code WriteBuffer} are all
+     * {@code TableLocation}-dispatched now; live-MinIO-verified for
+     * remote. The table itself must already exist — {@code DoPut} only
+     * appends, same as {@code CommitWriter.appendBatch}; creating a new
+     * table is {@code TableCreator}, not exposed over Flight yet.
      */
     @Override
     public Runnable acceptPut(CallContext context, FlightStream flightStream, StreamListener<PutResult> ackStream) {
@@ -306,14 +320,6 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                         flightStream.getDescriptor().getCommand(), FlightWriteRequest.class);
                 TableLocation tableRoot = resolveTableLocation(request.getTable(), request.getTableRoot());
 
-                if (tableRoot.isRemote()) {
-                    ackStream.onError(CallStatus.UNIMPLEMENTED
-                            .withDescription("DoPut against remote storage (s3a://, abfss://) is not yet "
-                                    + "supported — the write path (CommitWriter/ArrowToParquetWriter) is "
-                                    + "local-disk only today.")
-                            .toRuntimeException());
-                    return;
-                }
                 Map<String, String> partitionValues = request.getPartitionValues();
                 if (partitionValues == null) {
                     throw new IllegalArgumentException(
@@ -351,12 +357,20 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * Keyed by table root + sorted partition values, so repeated
      * {@code DoPut} calls against the same (table, partition) reuse one
      * buffering {@link WriteBuffer} instead of each starting fresh.
+     *
+     * Defaults to {@code ~/.labukdb/wal} — same convention
+     * {@code TableCatalog.atDefaultLocation()} already uses for
+     * {@code ~/.labukdb/catalog.json}. The WAL stays local even for a
+     * remote table (see {@code WriteBuffer}'s class javadoc for why).
      */
+    private static final Path DEFAULT_WAL_ROOT =
+            Path.of(System.getProperty("user.home"), ".labukdb", "wal");
+
     private WriteBuffer writeBufferFor(TableLocation tableRoot, Map<String, String> partitionValues) {
         String key = tableRoot.raw() + "|" + new TreeMap<>(partitionValues);
         return writeBuffers.computeIfAbsent(key, k -> {
             try {
-                return new WriteBuffer(tableRoot.localPath(), partitionValues,
+                return new WriteBuffer(tableRoot, walRoot, partitionValues,
                         DEFAULT_MAX_BUFFERED_ROWS, DEFAULT_MAX_BUFFERED_BYTES, allocator);
             } catch (IOException e) {
                 throw new UncheckedIOException("Failed to open WriteBuffer for " + tableRoot, e);

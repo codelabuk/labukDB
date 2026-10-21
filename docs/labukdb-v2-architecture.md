@@ -226,11 +226,50 @@ writer already removed one of them. Verified with a real 10-thread
 concurrent-`appendBatch` stress test (no lost updates, no duplicate
 version numbers, across 3 repeated runs) and a real-table smoke test (5
 genuinely concurrent writers against a copy of `logs_delta`, all 5
-landed correctly). Remote (S3/MinIO/ADLS) OCC is still out of scope —
-`CommitWriter` itself remains local-disk only, and the two backends'
-`FileAlreadyExistsException` types are unrelated classes (NIO's vs
-Hadoop's) that a remote-OCC pass would need to handle explicitly, not
-assume are interchangeable.
+landed correctly). Remote (S3/MinIO/ADLS) OCC conflict-retry logic is
+no longer blocked by `CommitWriter` being local-only (see the next
+update) — `commitWithRetry` now catches both the NIO and Hadoop
+`FileAlreadyExistsException` classes, which really are unrelated classes
+despite the shared simple name — but it hasn't been separately
+stress-tested under real concurrent remote writers the way the local
+path has (the 10-thread test above is local-disk only).
+
+**Update — CREATE TABLE and remote write completion are now done.**
+`CommitWriter`, `ArrowToParquetWriter`, and `WriteBuffer` are all
+`TableLocation`-dispatched now (local or remote, same pattern
+`SnapshotManager`/`ParquetToArrowReader` already used for reads) via
+additive `forLocation`/`TableLocation`-based constructors — the original
+local-only constructors are unchanged, zero blast radius on
+`Compactor`/`TableMerger`, which stay local-only by design. `DoPut` no
+longer rejects remote table locations. A new `TableCreator` class writes
+a table's version-0 commit (`protocol` + `metaData`, no `add` actions) —
+the capability this project never had before; every fixture until now
+hand-wrote an initial commit directly. `ArrowToDeltaSchema` is the new
+Arrow `Schema` → Delta `schemaString` encoder `TableCreator` needs,
+Jackson-tree-based rather than the hand-concatenated strings every test
+fixture used as a shortcut.
+
+**`WriteBuffer`'s WAL deliberately stays local-disk-only** even for a
+remote table — it's server-internal durability staging, never part of
+the Delta protocol or visible to any other reader, so redirecting it to
+S3/MinIO would trade away the latency/cost reason it exists for zero
+extra correctness verification. Its new `TableLocation`-based
+constructor takes an explicit `walRoot` parameter (defaulting to
+`~/.labukdb/wal`, same convention `TableCatalog.atDefaultLocation()`
+uses for `~/.labukdb/catalog.json`) rather than deriving one from the
+table's own — now possibly remote — location.
+
+Verified live against real MinIO, both at the library level
+(`RemoteWriteMinioIntegrationTest`: create a table, append real data,
+read it back) and through the actual user-facing Flight path
+(`FlightRemoteWriteMinioIntegrationTest`: a real `DoPut` against a live
+MinIO-backed table, then a real `DoGet` reading it back) — the literal
+"Flight serving — write: 0% remote" gap this closes.
+
+**Deliberately not done here:** a Flight `DoAction` RPC or CLI
+subcommand for CREATE TABLE — `TableCreator` is a library capability
+only for now, each of those needs its own protocol/UX decision. Iceberg
+write support, and remote multi-writer OCC stress-testing (see above).
 
 ## Build order
 
@@ -251,6 +290,24 @@ foundation under it is proven:
 7. ✅ **`TableMerger` — upsert/MERGE by key.** Done, see above. The
    Debezium connector that would actually drive it is the next,
    separate step — not started yet.
+8. ✅ **CREATE TABLE + remote write completion.** Done, see above —
+   `TableCreator`, and `CommitWriter`/`ArrowToParquetWriter`/`WriteBuffer`
+   all `TableLocation`-dispatched, live-MinIO-verified at both the
+   library and Flight levels.
+
+**Known, pre-existing flaky test — not caused by the work above.**
+`labukdb-flight`'s `FlightIntegrationTest` intermittently fails (~1-in-4
+observed) with `IllegalStateException: Memory was leaked by query` during
+`@AfterEach`'s `allocator.close()`. Confirmed not specific to any one
+test — it's hit a pure-read test (`partitionPruningAndResidualFilter...`,
+untouched by this session's write-path changes) as often as a `DoPut`
+one, and Arrow's own issue tracker has the identical error message on
+Arrow's own Flight test suite, explicitly concluded to be a flake, not a
+real bug ([ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448)).
+Left alone deliberately rather than spending effort hardening something
+upstream also treats as environmental gRPC/Flight teardown timing, not a
+logic defect — revisit if it starts failing CI at a materially higher
+rate than observed here.
 
 ## Phase roadmap beyond v1 core
 
@@ -268,11 +325,12 @@ v1 core is the current priority; these are sequenced, not shelved.
 | Remote atomic commits (S3/MinIO/ADLS) | `HadoopLogStorage.createCommitFile`, Hadoop bumped to 3.4.3 | ✅ Implemented; **MinIO real-infra verified**, S3/ADLS implemented-but-unverified |
 | `format/TableFormat` + `DeltaTableFormat` | Additive SPI prep | ✅ Done, tested standalone |
 | **Multi-format — `labukdb-format-iceberg`** | `IcebergTableFormat`, using `iceberg-core:1.12.0` (not hand-rolled) | ✅ **Done** — read-only, path-based (`HadoopTables`, no catalog service). Validated the `TableFormat` shape as intended: surfaced two real mismatches (`atVersion`'s Delta-sequential assumption vs. Iceberg's non-sequential `snapshotId`; `schemaString`'s Delta-JSON shape vs. Iceberg's typed `Schema`) — named, not silently papered over. Also empirically proved `decode/ParquetToArrowReader` is format-agnostic: reads an Iceberg-committed file with zero changes. Tested against a self-built fixture table (`iceberg-core`'s own create API), not a Spark/Trino-written one — same caveat `CheckpointReader` carries for Delta checkpoints. |
-| `flight/DoPut` | Ingest endpoint | Not started — next, now that `WriteBuffer` exists to wire it to |
+| `flight/DoPut` | Ingest endpoint | ✅ Done — local and remote, real `pyarrow.flight` client (local) and real `FlightClient` against live MinIO (remote) both verified |
 | `TableFormat` wired into `planner`/`flight`/`cli` | Still deferred | Two implementations now exist and have already informed the interface (see mismatches above) — wiring itself still not done |
 | Read scale-out | Self-describing Flight tickets (encode the scan directly in the ticket bytes instead of a `TicketRegistry` lookup), stateless server replicas behind a load balancer | Not started — cheap once started, no new distributed-systems machinery needed since snapshot resolution is already stateless against shared object storage |
+| CREATE TABLE | `TableCreator`, local + remote | ✅ **Done** — library capability only, not exposed over Flight/CLI yet |
 | Multi-writer OCC — local disk | Retry + conflict detection in `CommitWriter` | ✅ **Done** — real 10-thread + real-table concurrency tests, see "Concurrent writes" above |
-| Multi-writer OCC — remote (S3/MinIO/ADLS) | Same algorithm, but needs each backend's own `FileAlreadyExistsException` handling verified, not assumed from the local case | Not started |
+| Multi-writer OCC — remote (S3/MinIO/ADLS) | `commitWithRetry` now catches both NIO and Hadoop `FileAlreadyExistsException` classes | Conflict-retry logic in place; not separately stress-tested under concurrent remote writers the way local disk is |
 | **Distributed ingestion fleet** | Router + sharded Ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer — IOx's Router/Ingester split | **Planned, not yet designed.** Genuinely the largest remaining piece — closer to a distributed-systems project than an extension of the single-node write path, and needs its own dedicated design pass once v1 core is real |
 | **Distributed query execution** | Splitting one query's work across multiple compute nodes (join/aggregate pushdown across a fleet, not just client-side fan-out over `FlightEndpoint`s) | **Planned, not yet designed.** Needs a real distributed query planner; revisit once `execution/` exists single-node and its limits are actually felt |
 

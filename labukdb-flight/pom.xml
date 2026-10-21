@@ -34,6 +34,20 @@
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+    <!--
+      Test-scope only. hadoop-aws is `optional` in labukdb-core (so a
+      library consumer of labukdb-flight isn't forced into the AWS SDK),
+      but FlightRemoteWriteMinioIntegrationTest needs S3AFileSystem on
+      the classpath to actually reach MinIO. The real runtime path
+      (labukdb-server-app) already declares this non-optional for the
+      same reason, see that module's pom for why.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <optional>false</optional>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>

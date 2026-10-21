@@ -6,7 +6,6 @@ import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
@@ -75,11 +74,21 @@ class FlightIntegrationTest {
     @TempDir
     Path catalogDir;
 
+    @TempDir
+    Path walRoot;
+
     @BeforeEach
     void setUp() throws Exception {
         allocator = new RootAllocator(Long.MAX_VALUE);
         catalog = new TableCatalog(catalogDir.resolve("catalog.json"));
-        DeltaFlightProducer producer = new DeltaFlightProducer(allocator, catalog);
+        // Explicit walRoot -- otherwise this would write to the real
+        // ~/.labukdb/wal on every test run, accumulating stale empty
+        // directories forever (a real default appropriate for the actual
+        // server, not for a test suite run repeatedly on a dev machine).
+        // No test here touches remote storage, so an empty Configuration
+        // is equivalent to the producer's own default merged one.
+        DeltaFlightProducer producer = new DeltaFlightProducer(
+                allocator, catalog, new org.apache.hadoop.conf.Configuration(), walRoot);
 
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
         server = FlightServer.builder(allocator, serverLocation, producer).build();
@@ -358,22 +367,6 @@ class FlightIntegrationTest {
         }
         assertEquals(List.of("first-call-svc", "second-call-svc"),
                 services.stream().sorted().toList());
-    }
-
-    @Test
-    void doPut_remoteTableLocation_returnsUnimplementedNotAConfusingFailure(@TempDir Path tableRoot) throws Exception {
-        String writeJson = "{\"tableRoot\":\"s3a://fake-bucket/fake-table\",\"partitionValues\":{\"level\":\"ERROR\"}}";
-        FlightDescriptor putDescriptor = FlightDescriptor.command(writeJson.getBytes(StandardCharsets.UTF_8));
-
-        try (VectorSchemaRoot batch = buildBatch(allocator, new String[] {"x"}, new long[] {1});
-             SyncPutListener putListener = new SyncPutListener()) {
-            var putStream = client.startPut(putDescriptor, batch, putListener);
-            putStream.putNext();
-            putStream.completed();
-            FlightRuntimeException thrown = assertThrows(FlightRuntimeException.class, putListener::getResult);
-            assertTrue(thrown.getMessage().contains("local-disk only"),
-                    "error must explain why, not just fail opaquely: " + thrown.getMessage());
-        }
     }
 
     @Test

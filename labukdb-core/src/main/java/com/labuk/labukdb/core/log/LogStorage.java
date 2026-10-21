@@ -1,5 +1,7 @@
 package com.labuk.labukdb.core.log;
 
+import com.labuk.labukdb.core.storage.TableLocation;
+
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.util.List;
@@ -57,4 +59,16 @@ interface LogStorage {
 
     /** For error messages. */
     String describe();
+
+    /**
+     * Resolves the {@code _delta_log} storage for a table location — the
+     * one place that decides {@link LocalNioLogStorage} vs
+     * {@link HadoopLogStorage}, reused by {@link CommitWriter} and
+     * {@link TableCreator} instead of each re-implementing the dispatch.
+     */
+    static LogStorage forLocation(TableLocation location) throws IOException {
+        return location.isRemote()
+                ? new HadoopLogStorage(new org.apache.hadoop.fs.Path(location.hadoopPath(), "_delta_log"), location.hadoopConf())
+                : new LocalNioLogStorage(location.localPath().resolve("_delta_log"));
+    }
 }

@@ -1,5 +1,6 @@
 package com.labuk.labukdb.core.log;
 
+import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
@@ -57,10 +58,20 @@ import java.util.stream.Stream;
  * {@code flight/DoPut}, same as {@code TableFormat}'s deferred wiring.
  * Background/scheduled time-based flush — no scheduler exists yet;
  * {@link #flush()} is available to call manually or from a future one.
+ *
+ * <b>The WAL always stays on local disk</b> — even when the table itself
+ * is remote (S3/MinIO/ADLS, via {@link #WriteBuffer(TableLocation, Path,
+ * Map, long, long, BufferAllocator)}). It's server-internal durability
+ * staging for buffered-but-not-yet-flushed rows, never part of the Delta
+ * protocol or visible to any other reader — redirecting it to remote
+ * storage would trade away the whole latency/cost reason this class
+ * exists, for zero extra correctness verification. {@code walRoot} is an
+ * explicit, caller-supplied parameter rather than an auto-derived
+ * default — keeps it trivially testable without touching a real
+ * deployment's WAL directory.
  */
 public final class WriteBuffer implements AutoCloseable {
 
-    private final Path tableRoot;
     private final Map<String, String> partitionValues;
     private final long maxBufferedRows;
     private final long maxBufferedBytes;
@@ -72,16 +83,37 @@ public final class WriteBuffer implements AutoCloseable {
     private long bufferedBytes;
     private long nextSequence;
 
+    /** Local disk — unchanged behavior, WAL nested under the table's own root. */
     public WriteBuffer(Path tableRoot, Map<String, String> partitionValues,
                         long maxBufferedRows, long maxBufferedBytes,
                         BufferAllocator allocator) throws IOException {
-        this.tableRoot = tableRoot;
+        this(partitionValues, maxBufferedRows, maxBufferedBytes, allocator,
+                tableRoot.resolve("_labukdb_wal").resolve(sanitizePartitionKey(partitionValues)),
+                new CommitWriter(tableRoot));
+    }
+
+    /**
+     * Local or remote (S3/MinIO/ADLS) table, via {@link TableLocation} —
+     * what {@code DeltaFlightProducer} uses so {@code DoPut} works the
+     * same way against either. The WAL still lives under {@code walRoot}
+     * on local disk regardless — see this class's javadoc for why.
+     */
+    public WriteBuffer(TableLocation location, Path walRoot, Map<String, String> partitionValues,
+                        long maxBufferedRows, long maxBufferedBytes,
+                        BufferAllocator allocator) throws IOException {
+        this(partitionValues, maxBufferedRows, maxBufferedBytes, allocator,
+                walRoot.resolve(sanitizeLocationKey(location)).resolve(sanitizePartitionKey(partitionValues)),
+                CommitWriter.forLocation(location));
+    }
+
+    private WriteBuffer(Map<String, String> partitionValues, long maxBufferedRows, long maxBufferedBytes,
+                         BufferAllocator allocator, Path walDir, CommitWriter commitWriter) throws IOException {
         this.partitionValues = partitionValues;
         this.maxBufferedRows = maxBufferedRows;
         this.maxBufferedBytes = maxBufferedBytes;
         this.allocator = allocator;
-        this.walDir = tableRoot.resolve("_labukdb_wal").resolve(sanitizePartitionKey(partitionValues));
-        this.commitWriter = new CommitWriter(tableRoot);
+        this.walDir = walDir;
+        this.commitWriter = commitWriter;
 
         recoverFromExistingWal();
     }
@@ -232,5 +264,18 @@ public final class WriteBuffer implements AutoCloseable {
             parts.add(entry.getKey() + "=" + entry.getValue());
         }
         return String.join(",", parts);
+    }
+
+    /**
+     * Turns a table location's raw URI/path into a filesystem-safe
+     * directory name — character-replace, not a hash, so the WAL
+     * directory for a given table stays human-readable/debuggable, same
+     * style as {@link #sanitizePartitionKey}. Truncated defensively in
+     * case an unusually long location would otherwise exceed a
+     * filesystem's path-component length limit.
+     */
+    private static String sanitizeLocationKey(TableLocation location) {
+        String sanitized = location.raw().replaceAll("[^a-zA-Z0-9.-]", "_");
+        return sanitized.length() > 150 ? sanitized.substring(0, 150) : sanitized;
     }
 }

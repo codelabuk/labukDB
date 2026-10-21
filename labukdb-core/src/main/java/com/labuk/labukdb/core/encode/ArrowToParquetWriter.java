@@ -1,5 +1,6 @@
 package com.labuk.labukdb.core.encode;
 
+import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.FieldVector;
@@ -18,6 +19,7 @@ import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.example.ExampleParquetWriter;
 import org.apache.parquet.hadoop.example.GroupWriteSupport;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import org.apache.parquet.hadoop.util.HadoopOutputFile;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
@@ -53,13 +55,39 @@ public final class ArrowToParquetWriter {
 
     public void write(File outputFile, VectorSchemaRoot batch) throws IOException {
         MessageType schema = toParquetSchema(batch);
-
         Configuration conf = new Configuration();
         GroupWriteSupport.setSchema(schema, conf);
         org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(outputFile.getAbsolutePath());
 
-        try (ParquetWriter<Group> writer = ExampleParquetWriter.builder(hadoopPath)
-                .withConf(conf)
+        ExampleParquetWriter.Builder builder = ExampleParquetWriter.builder(hadoopPath).withConf(conf);
+        writeWith(builder, schema, batch);
+    }
+
+    /**
+     * Dispatches on the location — local reuses {@link #write(File, VectorSchemaRoot)}'s
+     * exact path; remote builds a {@link HadoopOutputFile} explicitly from
+     * {@code location}'s own {@code Configuration} (endpoint/credentials)
+     * rather than trusting an implicit default — same reasoning
+     * {@code ParquetInputFiles.remote()} already uses on the read side.
+     * Confirmed via {@code javap} on {@code parquet-hadoop} that
+     * {@code ExampleParquetWriter.builder(OutputFile)} exists for this.
+     */
+    public void write(TableLocation location, VectorSchemaRoot batch) throws IOException {
+        if (!location.isRemote()) {
+            write(location.localPath().toFile(), batch);
+            return;
+        }
+        MessageType schema = toParquetSchema(batch);
+        Configuration conf = location.hadoopConf();
+        GroupWriteSupport.setSchema(schema, conf);
+        HadoopOutputFile outputFile = HadoopOutputFile.fromPath(location.hadoopPath(), conf);
+
+        ExampleParquetWriter.Builder builder = ExampleParquetWriter.builder(outputFile).withConf(conf);
+        writeWith(builder, schema, batch);
+    }
+
+    private void writeWith(ExampleParquetWriter.Builder builder, MessageType schema, VectorSchemaRoot batch) throws IOException {
+        try (ParquetWriter<Group> writer = builder
                 .withType(schema)
                 .withCompressionCodec(CompressionCodecName.SNAPPY)
                 .build()) {

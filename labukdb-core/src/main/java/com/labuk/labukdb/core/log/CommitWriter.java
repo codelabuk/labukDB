@@ -5,9 +5,9 @@ import com.labuk.labukdb.core.encode.ArrowToParquetWriter;
 import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.log.action.RemoveFile;
 import com.labuk.labukdb.core.log.action.SingleAction;
+import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
@@ -26,14 +26,15 @@ import java.util.stream.Collectors;
  * writes it under the table's Hive-style partition layout, and commits it
  * as a single {@code add} action in the next version's JSON commit file.
  *
- * <b>Scope, stated plainly:</b> local disk only
- * ({@link HadoopLogStorage#createCommitFile} throws rather than pretending
- * remote writes are safe — see its javadoc, and
- * {@code docs/labukdb-v2-architecture.md}'s "Concurrent writes" section
- * for why remote multi-writer OCC needs its own, separate verification
- * pass); appends to an existing table only, no table creation.
+ * <b>Scope, stated plainly:</b> appends to an existing table only, no
+ * table creation (see {@link TableCreator} for that). Remote
+ * (S3/MinIO/ADLS) append is supported via {@link #forLocation} — live
+ * MinIO-verified; multi-writer OCC itself (the retry logic below) is
+ * only exercised there the same way the local-disk primitive is, not
+ * separately stress-tested against concurrent remote writers — see
+ * {@code docs/labukdb-v2-architecture.md}'s "Concurrent writes" section.
  *
- * <b>Multi-writer concurrency (local disk):</b> both write methods retry
+ * <b>Multi-writer concurrency:</b> both write methods retry
  * under optimistic concurrency control when {@link LogStorage#createCommitFile}'s
  * atomic create loses a race for a version number — see
  * {@link #commitWithRetry} for the shared retry shape, and each method's
@@ -49,16 +50,33 @@ import java.util.stream.Collectors;
  */
 public final class CommitWriter {
 
-    private final Path tableRoot;
-    private final LocalNioLogStorage storage;
+    private final TableLocation tableLocation;
+    private final LogStorage storage;
     private final SnapshotManager snapshotManager;
     private final ArrowToParquetWriter parquetWriter = new ArrowToParquetWriter();
     private final ObjectMapper mapper = new ObjectMapper();
 
-    public CommitWriter(Path tableRoot) {
-        this.tableRoot = tableRoot;
-        this.storage = new LocalNioLogStorage(tableRoot.resolve("_delta_log"));
-        this.snapshotManager = new SnapshotManager(tableRoot);
+    /** Local disk — unchanged behavior from before {@link TableLocation} existed. */
+    public CommitWriter(Path tableRoot) throws IOException {
+        this(TableLocation.forLocal(tableRoot));
+    }
+
+    private CommitWriter(TableLocation location) throws IOException {
+        this.tableLocation = location;
+        this.storage = LogStorage.forLocation(location);
+        this.snapshotManager = SnapshotManager.forLocation(location);
+    }
+
+    /**
+     * Dispatches on the location — local or remote (S3/MinIO/ADLS) — the
+     * same {@link TableLocation}-based entry point {@link SnapshotManager}
+     * and {@code decode/ParquetToArrowReader} already use for reads. This
+     * is what {@code WriteBuffer}/{@code DeltaFlightProducer} use so a
+     * {@code DoPut} against a remote table works the same way a local one
+     * always has.
+     */
+    public static CommitWriter forLocation(TableLocation location) throws IOException {
+        return new CommitWriter(location);
     }
 
     /**
@@ -184,12 +202,19 @@ public final class CommitWriter {
      * snapshot, ask {@code actionsBuilder} for this attempt's actions
      * (which may throw {@link ConcurrentModificationException} to signal
      * a genuine, non-retryable conflict — see {@link #replaceFiles}),
-     * attempt the atomic commit, and on {@link FileAlreadyExistsException}
-     * (someone else won this version number) loop back and try again,
-     * bounded by {@link #MAX_RETRIES}.
+     * attempt the atomic commit, and on a conflict (someone else won this
+     * version number) loop back and try again, bounded by {@link #MAX_RETRIES}.
+     *
+     * <b>Catches two unrelated exception classes, deliberately:</b>
+     * {@link FileAlreadyExistsException} (local, NIO) and
+     * {@code org.apache.hadoop.fs.FileAlreadyExistsException} (remote,
+     * Hadoop) are not related by inheritance despite the same simple name
+     * — see {@link HadoopLogStorage}'s javadoc. Before {@link #storage}
+     * became {@link TableLocation}-dispatched, only the NIO one could
+     * ever actually occur here; now either can, depending on {@code location}.
      */
     private long commitWithRetry(ActionsBuilder actionsBuilder) throws IOException {
-        FileAlreadyExistsException lastConflict = null;
+        IOException lastConflict = null;
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
             if (attempt > 0) {
                 backoff(attempt);
@@ -205,12 +230,12 @@ public final class CommitWriter {
             try {
                 storage.createCommitFile(CommitFileNames.jsonFileName(nextVersion), commit.toString());
                 return nextVersion;
-            } catch (FileAlreadyExistsException conflict) {
+            } catch (FileAlreadyExistsException | org.apache.hadoop.fs.FileAlreadyExistsException conflict) {
                 lastConflict = conflict;
                 // another writer won nextVersion first -- loop back, re-resolve, retry
             }
         }
-        throw new IOException("Too much write contention on " + tableRoot
+        throw new IOException("Too much write contention on " + tableLocation
                 + " -- failed to commit after " + MAX_RETRIES + " attempts", lastConflict);
     }
 
@@ -227,17 +252,30 @@ public final class CommitWriter {
     private AddFile encodeToNewFile(Snapshot current, VectorSchemaRoot batch, Map<String, String> partitionValues,
                                      boolean dataChange) throws IOException {
         String relativePath = buildRelativePath(current, partitionValues);
-        File dataFile = tableRoot.resolve(relativePath).toFile();
-        Files.createDirectories(dataFile.getParentFile().toPath());
-        parquetWriter.write(dataFile, batch);
+        TableLocation dataFileLocation = tableLocation.resolve(relativePath);
+
+        if (!dataFileLocation.isRemote()) {
+            // Remote (object storage) has no real directories to create;
+            // local disk does.
+            Files.createDirectories(dataFileLocation.localPath().getParent());
+        }
+        parquetWriter.write(dataFileLocation, batch);
 
         return new AddFile(
                 relativePath.replace('\\', '/'),
                 partitionValues,
-                dataFile.length(),
+                fileSize(dataFileLocation),
                 System.currentTimeMillis(),
                 dataChange,
                 null);
+    }
+
+    private long fileSize(TableLocation location) throws IOException {
+        if (!location.isRemote()) {
+            return location.localPath().toFile().length();
+        }
+        return location.hadoopPath().getFileSystem(location.hadoopConf())
+                .getFileStatus(location.hadoopPath()).getLen();
     }
 
     /**

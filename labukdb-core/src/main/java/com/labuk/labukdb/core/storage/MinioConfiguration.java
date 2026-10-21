@@ -28,9 +28,12 @@ import org.apache.hadoop.conf.Configuration;
  * project's own build, but a downstream consumer depending on this library
  * would need to add it explicitly.
  *
- * <b>Not verified against a real MinIO instance</b> — no way to run one in
- * the environment this was written in. These are the standard, documented
- * settings, but a real first run is the actual test.
+ * <b>Verified against a real MinIO cluster</b> — both reads and writes:
+ * atomic commits ({@code HadoopLogStorageMinioIntegrationTest}), scan +
+ * decode ({@code RemoteReadMinioIntegrationTest}), and a full
+ * create-table + append round trip at both the library level
+ * ({@code RemoteWriteMinioIntegrationTest}) and through the real Flight
+ * {@code DoPut}/{@code DoGet} path ({@code FlightRemoteWriteMinioIntegrationTest}).
  */
 public final class MinioConfiguration {
 

@@ -81,6 +81,21 @@ class CommitWriterTest {
     }
 
     @Test
+    void forLocation_withLocalTableLocation_behavesIdenticallyToTheOriginalConstructor(@TempDir Path tableRoot) throws Exception {
+        writeInitialCommit(tableRoot, List.of());
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = buildBatch(allocator, new String[] {"via-forLocation"}, new long[] {7})) {
+            long version = CommitWriter.forLocation(com.labuk.labukdb.core.storage.TableLocation.forLocal(tableRoot))
+                    .appendBatch(batch, Map.of());
+            assertEquals(1, version, "the new TableLocation-based dispatch path must be genuinely wired, not a no-op");
+        }
+
+        Snapshot snapshot = new SnapshotManager(tableRoot).latest();
+        assertEquals(1, snapshot.getActiveFileCount());
+    }
+
+    @Test
     void appendBatch_commitsAtomicallyAndIsReadableBack(@TempDir Path tableRoot) throws Exception {
         writeInitialCommit(tableRoot, List.of("level"));
 
