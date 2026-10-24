@@ -16,7 +16,7 @@ import java.util.Map;
  * planning and fetching - carrying its Hadoop Configuration with it,
  * rather than being flattened into a local path that couldn't be reopened.
  */
-final class ScanTicket {
+final class ScanTicket implements FlightTicket {
 
     final TableLocation dataFile;
     final List<String> projectedColumns;

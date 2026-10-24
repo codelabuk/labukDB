@@ -95,10 +95,13 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   actually matters). No new concurrency risk from either: old bytes stay
   on disk until `Vacuum` runs, so an in-flight reader's isolation already
   holds via `Snapshot`'s existing defensive copy.
-- **`log/TableMerger`** — ✅ **Done**: upsert/MERGE by key, the
-  foundational piece a CDC source (e.g. Debezium) needs — `CommitWriter`
+- **`log/TableMerger`** — ✅ **Done**: upsert/MERGE by key — `CommitWriter`
   alone can only blind-append or compact, never apply an update/delete
-  by key. One table + partition per call: `inserts`/`updates`/`deletes`
+  by key. Originally motivated by a CDC source (e.g. Debezium) as the
+  calling example — that specific direction was later considered and
+  deliberately dropped (see the build-order section below for why); the
+  upsert/MERGE capability itself stands on its own regardless of what
+  calls it. One table + partition per call: `inserts`/`updates`/`deletes`
   as three separate `VectorSchemaRoot`s (not one batch with an
   operation-indicator column), applied in that order against whatever's
   currently in the partition, committed as a single atomic
@@ -128,9 +131,7 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   needs a server-side "expected file set" precondition, out of scope);
   every retry re-reads/re-decodes the whole partition, same cost
   `Compactor` already accepts; no schema-type validation beyond "does
-  this named column exist." The Debezium connector itself (consuming its
-  embedded-engine change-event stream and calling this) is the next,
-  separate step.
+  this named column exist."
 - **`execution/`** — ✅ **Done**: `AggregateOperator` (`GROUP BY` +
   `SUM`/`COUNT`/`MIN`/`MAX`/`AVG`) and `SortLimitOperator` (`ORDER BY`/
   `LIMIT`, built on `arrow-algorithm`'s `IndexSorter`/`DefaultVectorComparators`
@@ -141,10 +142,32 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   existing fused residual-predicate pass in `decode/GroupPredicateEvaluator`
   already filters rows during decode; a separate post-decode operator
   would have no real caller yet (same premature-abstraction reasoning
-  that deferred `TableFormat`). **Not yet wired into `flight`/
-  `DeltaFlightProducer`** — `GetFlightInfo`'s one-endpoint-per-file model
-  doesn't fit `GROUP BY`'s need to combine rows across files without a
-  real protocol decision, named but not answered here.
+  that deferred `TableFormat`).
+- **`execution/` wired into `flight`** — ✅ **Done**: the real protocol
+  decision named above — `GetFlightInfo`'s one-endpoint-per-file model
+  genuinely didn't fit `GROUP BY`'s need to combine rows across files —
+  is resolved by switching to a **single combined endpoint** whenever a
+  query's `groupBy`/`aggregates`/`orderBy`/`limit` is present (any one of
+  the four, not just `GROUP BY` — a plain global top-N needs the exact
+  same cross-file combination a `GROUP BY` does). `DoGet` for that
+  endpoint decodes every surviving file, combines them (same
+  `VectorSchemaRootAppender` pattern `Compactor`/`TableMerger` already
+  use), then runs `AggregateOperator`/`SortLimitOperator` server-side
+  before streaming back one result. A plain scan (none of those four
+  fields) stays on the original, completely unchanged one-file-per-endpoint
+  path — verified by the existing `FlightIntegrationTest` suite passing
+  unmodified. New `FlightTicket` sealed interface
+  (`ScanTicket`/`CombinedScanTicket`) is what `TicketRegistry`/`DoGet`
+  dispatch on. Verified with a real server+client test spanning multiple
+  physical files for both the `GROUP BY` case and the plain
+  `ORDER BY ... LIMIT` case, each asserting the *globally* correct
+  result, not a per-file-local one. `COUNT` remains `COUNT(column)`
+  (non-null values), not `COUNT(*)` — unchanged, pre-existing
+  `AggregateOperator` semantics, not something this pass altered.
+  Deliberately not done here: a SQL parser (sequenced after this — SQL
+  needs an execution path to target, which is what this pass built) and
+  distributed cross-node aggregation (single-process only, same as
+  everything else in this codebase).
 
 `flight/DoPut` is the ingest entry point: it hands incoming Arrow batches
 to `WriteBuffer` first, not straight to `ArrowToParquetWriter`.
@@ -283,17 +306,28 @@ foundation under it is proven:
    verified against a real server with a real `pyarrow.flight` client.
 4. ✅ **Compaction / vacuum.** Done — `Compactor` + `Vacuum`, real-table verified.
 5. ✅ **`execution/`** — `AggregateOperator` + `SortLimitOperator` done,
-   standalone and composed; not yet wired into `flight` (see above).
+   standalone and composed, and now wired into `flight` too (see above).
 6. ✅ **Multi-writer OCC (local disk)** — done, see above. Remote OCC
    (S3/MinIO/ADLS) remains a separate, later piece — `CommitWriter` is
    still local-only.
-7. ✅ **`TableMerger` — upsert/MERGE by key.** Done, see above. The
-   Debezium connector that would actually drive it is the next,
-   separate step — not started yet.
+7. ✅ **`TableMerger` — upsert/MERGE by key.** Done, see above.
+   **A Debezium CDC connector was considered and deliberately dropped** —
+   Debezium only makes sense as a bridge from an *external* OLTP database
+   (Postgres/MySQL/etc.) that some other application already writes to,
+   not something labukDB itself needs; it doesn't fit labukDB's actual
+   target (a standalone real-time OLAP database applications write to
+   directly) any more than it fits DuckDB's (confirmed DuckDB has no
+   CDC-ingestion equivalent either — its Postgres/MySQL extensions are
+   query-time federation, not replication). `TableMerger` remains useful
+   on its own regardless — upsert-by-key doesn't need a CDC source.
 8. ✅ **CREATE TABLE + remote write completion.** Done, see above —
    `TableCreator`, and `CommitWriter`/`ArrowToParquetWriter`/`WriteBuffer`
    all `TableLocation`-dispatched, live-MinIO-verified at both the
    library and Flight levels.
+9. ✅ **`execution/` wired into `flight`.** Done, see above —
+   `GROUP BY`/`ORDER BY`/`LIMIT` now reachable through a real `DoGet`
+   round trip, combined correctly across multiple files. A SQL layer
+   (deliberately deferred until this existed) is the natural next step.
 
 **Known, pre-existing flaky test — not caused by the work above.**
 `labukdb-flight`'s `FlightIntegrationTest` intermittently fails (~1-in-4

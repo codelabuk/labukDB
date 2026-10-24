@@ -44,9 +44,10 @@ glance, and how to build and run it.
 
 ## What this is not
 
-- **Not a SQL engine.** `GROUP BY`/`ORDER BY`/`LIMIT` exist as standalone
-  operators (`execution/`) but aren't wired into query serving yet — see
-  Status below. No joins.
+- **Not a SQL engine.** `GROUP BY`/`ORDER BY`/`LIMIT` are real, served
+  over `DoGet` — see [The layers](#the-layers) — but there's no SQL text
+  parser; a client still builds a request shape, not a SQL string. No
+  joins.
 - **Not a Spark replacement** — different scope entirely, though it now
   overlaps more than it used to (it writes real Delta tables Spark can
   also read).
@@ -83,8 +84,8 @@ below is deliberately small enough to reason about end to end.
 | Read | `decode/` | For each surviving file: prune row groups via Parquet footer stats, decode only the requested columns, apply the residual filter row-by-row, and reconstruct partition columns as constants. Decode and filter are fused into one pass. | `RowGroupPruner`, `GroupPredicateEvaluator`, `ParquetToArrowReader` |
 | Write | `encode/` | Arrow → Parquet (the write mirror of `decode/`), and Arrow `Schema` → Delta's JSON `schemaString` for creating a table. | `ArrowToParquetWriter`, `ArrowToDeltaSchema` |
 | Write | `log/` | Append a batch, upsert/MERGE by key, compact small files, vacuum expired ones, create a brand-new table — all as atomic commits with multi-writer optimistic concurrency control. | `CommitWriter`, `WriteBuffer`, `TableMerger`, `Compactor`, `Vacuum`, `TableCreator` |
-| Both | `flight/` | Serve it. `GetFlightInfo`/`DoGet` for reads — plans and returns one `FlightEndpoint` per surviving file, decodes lazily per ticket. `DoPut` for writes — streams incoming batches into a buffer, flushes to a committed file. | `DeltaFlightProducer`, `LabukDbServerApp` |
-| — | `execution/` | `GROUP BY` aggregation and `ORDER BY`/`LIMIT`, standalone — not yet wired into `flight/` (see Status below). | `AggregateOperator`, `SortLimitOperator` |
+| Both | `flight/` | Serve it. A plain scan returns one `FlightEndpoint` per surviving file, decoded lazily per ticket. A query with `groupBy`/`aggregates`/`orderBy`/`limit` returns one combined endpoint instead — every surviving file is decoded, combined, and run through `execution/` server-side before streaming back one correct, cross-file result. `DoPut` for writes — streams incoming batches into a buffer, flushes to a committed file. | `DeltaFlightProducer`, `LabukDbServerApp` |
+| — | `execution/` | `GROUP BY` aggregation and `ORDER BY`/`LIMIT`, reachable via `flight/`'s `DoGet` (see above) and usable standalone as a library. | `AggregateOperator`, `SortLimitOperator` |
 
 Supporting packages: `storage/` (local/S3/MinIO/ADLS location resolution),
 `catalog/` (name → table-root registry), `cli/` (the `labukdb` tool),
@@ -378,9 +379,10 @@ caching (`ParquetFooterCache`) are both in place. A decoded-row-batch LRU
 for hot files is not yet implemented.
 
 **Flight surface:** `GetFlightInfo`, `DoGet`, `DoPut`, and `ListFlights`
-are implemented, local and remote. `DoAction`/`DoExchange` are
-unimplemented — there's no CREATE TABLE RPC and no push-based
-tailing/subscription yet.
+are implemented, local and remote — including `GROUP BY`/`ORDER BY`/
+`LIMIT` over `DoGet` (see Query/analytics support below). `DoAction`/
+`DoExchange` are unimplemented — there's no CREATE TABLE RPC and no
+push-based tailing/subscription yet.
 
 **Write support:**
 - **Append** (`CommitWriter.appendBatch`, `WriteBuffer`/`DoPut`) — done,
@@ -399,13 +401,23 @@ tailing/subscription yet.
   subcommand yet.
 - **Not implemented:** writing to Iceberg tables (read-only today); CLI
   write subcommands (`ingest`/`compact`/`vacuum`/`create-table` — the CLI
-  is `catalog`/`describe`/`query` only); `execution/`'s `GROUP BY`/
-  `ORDER BY` operators aren't wired into `flight/` (`GetFlightInfo`'s
-  one-endpoint-per-file model doesn't fit `GROUP BY`'s need to combine
-  rows across files, a real protocol decision not yet made); remote
-  multi-writer OCC has the right exception-handling in place but hasn't
-  been separately stress-tested under concurrent remote writers the way
-  local disk has.
+  is `catalog`/`describe`/`query` only); remote multi-writer OCC has the
+  right exception-handling in place but hasn't been separately
+  stress-tested under concurrent remote writers the way local disk has.
+
+**Query/analytics support:** `GROUP BY` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`)
+and `ORDER BY`/`LIMIT` are both reachable through a real `DoGet` round
+trip, not just available as a library — `GetFlightInfo` switches to a
+single combined endpoint whenever any of `groupBy`/`aggregates`/
+`orderBy`/`limit` is present, decodes every surviving file, combines
+them server-side, and runs `execution/` against the combined result
+before streaming back one correct, cross-file answer (verified with
+real multi-file fixtures — a per-file-only implementation would
+silently produce a wrong, partial result instead). A plain scan is
+completely unaffected — same one-endpoint-per-file path as always.
+`COUNT` is SQL `COUNT(column)` (non-null values), not `COUNT(*)`. No SQL
+text parser yet — a client builds the request shape directly; that's the
+natural next layer on top of this, not possible before it.
 
 **A known, pre-existing flaky test:** `FlightIntegrationTest`
 intermittently fails (~1-in-4 observed) with a Flight/gRPC buffer-release
@@ -464,7 +476,6 @@ dependencies:
 |---|---|
 | Iceberg write support | `IcebergTableFormat` is read-only today; `CommitWriter`'s Delta-specific write path has no Iceberg equivalent yet |
 | `TableMerger`/`Compactor`/`Vacuum` for remote tables | All three remain local-disk only by design; `CommitWriter`/`ArrowToParquetWriter`/`WriteBuffer` already aren't |
-| Debezium CDC connector | Consumes Debezium's embedded-engine (no Kafka needed) change-event stream and calls `TableMerger` — `TableMerger` itself (the foundational piece) is done |
 | CLI write subcommands | `ingest`/`compact`/`vacuum`/`create-table` — the write-path classes all exist as library capabilities, none are exposed via the CLI yet |
 | Flight `DoAction` for CREATE TABLE | `TableCreator` is a library capability only; needs its own request/response shape decision |
 | Remote multi-writer OCC stress-testing | Conflict-retry logic handles both local (NIO) and remote (Hadoop) exception types; not separately stress-tested under concurrent remote writers the way local disk is |
@@ -476,8 +487,8 @@ dependencies:
 | Nested `LIST<LIST<...>>`, MAP, STRUCT | `LIST<primitive>` already supported, read-only |
 | Checkpoint multi-part support for writes | Multi-part checkpoints are read-supported; `CommitWriter` doesn't write checkpoints at all yet (every version replays from JSON) |
 | Row-data caching (LRU) | Metadata is cached; scanned rows are not |
-| `execution/` wired into `flight/` | `GROUP BY`/`ORDER BY` exist standalone; `GetFlightInfo`'s one-endpoint-per-file model doesn't fit `GROUP BY`'s cross-file combine need — a real protocol decision, not yet made |
-| Streaming/tailing subscriptions (`DoExchange`) | Push-based freshness for readers, not pull — separate from the CDC-ingestion direction above |
+| A SQL text parser | `GROUP BY`/`ORDER BY`/`LIMIT` are reachable via `DoGet` now (see Status above) — a client still builds the request shape directly rather than SQL text; this is the natural next layer on top of that, not possible before it existed |
+| Streaming/tailing subscriptions (`DoExchange`) | Push-based freshness for readers, not pull |
 
 ### Multi-format
 | Item | Notes |

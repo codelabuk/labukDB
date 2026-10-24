@@ -29,6 +29,16 @@ import java.util.List;
  * are null, the query resolves against the latest snapshot. {@code columns}
  * null or empty means "all columns." {@code predicate} null means "no
  * filter, scan everything."
+ *
+ * <b>{@code groupBy}/{@code aggregates}/{@code orderBy}/{@code limit}</b> —
+ * any of these present switches the server onto a combined, cross-file
+ * execution path (see {@code AggregateQueryCodec} for the exact JSON
+ * shape of {@code aggregates}/{@code orderBy}) instead of the default
+ * one-endpoint-per-file scan. {@code aggregates}' {@code function} is one
+ * of {@code SUM}/{@code COUNT}/{@code MIN}/{@code MAX}/{@code AVG} —
+ * {@code COUNT} counts non-null values of the named column (SQL
+ * {@code COUNT(column)} semantics), not {@code COUNT(*)}, matching
+ * {@code AggregateOperator}'s existing, unchanged behavior.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class FlightQueryRequest {
@@ -39,6 +49,10 @@ public class FlightQueryRequest {
     private Long timestampMillis;
     private List<String> columns;
     private JsonNode predicate;
+    private List<String> groupBy;
+    private JsonNode aggregates;
+    private JsonNode orderBy;
+    private Long limit;
 
     public String getTable() {
         return table;
@@ -86,5 +100,37 @@ public class FlightQueryRequest {
 
     public void setPredicate(JsonNode predicate) {
         this.predicate = predicate;
+    }
+
+    public List<String> getGroupBy() {
+        return groupBy;
+    }
+
+    public void setGroupBy(List<String> groupBy) {
+        this.groupBy = groupBy;
+    }
+
+    public JsonNode getAggregates() {
+        return aggregates;
+    }
+
+    public void setAggregates(JsonNode aggregates) {
+        this.aggregates = aggregates;
+    }
+
+    public JsonNode getOrderBy() {
+        return orderBy;
+    }
+
+    public void setOrderBy(JsonNode orderBy) {
+        this.orderBy = orderBy;
+    }
+
+    public Long getLimit() {
+        return limit;
+    }
+
+    public void setLimit(Long limit) {
+        this.limit = limit;
     }
 }

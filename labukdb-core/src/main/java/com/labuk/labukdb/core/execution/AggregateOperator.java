@@ -121,7 +121,13 @@ public final class AggregateOperator {
         return result;
     }
 
-    private Field outputFieldFor(AggregateSpec spec, Schema inputSchema) {
+    /**
+     * Pure function of {@code (spec, inputSchema)}, no instance state —
+     * also used by {@code flight/} to compute an aggregate query's output
+     * schema at {@code GetFlightInfo} time, without running the
+     * aggregation itself.
+     */
+    public static Field outputFieldFor(AggregateSpec spec, Schema inputSchema) {
         return switch (spec.function()) {
             case COUNT -> new Field(spec.outputName(), FieldType.nullable(new ArrowType.Int(64, true)), null);
             case SUM, AVG -> new Field(spec.outputName(),

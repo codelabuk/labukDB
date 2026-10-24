@@ -3,6 +3,11 @@ package com.labuk.labukdb.flight;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.labuk.labukdb.core.catalog.TableCatalog;
 import com.labuk.labukdb.core.decode.ParquetToArrowReader;
+import com.labuk.labukdb.core.execution.AggregateOperator;
+import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.SortKey;
+import com.labuk.labukdb.core.execution.SortLimitOperator;
+import com.labuk.labukdb.flight.query.AggregateQueryCodec;
 import com.labuk.labukdb.flight.query.FlightQueryRequest;
 import com.labuk.labukdb.flight.query.PredicateCodec;
 import com.labuk.labukdb.core.log.Snapshot;
@@ -40,8 +45,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -204,6 +211,17 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             Predicate predicate = PredicateCodec.fromJson(query.getPredicate());
             ScanPlan plan = queryPlanner.plan(snapshot, predicate, query.getColumns());
 
+            List<String> groupByColumns = query.getGroupBy() == null ? List.of() : query.getGroupBy();
+            List<AggregateSpec> aggregates = AggregateQueryCodec.aggregatesFromJson(query.getAggregates());
+            List<SortKey> sortKeys = AggregateQueryCodec.orderByFromJson(query.getOrderBy());
+            long limit = query.getLimit() == null ? -1 : query.getLimit();
+            boolean combineMode = !groupByColumns.isEmpty() || !aggregates.isEmpty()
+                    || !sortKeys.isEmpty() || limit >= 0;
+
+            if (combineMode) {
+                return combinedFlightInfo(descriptor, tableRoot, plan, groupByColumns, aggregates, sortKeys, limit);
+            }
+
             List<FlightEndpoint> endpoints = new ArrayList<>();
             for (AddFile file : plan.getFilesToScan()) {
                 TableLocation dataFile = tableRoot.resolve(file.getPath());
@@ -264,18 +282,154 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         }
     }
 
+    /**
+     * Combine-mode planning — any of {@code groupBy}/{@code aggregates}/
+     * {@code orderBy}/{@code limit} present. Unlike the plain-scan path,
+     * every surviving file must be read together before a result exists,
+     * so this registers exactly one {@link CombinedScanTicket} covering
+     * all of them and returns exactly one {@link FlightEndpoint} — the
+     * literal fix for {@code GetFlightInfo}'s one-file-per-endpoint model
+     * not fitting cross-file combination.
+     */
+    private FlightInfo combinedFlightInfo(FlightDescriptor descriptor, TableLocation tableRoot, ScanPlan plan,
+                                           List<String> groupByColumns, List<AggregateSpec> aggregates,
+                                           List<SortKey> sortKeys, long limit) throws IOException {
+        boolean aggregating = !groupByColumns.isEmpty() || !aggregates.isEmpty();
+
+        // Decode needs every column referenced anywhere in this query --
+        // not just query.getColumns(), which doesn't apply the same way
+        // once the output is defined by groupBy/aggregates instead of a
+        // free projection.
+        Set<String> neededColumns = new LinkedHashSet<>();
+        if (aggregating) {
+            neededColumns.addAll(groupByColumns);
+            for (AggregateSpec spec : aggregates) {
+                neededColumns.add(spec.column());
+            }
+        } else {
+            if (plan.getProjectedColumns() != null) {
+                neededColumns.addAll(plan.getProjectedColumns());
+            }
+            // A plain orderBy/limit (no grouping) sorts on raw columns --
+            // make sure one is available to sort by even if the client
+            // didn't think to request it explicitly.
+            for (SortKey key : sortKeys) {
+                neededColumns.add(key.column());
+            }
+        }
+        List<String> projectedColumns = List.copyOf(neededColumns);
+
+        List<CombinedScanTicket.FileScan> files = new ArrayList<>();
+        for (AddFile file : plan.getFilesToScan()) {
+            TableLocation dataFile = tableRoot.resolve(file.getPath());
+            Predicate perFileResidual =
+                    PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
+            files.add(new CombinedScanTicket.FileScan(dataFile, perFileResidual, file.getPartitionValues()));
+        }
+
+        List<FlightEndpoint> endpoints = new ArrayList<>();
+        if (!files.isEmpty()) {
+            String ticketId = registry.register(new CombinedScanTicket(
+                    files, projectedColumns, groupByColumns, aggregates, sortKeys, limit));
+            endpoints.add(new FlightEndpoint(new Ticket(ticketId.getBytes(StandardCharsets.UTF_8))));
+        }
+
+        // Same "no surviving files -> empty schema" convention the plain-
+        // scan path already has -- aggregate output types can't be known
+        // without inspecting at least one file's physical schema.
+        Schema schema;
+        if (plan.getFilesToScan().isEmpty()) {
+            schema = new Schema(List.of());
+        } else if (aggregating) {
+            AddFile firstFile = plan.getFilesToScan().get(0);
+            Set<String> inputColumns = new LinkedHashSet<>(groupByColumns);
+            for (AggregateSpec spec : aggregates) {
+                inputColumns.add(spec.column());
+            }
+            Schema inputSchema = parquetReader.readSchema(
+                    tableRoot.resolve(firstFile.getPath()), List.copyOf(inputColumns), firstFile.getPartitionValues());
+
+            List<org.apache.arrow.vector.types.pojo.Field> outputFields = new ArrayList<>();
+            for (String column : groupByColumns) {
+                outputFields.add(inputSchema.findField(column));
+            }
+            for (AggregateSpec spec : aggregates) {
+                outputFields.add(AggregateOperator.outputFieldFor(spec, inputSchema));
+            }
+            schema = new Schema(outputFields);
+        } else {
+            AddFile firstFile = plan.getFilesToScan().get(0);
+            schema = parquetReader.readSchema(
+                    tableRoot.resolve(firstFile.getPath()), projectedColumns, firstFile.getPartitionValues());
+        }
+
+        return FlightInfo.builder(schema, descriptor, endpoints)
+                .setRecords(-1)
+                .setBytes(-1)
+                .build();
+    }
+
     @Override
     public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
         String ticketId = new String(ticket.getBytes(), StandardCharsets.UTF_8);
+        // Only ever non-null mid-pipeline in the CombinedScanTicket branch,
+        // where decode/aggregate/sort each produce a new root that
+        // supersedes the previous one -- tracked here so a failure at any
+        // stage still closes whatever was most recently allocated, via the
+        // finally block below, without risking a double-close on the
+        // success path (set back to null right after a clean stream).
+        VectorSchemaRoot current = null;
         try {
-            ScanTicket scanTicket = registry.lookup(ticketId);
-            try (VectorSchemaRoot root = parquetReader.read(
-                    scanTicket.dataFile, allocator, scanTicket.projectedColumns,
-                    scanTicket.residualPredicate, scanTicket.partitionValues)) {
-                listener.start(root);
-                listener.putNext();
-                listener.completed();
+            FlightTicket flightTicket = registry.lookup(ticketId);
+
+            if (flightTicket instanceof ScanTicket scanTicket) {
+                try (VectorSchemaRoot root = parquetReader.read(
+                        scanTicket.dataFile, allocator, scanTicket.projectedColumns,
+                        scanTicket.residualPredicate, scanTicket.partitionValues)) {
+                    listener.start(root);
+                    listener.putNext();
+                    listener.completed();
+                }
+                return;
             }
+
+            CombinedScanTicket combinedTicket = (CombinedScanTicket) flightTicket;
+
+            // Decode every surviving file and combine into one root --
+            // same VectorSchemaRootAppender pattern Compactor/TableMerger
+            // already use, including the allocateNew() gotcha (a bare
+            // create() alone leaves zero-capacity buffers and fails on the
+            // first variable-width column appended into it).
+            for (CombinedScanTicket.FileScan file : combinedTicket.files) {
+                try (VectorSchemaRoot batch = parquetReader.read(
+                        file.dataFile(), allocator, combinedTicket.projectedColumns,
+                        file.residualPredicate(), file.partitionValues())) {
+                    if (current == null) {
+                        current = VectorSchemaRoot.create(batch.getSchema(), allocator);
+                        current.allocateNew();
+                    }
+                    org.apache.arrow.vector.util.VectorSchemaRootAppender.append(current, batch);
+                }
+            }
+
+            if (!combinedTicket.groupByColumns.isEmpty() || !combinedTicket.aggregates.isEmpty()) {
+                VectorSchemaRoot aggregated = new AggregateOperator().aggregate(
+                        List.of(current), combinedTicket.groupByColumns, combinedTicket.aggregates, allocator);
+                current.close();
+                current = aggregated;
+            }
+            if (!combinedTicket.sortKeys.isEmpty() || combinedTicket.limit >= 0) {
+                VectorSchemaRoot sorted = new SortLimitOperator().sortAndLimit(
+                        current, combinedTicket.sortKeys, combinedTicket.limit, allocator);
+                current.close();
+                current = sorted;
+            }
+
+            listener.start(current);
+            listener.putNext();
+            listener.completed();
+            current.close();
+            current = null;
         } catch (IOException e) {
             listener.error(CallStatus.INTERNAL.withDescription("Failed to read file: " + e.getMessage())
                     .toRuntimeException());
@@ -291,6 +445,9 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                     .withCause(e)
                     .toRuntimeException());
         } finally {
+            if (current != null) {
+                current.close();
+            }
             registry.invalidate(ticketId);
         }
     }

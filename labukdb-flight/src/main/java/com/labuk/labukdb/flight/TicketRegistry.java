@@ -20,16 +20,16 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class TicketRegistry {
 
-    private final Map<String, ScanTicket> tickets = new ConcurrentHashMap<>();
+    private final Map<String, FlightTicket> tickets = new ConcurrentHashMap<>();
 
-    String register(ScanTicket ticket) {
+    String register(FlightTicket ticket) {
         String id = UUID.randomUUID().toString();
         tickets.put(id, ticket);
         return id;
     }
 
-    ScanTicket lookup(String id) {
-        ScanTicket ticket = tickets.get(id);
+    FlightTicket lookup(String id) {
+        FlightTicket ticket = tickets.get(id);
         if (ticket == null) {
             throw new IllegalArgumentException("Unknown or already-consumed ticket: " + id);
         }
