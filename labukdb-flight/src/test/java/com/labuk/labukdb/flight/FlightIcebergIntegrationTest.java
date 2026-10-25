@@ -7,10 +7,10 @@ import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
-import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
+import org.apache.arrow.flight.PutResult;
 import org.apache.arrow.flight.SyncPutListener;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
@@ -36,7 +36,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
@@ -184,35 +183,50 @@ class FlightIcebergIntegrationTest {
     }
 
     @Test
-    void doPut_againstIcebergTable_rejectedBeforeTouchingAnything(@TempDir Path tableRoot) throws Exception {
-        buildTwoPartitionFixture(tableRoot);
-        long filesBefore = countFilesUnder(tableRoot);
+    void doPut_appendsToIcebergTable_thenReadableViaDoGet(@TempDir Path tableRoot) throws Exception {
+        buildTwoPartitionFixture(tableRoot); // ERROR: 1..5, INFO: 100..104 -- 10 rows total
 
-        FlightDescriptor descriptor = FlightDescriptor.command(
+        FlightDescriptor putDescriptor = FlightDescriptor.command(
                 ("{\"tableRoot\":" + MAPPER.writeValueAsString(tableRoot.toAbsolutePath().toString())
-                        + ",\"partitionValues\":{\"level\":\"ERROR\"}}").getBytes(StandardCharsets.UTF_8));
+                        + ",\"partitionValues\":{\"level\":\"WARN\"}}").getBytes(StandardCharsets.UTF_8));
 
+        Field serviceField = new Field("service", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
         Field amountField = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
-        try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(amountField)), allocator);
+        try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(serviceField, amountField)), allocator);
              SyncPutListener putListener = new SyncPutListener()) {
             batch.allocateNew();
+            ((VarCharVector) batch.getVector("service")).setSafe(0, "new-svc".getBytes(StandardCharsets.UTF_8));
             ((BigIntVector) batch.getVector("amount")).setSafe(0, 999L);
             batch.setRowCount(1);
 
-            var putStream = client.startPut(descriptor, batch, putListener);
+            var putStream = client.startPut(putDescriptor, batch, putListener);
             putStream.putNext();
             putStream.completed();
-
-            FlightRuntimeException thrown = assertThrows(FlightRuntimeException.class, putListener::getResult);
-            assertTrue(thrown.getMessage().contains("Iceberg"), thrown.getMessage());
+            PutResult ack = putListener.read();
+            assertNotNull(ack, "server must ack the Iceberg DoPut");
         }
 
-        assertEquals(filesBefore, countFilesUnder(tableRoot), "the Iceberg table directory must be untouched after a rejected DoPut");
-    }
+        // Read back through the existing, UNMODIFIED Iceberg GetFlightInfo/DoGet path.
+        String queryJson = "{\"tableRoot\":" + MAPPER.writeValueAsString(tableRoot.toAbsolutePath().toString()) + "}";
+        FlightInfo info = client.getInfo(FlightDescriptor.command(queryJson.getBytes(StandardCharsets.UTF_8)));
 
-    private static long countFilesUnder(Path root) throws Exception {
-        try (var walk = Files.walk(root)) {
-            return walk.filter(Files::isRegularFile).count();
+        int totalRows = 0;
+        boolean sawNewRow = false;
+        for (FlightEndpoint endpoint : info.getEndpoints()) {
+            try (FlightStream stream = client.getStream(endpoint.getTicket())) {
+                while (stream.next()) {
+                    VectorSchemaRoot root = stream.getRoot();
+                    totalRows += root.getRowCount();
+                    VarCharVector serviceVector = (VarCharVector) root.getVector("service");
+                    for (int i = 0; i < root.getRowCount(); i++) {
+                        if ("new-svc".equals(new String(serviceVector.get(i), StandardCharsets.UTF_8))) {
+                            sawNewRow = true;
+                        }
+                    }
+                }
+            }
         }
+        assertEquals(11, totalRows, "10 original rows + 1 newly appended row via DoPut");
+        assertTrue(sawNewRow, "the newly appended row must be readable through the existing, unmodified read path");
     }
 }

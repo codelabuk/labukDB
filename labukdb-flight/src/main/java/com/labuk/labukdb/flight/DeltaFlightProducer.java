@@ -29,6 +29,7 @@ import com.labuk.labukdb.core.storage.MinioConfiguration;
 import com.labuk.labukdb.core.storage.TableLocation;
 import com.labuk.labukdb.flight.query.FlightWriteRequest;
 import com.labuk.labukdb.iceberg.IcebergTableFormat;
+import com.labuk.labukdb.iceberg.IcebergTableWriter;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -43,6 +44,7 @@ import org.apache.arrow.flight.Ticket;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.VectorSchemaRootAppender;
 import org.apache.hadoop.conf.Configuration;
 
 import java.io.IOException;
@@ -529,8 +531,8 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     }
 
     /**
-     * Streams incoming Arrow batches into a {@link WriteBuffer} for the
-     * requested table + partition, flushing unconditionally once the
+     * Delta: streams incoming Arrow batches into a {@link WriteBuffer} for
+     * the requested table + partition, flushing unconditionally once the
      * client finishes sending — a successful {@code DoPut} means
      * "committed," not "buffered somewhere, maybe." Batching across
      * *separate* {@code DoPut} calls via {@code WriteBuffer}'s own
@@ -544,6 +546,12 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * remote. The table itself must already exist — {@code DoPut} only
      * appends, same as {@code CommitWriter.appendBatch}; creating a new
      * table is {@code TableCreator}, not exposed over Flight yet.
+     *
+     * Iceberg (detected via {@link DetectedFormat}): delegates to {@link
+     * #acceptPutIceberg} — append-only, one {@code DoPut} call commits
+     * exactly one new Iceberg snapshot via {@link IcebergTableWriter}, no
+     * {@code WriteBuffer}-style cross-call buffering. The table must
+     * already exist here too; no Iceberg CREATE TABLE support either.
      */
     @Override
     public Runnable acceptPut(CallContext context, FlightStream flightStream, StreamListener<PutResult> ackStream) {
@@ -553,15 +561,11 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                         flightStream.getDescriptor().getCommand(), FlightWriteRequest.class);
                 TableLocation tableRoot = resolveTableLocation(request.getTable(), request.getTableRoot());
 
-                // Iceberg write support doesn't exist -- without this check, DoPut
-                // would silently create Delta-shaped commit-log files inside what's
-                // actually meant to be an Iceberg table's directory, since nothing
-                // downstream of this point knows Iceberg exists. Fail clearly before
-                // touching anything, now that Iceberg tables are visible/reachable
-                // at all through this same system (see getFlightInfo).
                 if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                    throw new IllegalArgumentException(
-                            "Writes are not supported for Iceberg tables (detected at " + tableRoot + ")");
+                    acceptPutIceberg(tableRoot, request.getPartitionValues(), flightStream);
+                    ackStream.onNext(PutResult.empty());
+                    ackStream.onCompleted();
+                    return;
                 }
 
                 Map<String, String> partitionValues = request.getPartitionValues();
@@ -595,6 +599,44 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                         .toRuntimeException());
             }
         };
+    }
+
+    /**
+     * Iceberg's {@code DoPut} counterpart — combines every streamed batch
+     * into one {@link VectorSchemaRoot} (same {@code VectorSchemaRootAppender}
+     * pattern {@code CombinedQueryExecutor}/{@code Compactor}/{@code
+     * TableMerger} already use, including the {@code allocateNew()}
+     * gotcha) and commits it as exactly one new Iceberg snapshot via
+     * {@link IcebergTableWriter}. Deliberately no cross-call buffering
+     * the way {@link WriteBuffer} gives Delta — one {@code DoPut} call is
+     * one Iceberg commit, matching how Delta's own write path was itself
+     * built incrementally (plain commits existed before {@code WriteBuffer}
+     * did).
+     */
+    private void acceptPutIceberg(TableLocation tableRoot, Map<String, String> partitionValues,
+                                   FlightStream flightStream) throws IOException {
+        if (partitionValues == null) {
+            throw new IllegalArgumentException("'partitionValues' is required");
+        }
+
+        VectorSchemaRoot combined = null;
+        try {
+            while (flightStream.next()) {
+                VectorSchemaRoot batch = flightStream.getRoot();
+                if (combined == null) {
+                    combined = VectorSchemaRoot.create(batch.getSchema(), allocator);
+                    combined.allocateNew();
+                }
+                VectorSchemaRootAppender.append(combined, batch);
+            }
+            if (combined != null && combined.getRowCount() > 0) {
+                new IcebergTableWriter(tableRoot).appendBatch(combined, partitionValues);
+            }
+        } finally {
+            if (combined != null) {
+                combined.close();
+            }
+        }
     }
 
     /**

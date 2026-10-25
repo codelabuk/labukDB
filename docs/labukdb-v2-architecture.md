@@ -68,8 +68,8 @@ system alone.
 | Module | Contains (today's package) | Depends on | Produces |
 |---|---|---|---|
 | `labukdb-core` | `log/`, `planner/`, `decode/`, `storage/`, `catalog/` (reused) + `encode/`, `execution/`, `format/`, `query/` (new) | — | embeddable library jar |
-| `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat`, delegating manifest/table loading to `iceberg-core:1.12.0`'s `HadoopTables` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional) |
-| `labukdb-flight` | `flight/` (adds `DoPut`) | `labukdb-core`, `labukdb-format-iceberg` (for Iceberg query support) | library jar |
+| `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat` (reads) + `IcebergTableWriter` (append-only writes), delegating manifest/table loading and commit protocol to `iceberg-core:1.12.0`'s `HadoopTables`/`Table` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional for a pure core embedder; required by cli/flight) |
+| `labukdb-flight` | `flight/` (adds `DoPut`, including Iceberg append) | `labukdb-core`, `labukdb-format-iceberg` (Iceberg query + write support) | library jar |
 | `labukdb-server-app` | `DeltaFlightServerApp` → `LabukDbServerApp` | `labukdb-core`, `labukdb-flight` | shaded standalone server jar |
 | `labukdb-cli` | `cli/` | `labukdb-core`, `labukdb-format-iceberg` (for Iceberg `--table`/`--sql` support) in-process — no Flight needed | shaded CLI executable |
 
@@ -408,19 +408,65 @@ Correctness isn't affected; large Iceberg results just don't stream
 incrementally yet. On Flight this means Iceberg always registers exactly
 one `CombinedScanTicket`, reusing the *existing* ticket/executor/`getStream`
 dispatch completely unchanged (already polymorphic over `FlightTicket`).
-`DoPut` against a detected-Iceberg location is now rejected with a clear
-error before touching anything — without that guard it would have
-silently created Delta-shaped commit-log files inside what's actually
-meant to be an Iceberg table's directory, a real risk this change's added
-reachability increased, not a hypothetical one.
+`DoPut` against a detected-Iceberg location was rejected with a clear
+error in this pass, before touching anything — since reading it this way
+had just made Iceberg tables visible/reachable without yet having a write
+path for them. **That rejection was itself replaced by a real write path
+in a later pass — see the Iceberg writes update below.**
 
 Verified with new real-fixture tests (same `HadoopTables.create` +
 `ArrowToParquetWriter` + commit pattern `IcebergTableFormatTest` already
 used, extended to two partition files): `QueryCommandIcebergIntegrationTest`
 (CLI `--table`/`--filter` and `--sql`, including genuine cross-file
 `GROUP BY`) and `FlightIcebergIntegrationTest` (real server + client,
-plain scan and `GROUP BY` over real `DoGet`, plus the `DoPut`-rejection
-test asserting the table directory is provably untouched afterward).
+plain scan and `GROUP BY` over real `DoGet`).
+
+**Update — Iceberg writes (append-only) are now done, replacing the
+`DoPut` rejection above.** Revised scope after checking `iceberg-core`'s
+real API rather than assuming: this isn't "a second parallel write
+engine" the way it first sounded. `iceberg-core`'s own `Table`/
+`AppendFiles` already implements the commit protocol — manifest writing,
+snapshot creation, atomic catalog-pointer swap, **and OCC retry**
+(confirmed via `javap -c` on `SnapshotProducer.commit()`'s real bytecode:
+it already runs `Tasks.foreach(...).retry(...).exponentialBackoff(...)
+.onlyRetryOn(CommitFailedException.class)...` internally). Unlike
+`CommitWriter`, which had to hand-build its own bounded-retry loop
+because this project reimplements Delta's log format from scratch, the
+new `labukdb-format-iceberg/IcebergTableWriter` needs no retry loop of
+its own — it's a thin adapter, much like `IcebergTableFormat`'s read side
+already is: `appendBatch(VectorSchemaRoot, Map<String,String>)`, same
+shape as `CommitWriter.appendBatch` for discoverability, writes via the
+*existing, unmodified* `ArrowToParquetWriter`/`TableLocation` dispatch,
+builds a `DataFile` via `DataFiles.builder(table.spec())` (the exact
+builder calls already proven correct in `IcebergTableFormatTest`/
+`IcebergRemoteMinioIntegrationTest`'s own fixtures), then
+`table.newAppend().appendFile(dataFile).commit()`.
+
+Scoped deliberately narrow, mirroring how Delta's own write path was
+built incrementally (single-writer commit path first, `TableCreator`
+much later): append only, to an **already-existing** table — no CREATE
+TABLE, merge/upsert, compaction, or vacuum equivalent. Reachable via
+Flight `DoPut` (new `acceptPutIceberg` helper, mirroring how
+`icebergFlightInfo` was already factored out of `getFlightInfo`) and the
+embedded library — deliberately **not** a CLI subcommand, matching
+Delta's own CLI, which has no write subcommands for either format. No
+Iceberg `WriteBuffer` equivalent either — one `DoPut` call is exactly one
+Iceberg commit (streamed batches combined via the same
+`VectorSchemaRootAppender` pattern `CombinedQueryExecutor`/`Compactor`/
+`TableMerger` already use), no cross-call buffering; `WriteBuffer` was
+itself a later addition to Delta's write path for the same reason, so
+the same build-order logic applies here.
+
+One real edge case resolved by a dedicated test, not assumed: an
+unpartitioned table's partition path is `""`, and `DataFiles.Builder
+.withPartitionPath("")` needed confirming it's accepted — it is.
+
+Verified with `IcebergTableWriterTest` (append + read back through the
+*existing, unmodified* `IcebergTableFormat`/`ParquetToArrowReader`;
+append twice, both commits visible; the unpartitioned-table case) and a
+real `DoPut`-then-`DoGet` round trip added to `FlightIcebergIntegrationTest`
+(replacing its now-obsolete rejection test, which asserted behavior this
+pass intentionally replaced).
 
 ## Build order
 
@@ -483,9 +529,15 @@ foundation under it is proven:
     `format/DetectedFormat` auto-detects Delta vs. Iceberg per table
     location; `--table`/`--sql`/Flight all reach Iceberg tables now, not
     just a direct Java call to `IcebergTableFormat`. Delta's own query
-    path is completely unchanged. Iceberg writes remain unbuilt, and
-    `DoPut` now explicitly rejects a detected-Iceberg location rather
-    than silently mishandling it.
+    path is completely unchanged.
+13. ✅ **Iceberg writes (append-only).** Done, see above — new
+    `IcebergTableWriter`, reachable via `DoPut` and the embedded library.
+    No Iceberg CREATE TABLE, merge/upsert, compaction, or vacuum yet; no
+    CLI write subcommands for either format. Iceberg catalog-service
+    integration (REST/Hive/Glue, vs. today's path-only `HadoopTables`)
+    remains a separate, deliberately later follow-up — it needs a new
+    addressing model alongside `TableLocation`, not just a different
+    loader.
 
 **Known, pre-existing flaky test — not caused by the work above, root
 cause still genuinely open.** `labukdb-flight`'s `FlightIntegrationTest`

@@ -26,10 +26,11 @@ a location holds — probing for a `_delta_log/` directory (Delta) or a
 `FlightQueryRequest` works against either without saying which one it is.
 A few real differences to know about:
 
-- **Iceberg is read-only.** There's no write support for it at all —
-  `DoPut` against a detected-Iceberg location is rejected with a clear
-  error before touching anything, and no CLI/library write path exists
-  for it either.
+- **Iceberg writes are append-only, and not reachable from the CLI.**
+  `DoPut` (Flight) and `IcebergTableWriter` (embedded library) can append
+  to an already-existing Iceberg table — no CREATE TABLE, no merge/
+  upsert, no compaction, no vacuum, and the CLI still has no write
+  subcommands at all for *either* format, so this isn't CLI-reachable.
 - **`--version`/`version` means something different per format.** For
   Delta it's a small sequential commit version; for Iceberg it's a real,
   non-sequential `snapshotId` (a large pseudo-random long) — see
@@ -295,6 +296,16 @@ table's schema (minus partition columns) after the descriptor; the
 server buffers them (WAL-backed) and flushes to a committed Parquet file
 + log entry once a size/time threshold is hit.
 
+**`DoPut` against an Iceberg table** works the same way from the
+client's side (same JSON request shape, same streamed-batches protocol),
+but is handled differently server-side: no `WriteBuffer`, no WAL — every
+streamed batch in the call is combined into one Arrow batch and committed
+as exactly **one new Iceberg snapshot** per `DoPut` call (via the new
+`IcebergTableWriter`, reusing `iceberg-core`'s own `Table.newAppend()`,
+which already retries internally under a concurrent-writer conflict — no
+hand-built OCC loop needed here, unlike Delta's). The table must already
+exist; there's still no Iceberg CREATE TABLE support.
+
 ### From Python (or any Flight-capable client, any language)
 
 ```python
@@ -461,6 +472,23 @@ for the exact semantics). `Compactor` (bin-packing) and `Vacuum`
 (orphaned-file removal) both have matching `TableLocation` overloads too
 — all four local and remote, live-MinIO-verified.
 
+**Writing to an Iceberg table** — append only, to an already-existing
+table (no Iceberg equivalent of `TableCreator`/`TableMerger`/`Compactor`/
+`Vacuum` yet):
+
+```java
+import com.labuk.labukdb.iceberg.IcebergTableWriter;
+
+new IcebergTableWriter(location).appendBatch(batch, Map.of("level", "ERROR"));
+```
+
+Same `appendBatch(VectorSchemaRoot, Map<String,String>)` shape as
+`CommitWriter`, deliberately, but no OCC retry loop of its own —
+`iceberg-core`'s own `Table.newAppend().commit()` already retries
+internally under a concurrent-writer conflict (confirmed against its
+real bytecode), so there's nothing to hand-roll the way Delta's
+`CommitWriter` has to.
+
 ### Configuring a remote backend
 
 No env-var auto-detection at the library layer (that convenience is
@@ -495,8 +523,9 @@ environment-variable table.
   (section 4).
 
 All four are query-equivalent for `SELECT`/filter/`GROUP BY`/`ORDER BY`/
-`LIMIT` — none trades away correctness for convenience. Writes
-(`CommitWriter`/`TableCreator`/`TableMerger`/`Compactor`/`Vacuum`) are
-reachable from the embedded library and Flight's `DoPut` (append only);
-the CLI is query-only today — no `ingest`/`compact`/`vacuum`/`create-table`
-subcommands yet.
+`LIMIT` — none trades away correctness for convenience. Writes are
+reachable from the embedded library and Flight's `DoPut`: Delta has the
+full set (`CommitWriter`/`TableCreator`/`TableMerger`/`Compactor`/
+`Vacuum`), Iceberg has append-only (`IcebergTableWriter`, no create/
+merge/compact/vacuum equivalent yet). The CLI is query-only for both
+formats — no `ingest`/`compact`/`vacuum`/`create-table` subcommands.

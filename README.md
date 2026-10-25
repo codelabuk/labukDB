@@ -9,7 +9,8 @@ embeddable or served over Apache Arrow Flight.**
 It reads and writes real Delta tables — local disk, S3, MinIO, or ADLS —
 prunes files down using a four-level pushdown pipeline on read, and
 streams rows in or out as Arrow IPC to any client in any language. It also
-reads (not yet writes) Iceberg tables. No `delta-rs`, no `delta-kernel`,
+reads and appends to (not yet creates/merges/compacts/vacuums) Iceberg
+tables. No `delta-rs`, no `delta-kernel`,
 no DuckDB/Spark in the path: the transaction log, pruning, Parquet
 encode/decode, and the write path (append, upsert/MERGE by key,
 compaction, vacuum, multi-writer concurrency, table creation) are all
@@ -47,14 +48,15 @@ build and run it.
 
 ## What this is not
 
-- **Not a SQL engine.** `GROUP BY`/`ORDER BY`/`LIMIT` are real, served
-  over `DoGet` — see [The layers](#the-layers) — but there's no SQL text
-  parser; a client still builds a request shape, not a SQL string. No
-  joins.
+- **Not a full SQL engine.** `GROUP BY`/`ORDER BY`/`LIMIT` are real, and
+  a real (narrow) SQL subset is parsed on the CLI's `--sql` flag — see
+  [The layers](#the-layers) — but no joins, subqueries, or `NOT`, and
+  Flight clients still build a JSON request shape, not SQL text.
 - **Not a Spark replacement** — different scope entirely, though it now
   overlaps more than it used to (it writes real Delta tables Spark can
   also read).
-- **Not Iceberg-write-capable yet** — Iceberg support is read-only.
+- **Not Iceberg-CREATE/merge/compact/vacuum-capable yet** — Iceberg
+  support is read + append-only.
 
 Companion project to `local-lakehouse-lab` (not part of it): that project
 is a Spark/Flink + DuckDB stack. This one is the from-scratch story —
@@ -489,12 +491,19 @@ push-based tailing/subscription yet.
   action actually named).
 - **CREATE TABLE** (`TableCreator`) — done, local and remote, live-MinIO-
   verified. Library capability only — no Flight `DoAction` RPC or CLI
-  subcommand yet.
-- **Not implemented:** writing to Iceberg tables (read-only today); CLI
-  write subcommands (`ingest`/`compact`/`vacuum`/`create-table` — the CLI
-  is `catalog`/`describe`/`query` only); remote multi-writer OCC has the
-  right exception-handling in place but hasn't been separately
-  stress-tested under concurrent remote writers the way local disk has.
+  subcommand yet. Delta only — no Iceberg equivalent.
+- **Iceberg append** (`IcebergTableWriter`, `DoPut`) — done, append to an
+  already-existing table only. Reuses `iceberg-core`'s own
+  `Table.newAppend().commit()`, which already retries internally under a
+  concurrent-writer conflict (confirmed against its real bytecode) — no
+  hand-built OCC loop needed, unlike `CommitWriter`'s. No Iceberg CREATE
+  TABLE, merge/upsert, compaction, or vacuum.
+- **Not implemented:** CLI write subcommands (`ingest`/`compact`/`vacuum`/
+  `create-table` — the CLI is `catalog`/`describe`/`query` only, for both
+  formats); Iceberg CREATE TABLE/merge/compaction/vacuum; remote
+  multi-writer OCC (Delta) has the right exception-handling in place but
+  hasn't been separately stress-tested under concurrent remote writers
+  the way local disk has.
 
 **Query/analytics support:** `GROUP BY` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`)
 and `ORDER BY`/`LIMIT` are both reachable through a real `DoGet` round
@@ -584,7 +593,7 @@ dependencies:
 ### Write path
 | Item | Notes |
 |---|---|
-| Iceberg write support | `IcebergTableFormat` is read-only today; `CommitWriter`'s Delta-specific write path has no Iceberg equivalent yet |
+| Iceberg write support beyond append | `IcebergTableWriter` does append (`DoPut` + embedded library), reusing `iceberg-core`'s own OCC-retrying `Table.newAppend().commit()` — no Iceberg CREATE TABLE, merge/upsert, compaction, or vacuum yet |
 | CLI write subcommands | `ingest`/`compact`/`vacuum`/`create-table` — the write-path classes all exist as library capabilities, none are exposed via the CLI yet |
 | Flight `DoAction` for CREATE TABLE | `TableCreator` is a library capability only; needs its own request/response shape decision |
 | Remote multi-writer OCC stress-testing | Conflict-retry logic handles both local (NIO) and remote (Hadoop) exception types; not separately stress-tested under concurrent remote writers the way local disk is |
@@ -602,7 +611,8 @@ dependencies:
 ### Multi-format
 | Item | Notes |
 |---|---|
-| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — read-only, path-based, local and remote (live-MinIO-verified), tested against a self-built fixture rather than a Spark/Trino-written table. Reachable via `--table`/`--sql`/Flight now too (auto-detected by probing for `_delta_log/` vs. `metadata/`), not just as a library call — see [USAGE.md](USAGE.md#delta-vs-iceberg) |
+| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — path-based, local and remote (live-MinIO-verified), tested against a self-built fixture rather than a Spark/Trino-written table. Reachable via `--table`/`--sql`/Flight now too (auto-detected by probing for `_delta_log/` vs. `metadata/`), not just as a library call — see [USAGE.md](USAGE.md#delta-vs-iceberg) |
+| Iceberg write support | ✅ Append only (`IcebergTableWriter`, `DoPut` + embedded library) — no CREATE TABLE, merge/upsert, compaction, or vacuum. `iceberg-core`'s own commit protocol handles OCC retry internally, unlike Delta's hand-built one |
 | `TableFormat` wired into `cli`/`flight` | ✅ Done for Iceberg's query path specifically (`DetectedFormat` + `QueryPlanner.planNormalized`) — Delta's own query path still bypasses it (`SnapshotManager`/`QueryPlanner.plan`/`ScanPlan`/`AddFile`, deliberately left unchanged; `Snapshot` is built from real commit-log actions in a way nothing can fake for Iceberg, so this was a genuine second path, not a shared-everything refactor) |
 | Parquet-only tables (no transaction log) | Direct file listing with stats, no commit log |
 

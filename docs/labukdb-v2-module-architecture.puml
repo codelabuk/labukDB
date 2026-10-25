@@ -191,12 +191,13 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
 
 ' ─── format module, optional only for a pure core embedder ──
 package "labukdb-format-iceberg  (optional for core embedders;\nrequired by cli/flight below)" #D9F2C4 {
-  [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core — READ-ONLY,\nno Iceberg write support yet)] as ITF #D9F2C4
+  [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core — read-only)] as ITF #D9F2C4
+  [IcebergTableWriter\n(append-only, to an existing table;\niceberg-core's own Table.newAppend()\nretries OCC conflicts internally --\nno hand-built retry loop needed,\nunlike CommitWriter's)] as ITW #D9F2C4
 }
 
 ' ─── labukdb-flight ───────────────────────────────────────
 package "labukdb-flight  (depends on core, format-iceberg)" #EEEDFE {
-  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files;\nDoPut rejects a detected-Iceberg\nlocation -- no write support for it)] as DFP
+  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files;\nDoPut appends to Iceberg too now --\none DoPut = one Iceberg commit,\nno WriteBuffer equivalent)] as DFP
   [TicketRegistry] as TR
 }
 
@@ -230,6 +231,8 @@ TMRG --> CW  : insert/update/delete by key,\ncommit via replaceFiles\n(dataChang
 VAC  --> DT  : delete files past retired-and-expired
 
 ITF --> IT : read via iceberg-core
+ITW --> IT  : commit via iceberg-core\n(Table.newAppend, internal OCC retry)
+ITW --> ATPW : write new data file\n(existing, unmodified encoder)
 TF  <|.. DTF
 TF  <|.. ITF
 
@@ -269,7 +272,8 @@ DFP --> DF   : every query, first --\nDelta or Iceberg?
 DFP --> QP   : Delta-detected -- plan()/ScanPlan,\nunchanged one-endpoint-per-file\nor combine-mode split
 DFP --> ITF  : Iceberg-detected --\nalways combine mode\n(see ITF --> QP above)
 DFP --> CQE  : combine-mode DoGet --\ngroupBy/aggregates/orderBy/limit\npresent (Delta), or any Iceberg\nquery, one combined endpoint\ninstead of one-per-file
-DFP --> WB   : DoPut → buffer first\n(rejects Iceberg-detected first)
+DFP --> WB   : DoPut, Delta-detected --\nbuffer first (WAL-backed)
+DFP --> ITW  : DoPut, Iceberg-detected --\nstreamed batches combined into\none VectorSchemaRoot, one commit\nper DoPut call, no buffering
 DFP --> TR
 DFP --> CAT
 DFSA --> DFP
