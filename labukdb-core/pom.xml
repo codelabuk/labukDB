@@ -32,6 +32,10 @@
       s3a:// / abfss://, kept optional so a local-only consumer isn't
       forced to pull in either cloud SDK transitively.
     - arrow-vector / arrow-memory-netty: the decoded columnar output.
+    - query/SqlQueryTranslator needs jsqlparser, also kept optional.
+      A pure-library embedder calling log/planner/decode/execution/
+      directly (no SQL) shouldn't be forced into a SQL parser dependency
+      they never asked for, same reasoning as hadoop-aws/hadoop-azure.
   -->
   <dependencies>
     <dependency>
@@ -78,6 +82,11 @@
       <!-- execution/SortLimitOperator's IndexSorter/CompositeVectorComparator — real, reusable sort infra, not hand-rolled comparison logic. -->
       <groupId>org.apache.arrow</groupId>
       <artifactId>arrow-algorithm</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.github.jsqlparser</groupId>
+      <artifactId>jsqlparser</artifactId>
+      <optional>true</optional>
     </dependency>
 
     <dependency>

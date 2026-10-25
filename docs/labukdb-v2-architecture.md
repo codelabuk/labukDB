@@ -1,12 +1,16 @@
 # labukDB v2 — Multi-Module Architecture
 
-**Status: planned, not implemented.** This document captures the agreed
-design for turning `delta-flight-engine` (a read-only Delta Lake gateway)
-into **labukDB** — a multi-format lakehouse database that reads and writes
-Delta tables, reads Iceberg tables, and is usable either as an embedded
-Java library or as a Flight server. Nothing here exists in code yet; see
-[ARCHITECTURE.md](../ARCHITECTURE.md) for the v1 system this plan builds
-on top of.
+**Status: mostly built.** This document captures the design for turning
+`delta-flight-engine` (a read-only Delta Lake gateway) into **labukDB** —
+a multi-format lakehouse database that reads and writes Delta tables,
+reads Iceberg tables, and is usable either as an embedded Java library or
+as a Flight server. Most of what's described here is now implemented and
+verified, local and remote (live-MinIO) — the "Build order" and "Status"
+sections below track exactly what's done vs. still planned, item by
+item; don't assume this header alone reflects the current state of any
+one piece. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the v1 system
+this plan builds on top of, and [USAGE.md](../USAGE.md) for how to
+actually use what's built.
 
 Diagram sources: [`labukdb-v2-module-architecture.puml`](labukdb-v2-module-architecture.puml)
 (PlantUML source — edit this), rendered as
@@ -16,8 +20,9 @@ Diagram sources: [`labukdb-v2-module-architecture.puml`](labukdb-v2-module-archi
 ![labukDB v2 module architecture](labukdb-v2-module-architecture.png)
 
 Legend: **lavender** boxes are reused from v1 as-is (package renamed
-`com.labuk.deltaflight` → `com.labuk.labukdb`); **amber** boxes are new —
-they don't exist yet.
+`com.labuk.deltaflight` → `com.labuk.labukdb`); **green** boxes are new
+in v2 and built + verified (most of the diagram, at this point); **amber**
+boxes are new and still only planned — they don't exist yet.
 
 ---
 
@@ -58,7 +63,7 @@ system alone.
 
 | Module | Contains (today's package) | Depends on | Produces |
 |---|---|---|---|
-| `labukdb-core` | `log/`, `planner/`, `decode/`, `storage/`, `catalog/` (reused) + `encode/`, `execution/`, `format/` (new) | — | embeddable library jar |
+| `labukdb-core` | `log/`, `planner/`, `decode/`, `storage/`, `catalog/` (reused) + `encode/`, `execution/`, `format/`, `query/` (new) | — | embeddable library jar |
 | `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat`, delegating manifest/table loading to `iceberg-core:1.12.0`'s `HadoopTables` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional) |
 | `labukdb-flight` | `flight/` (adds `DoPut`) | `labukdb-core` [+ `labukdb-format-iceberg`] | library jar |
 | `labukdb-server-app` | `DeltaFlightServerApp` → `LabukDbServerApp` | `labukdb-core`, `labukdb-flight` | shaded standalone server jar |
@@ -169,10 +174,10 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   result, not a per-file-local one. `COUNT` remains `COUNT(column)`
   (non-null values), not `COUNT(*)` — unchanged, pre-existing
   `AggregateOperator` semantics, not something this pass altered.
-  Deliberately not done here: a SQL parser (sequenced after this — SQL
-  needs an execution path to target, which is what this pass built) and
-  distributed cross-node aggregation (single-process only, same as
-  everything else in this codebase).
+  Deliberately not done here: distributed cross-node aggregation
+  (single-process only, same as everything else in this codebase). A SQL
+  parser was sequenced after this (SQL needs an execution path to
+  target) and is now done — see the SQL query layer update below.
 
 `flight/DoPut` is the ingest entry point: it hands incoming Arrow batches
 to `WriteBuffer` first, not straight to `ArrowToParquetWriter`.
@@ -301,6 +306,58 @@ subcommand for CREATE TABLE — `TableCreator` is a library capability
 only for now, each of those needs its own protocol/UX decision. Iceberg
 write support, and remote multi-writer OCC stress-testing (see above).
 
+**Update — SQL query layer is now done, on the CLI.** New `core/query/`
+package: `SqlQueryTranslator` parses a real `SELECT` statement (via
+`jsqlparser`, not a hand-rolled grammar — parser theory isn't one of
+this project's own from-scratch learning goals, unlike Delta/Parquet/
+pruning/execution) straight into the existing `Predicate`/`AggregateSpec`/
+`SortKey` structures `execution/` already executes correctly, returned
+as a new `SqlQuery` record. Two real bugs were found and fixed by
+actually running the translator against `jsqlparser`'s real parse output
+(via `javap`/a throwaway diagnostic program, not assumed from memory):
+`COUNT(*)` does not set `Function.isAllColumns()` in this grammar path —
+it shows up as a single parameter of type `AllColumns` instead, which is
+what's actually checked now; and a bare `col IN (...) OR ...` lets `IN`'s
+grammar production greedily consume the trailing `OR`/`AND` as its own
+right-hand expression instead of binding tighter than `OR` as standard
+SQL precedence would, which is rejected with a specific error naming the
+fix (wrap the `IN` predicate in parentheses) rather than silently
+misinterpreted.
+
+**A real, related gap surfaced while scoping this, not invented:** the
+CLI's own `QueryCommand` never had `execution/` wired in either — only
+scan+filter+project, with `--limit` just capping total printed rows, not
+a real `ORDER BY`/`LIMIT`. Since `labukdb-cli` depends on `labukdb-core`
+only (deliberately no Flight dependency), SQL on the CLI couldn't deliver
+`GROUP BY`/`ORDER BY` without `execution/`'s combine logic existing
+somewhere both `labukdb-cli` and `labukdb-flight` can reach — so it was
+extracted into `labukdb-core` itself: new `execution/CombinedQueryExecutor`
++ `execution/FileScan` (moved out of being a `CombinedScanTicket`-local
+record in `labukdb-flight`), holding the exact decode → combine →
+aggregate → sort logic verbatim from `DeltaFlightProducer.getStream`'s
+`CombinedScanTicket` branch. `DeltaFlightProducer` now calls this shared
+executor instead of its own inline copy — verified behavior-preserving by
+re-running `FlightAggregationIntegrationTest`/`FlightIntegrationTest`
+unmodified after the extraction.
+
+CLI: `--sql "<SELECT ...>"`, mutually exclusive with
+`--table`/`--columns`/`--filter`/`--limit` (the SQL text subsumes all
+four). A plain `SELECT`+`WHERE` (no `GROUP BY`/aggregates/`ORDER BY`/
+`LIMIT`) reuses the existing per-file streaming scan unchanged — only a
+query needing cross-file combination (same `combineMode` trigger
+`DeltaFlightProducer` uses) goes through `CombinedQueryExecutor`. Unlike
+`--limit` (defaults to capping output at 50 rows), a bare SQL `SELECT`
+with no `LIMIT` clause prints every matching row, matching real SQL
+semantics rather than silently truncating. Verified with a new
+`QueryCommandSqlIntegrationTest` against a real two-partition-file
+fixture — genuine cross-file `GROUP BY`+`COUNT` and a genuine global
+top-N `ORDER BY ... LIMIT`, the same correctness bar
+`FlightAggregationIntegrationTest` already holds Flight to.
+
+**Deliberately not done here:** SQL-over-Flight (translating SQL text
+into the `FlightQueryRequest` JSON shape server-side) — a client still
+builds that JSON shape directly; this pass is CLI-only.
+
 ## Build order
 
 Not all five new subsystems carry equal risk — ordered to get something
@@ -334,8 +391,7 @@ foundation under it is proven:
 9. ✅ **`execution/` wired into `flight`.** Done, see above —
    `GROUP BY`/`ORDER BY`/`LIMIT` now reachable through a real `DoGet`
    round trip, combined correctly across multiple files, **live-MinIO-verified
-   for remote too** (`FlightRemoteAggregationMinioIntegrationTest`). A SQL
-   layer (deliberately deferred until this existed) is the natural next step.
+   for remote too** (`FlightRemoteAggregationMinioIntegrationTest`).
 10. ✅ **Remote completion for the remaining local-only pieces —
     `TableMerger`, `Compactor`, `Vacuum`, and Iceberg reads.** All four
     were either genuinely local-only (the first three — hardcoded `Path`/
@@ -354,6 +410,11 @@ foundation under it is proven:
     that actually matters for `Vacuum`: a real `FileSystem.exists()`
     check against the bucket proving bytes were genuinely deleted, not
     just that a log entry claims so.
+11. ✅ **SQL query layer, on the CLI.** Done, see above —
+    `core/query/SqlQueryTranslator` (built on `jsqlparser`) plus the new
+    shared `core/execution/CombinedQueryExecutor` both `labukdb-cli` and
+    `labukdb-flight` now call, wired into the CLI's new `--sql` flag.
+    SQL-over-Flight remains a deliberate, separate follow-up.
 
 **Known, pre-existing flaky test — not caused by the work above.**
 `labukdb-flight`'s `FlightIntegrationTest` intermittently fails (~1-in-4

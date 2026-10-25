@@ -1,25 +1,22 @@
 package com.labuk.labukdb.flight;
 
 import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.SortKey;
-import com.labuk.labukdb.core.planner.Predicate;
-import com.labuk.labukdb.core.storage.TableLocation;
 
 import java.util.List;
-import java.util.Map;
 
 /**
  * Everything {@code DoGet} needs to decode every surviving file, combine
  * them, and optionally aggregate/sort/limit — the counterpart to
  * {@link ScanTicket} for a query that can't be answered file-by-file
  * independently. One of these covers *all* surviving files for a query,
- * unlike {@link ScanTicket} which covers exactly one.
+ * unlike {@link ScanTicket} which covers exactly one. {@link FileScan}
+ * (the same three fields {@link ScanTicket} carries, bundled per-file
+ * here) is {@code core/execution/}'s, shared with {@code CombinedQueryExecutor}
+ * rather than a flight-local duplicate.
  */
 final class CombinedScanTicket implements FlightTicket {
-
-    /** One surviving file's scan parameters — the same three fields {@link ScanTicket} carries, bundled per-file here instead of one ticket each. */
-    record FileScan(TableLocation dataFile, Predicate residualPredicate, Map<String, String> partitionValues) {
-    }
 
     final List<FileScan> files;
     final List<String> projectedColumns;

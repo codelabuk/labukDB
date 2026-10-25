@@ -19,8 +19,11 @@ For a full guided tour of how it works, see **[ARCHITECTURE.md](ARCHITECTURE.md)
 (the original read-path walkthrough) and
 **[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md)**
 (the current module design, including everything the write path added).
-This README covers what the project is, how the pieces fit together at a
-glance, and how to build and run it.
+For every way to actually *use* it — CLI flags, CLI SQL, the Flight JSON
+wire format, or embedding the library directly — with every field and
+flag documented, see **[USAGE.md](USAGE.md)**. This README covers what
+the project is, how the pieces fit together at a glance, and how to
+build and run it.
 
 ---
 
@@ -149,6 +152,77 @@ requires it on Java 9+. `mvn test` sets this automatically via Surefire's
 `=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `LIKE` (SQL-style, `%`/`_`,
 case-sensitive), combined with `AND`/`OR`. No generic `NOT` — see
 `Predicate`'s javadoc for why that doesn't lose expressiveness.
+
+---
+
+## Ways to query labukDB
+
+See **[USAGE.md](USAGE.md)** for the full reference (every CLI flag,
+every `FlightQueryRequest`/`FlightWriteRequest` field, and the embedded
+library's write path too) — this section is a quick summary.
+
+Four ways to ask the same engine a question, from least to most setup:
+
+**1. CLI, flag-based** — `--filter` is deliberately simple (`AND`-only,
+see [Filter syntax](#filter-syntax) above):
+
+```
+bin/labukdb query --table logs --filter "level=ERROR" --columns service,message --limit 10
+```
+
+**2. CLI, SQL** — a real `SELECT` statement, parsed by `SqlQueryTranslator`
+into the exact `Predicate`/`AggregateSpec`/`SortKey` structures the engine
+already executes correctly. Mutually exclusive with
+`--table`/`--columns`/`--filter`/`--limit` — the SQL text's own `FROM`/
+`SELECT`/`WHERE`/`LIMIT` clauses subsume all four:
+
+```
+bin/labukdb query --sql "SELECT level, COUNT(amount) AS cnt FROM logs GROUP BY level"
+bin/labukdb query --sql "SELECT amount FROM logs ORDER BY amount DESC LIMIT 3"
+```
+
+Subset supported: `SELECT <col>|<AGGFUNC>(<col>) AS <alias> FROM <table>
+[WHERE <predicate>] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`, with the
+same predicate operators and aggregate functions as above. Rejected with
+a specific error, not silently mishandled: `NOT`/`NOT IN`/`NOT LIKE`,
+`IS NULL`, joins, subqueries, `COUNT(*)` (matches `AggregateOperator`'s
+pre-existing `COUNT(column)`-only semantics) — and, confirmed against a
+real parse, `IN` combined with `AND`/`OR` without explicit parentheses
+(a genuine `jsqlparser` grammar precedence quirk where a bare `IN (...)`
+greedily consumes a trailing `OR`/`AND`; wrap it, e.g.
+`(level IN ('a','b')) OR (x LIKE 'c')`). See `SqlQueryTranslator`'s
+javadoc for the full, exact subset. A plain `SELECT`+`WHERE` reuses the
+same per-file streaming scan as `--filter`; anything needing `GROUP BY`/
+`ORDER BY`/`LIMIT` goes through the same cross-file `CombinedQueryExecutor`
+the Flight server uses below — one real implementation, not two that
+could drift.
+
+**3. Flight, JSON request** — a running server, queried over gRPC. The
+request is JSON-encoded as a `FlightDescriptor`'s command bytes:
+
+```json
+{
+  "table": "logs",
+  "groupBy": ["level"],
+  "aggregates": [
+    {"function": "COUNT", "column": "amount", "outputName": "cnt"}
+  ],
+  "orderBy": [{"column": "cnt", "ascending": false}],
+  "limit": 10
+}
+```
+
+Any of `groupBy`/`aggregates`/`orderBy`/`limit` switches `GetFlightInfo`
+onto a single combined endpoint instead of one-per-file — see
+`FlightQueryRequest`'s javadoc for the complete field list (predicate
+shape, `version`/`timestampMillis` for time travel, etc). **No SQL-over-
+Flight yet** — a client builds this JSON shape directly today; translating
+SQL text into it server-side is a deliberate, separate follow-up, not
+built in this pass (CLI-only).
+
+**4. Embedded library, direct API** — no CLI, no server, just
+`labukdb-core` in-process; see [Using it as a library](#using-it-as-a-library)
+below for the full `log/` → `planner/` → `decode/` walkthrough.
 
 ---
 
@@ -425,9 +499,12 @@ before streaming back one correct, cross-file answer (verified with
 real multi-file fixtures — a per-file-only implementation would
 silently produce a wrong, partial result instead). A plain scan is
 completely unaffected — same one-endpoint-per-file path as always.
-`COUNT` is SQL `COUNT(column)` (non-null values), not `COUNT(*)`. No SQL
-text parser yet — a client builds the request shape directly; that's the
-natural next layer on top of this, not possible before it.
+`COUNT` is SQL `COUNT(column)` (non-null values), not `COUNT(*)`. A real
+SQL text parser (`SqlQueryTranslator`, built on `jsqlparser`) is wired
+into the CLI's `--sql` flag — see [Ways to query labukDB](#ways-to-query-labukdb)
+above for the supported subset. SQL-over-Flight (translating SQL text
+into the JSON request shape server-side) is not built yet; a Flight
+client still builds that shape directly.
 
 **A known, pre-existing flaky test:** `FlightIntegrationTest`
 intermittently fails (~1-in-4 observed) with a Flight/gRPC buffer-release

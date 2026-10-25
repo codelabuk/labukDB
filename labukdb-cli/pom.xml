@@ -42,6 +42,17 @@
       <artifactId>hadoop-azure</artifactId>
       <optional>false</optional>
     </dependency>
+    <!--
+      jsqlparser is `optional` in labukdb-core's own pom too (so a pure
+      embedder isn't forced into a SQL parser they never asked for), but
+      this shaded binary's SQL query subcommand genuinely needs it at
+      runtime, same override reasoning as hadoop-aws/hadoop-azure above.
+    -->
+    <dependency>
+      <groupId>com.github.jsqlparser</groupId>
+      <artifactId>jsqlparser</artifactId>
+      <optional>false</optional>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>

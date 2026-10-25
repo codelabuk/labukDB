@@ -142,9 +142,10 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [ArrowToParquetWriter\n(mirror of ParquetToArrowReader)] as ATPW #D9F2C4
   }
 
-  package "execution/ — query operators (standalone; not yet wired into flight/)" #D9F2C4 {
+  package "execution/ — query operators (wired into flight/ and cli/)" #D9F2C4 {
     [AggregateOperator\n(GROUP BY, SUM/COUNT/\nMIN/MAX/AVG)] as AOP #D9F2C4
     [SortLimitOperator\n(ORDER BY ... LIMIT)] as SOP #D9F2C4
+    [CombinedQueryExecutor\n(decode every surviving file,\ncombine, optionally aggregate,\noptionally sort+limit -- the one\nreal implementation flight/ and\ncli/ both call, not two copies\nthat could drift)] as CQE #D9F2C4
   }
 
   note bottom of AOP
@@ -153,6 +154,22 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     residual-predicate pass already
     covers this; a separate post-decode
     operator would have no real caller.
+  end note
+
+  package "query/ — SQL text → engine structures" #D9F2C4 {
+    [SqlQueryTranslator\n(SELECT/WHERE/GROUP BY/\nORDER BY/LIMIT via jsqlparser --\na real SQL grammar isn't one of\nthis project's own from-scratch\nlearning goals, unlike Delta/\nParquet/pruning/execution)] as SQTR #D9F2C4
+    [SqlQuery\n(record: table, columns,\npredicate, groupBy,\naggregates, orderBy, limit)] as SQQ #D9F2C4
+  }
+
+  note bottom of SQTR
+    IN combined with AND/OR requires
+    explicit parens -- a real jsqlparser
+    grammar quirk (bare IN(...) greedily
+    consumes a trailing OR/AND) rejected
+    with a specific error, not silently
+    misparsed. COUNT(*) rejected too,
+    matching AggregateOperator's existing
+    COUNT(column)-only semantics.
   end note
 
   package "catalog/ — name → location (reused)" #EEEDFE {
@@ -167,7 +184,7 @@ package "labukdb-format-iceberg  (optional — pulls in iceberg-core)" #D9F2C4 {
 
 ' ─── labukdb-flight ───────────────────────────────────────
 package "labukdb-flight  (depends on core [+ format-iceberg])" #EEEDFE {
-  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(remote s3a://abfss:// reads live-\nverified; DoPut rejects remote)] as DFP
+  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files)] as DFP
   [TicketRegistry] as TR
 }
 
@@ -176,7 +193,7 @@ package "labukdb-server-app" #EEEDFE {
 }
 
 package "labukdb-cli  (depends on core in-process, no server)" #EEEDFE {
-  [LabukDbCli\ncatalog / describe / query\n(no ingest/compact/vacuum yet)] as CLI
+  [LabukDbCli\ncatalog / describe / query\n(--table/--filter or real --sql;\nno ingest/compact/vacuum yet)] as CLI
   [TableResolver] as TR2
 }
 
@@ -219,6 +236,12 @@ PTAR --> PFC
 AOP  --> PTAR : consumes already-decoded,\nalready-filtered Arrow batches\n(decode/'s own fused residual filter,\nno separate FilterOperator)
 SOP  --> AOP
 
+CQE --> PTAR : decode every surviving file
+CQE --> AOP  : optional GROUP BY
+CQE --> SOP  : optional ORDER BY / LIMIT
+
+SQTR --> SQQ : parse() returns
+
 WB   --> ATPW : flush threshold hit\n(size or time)
 ATPW --> CW : new Parquet file path\nfor a committed add action
 WB ..> PTAR : read-your-writes\n(not-yet-flushed rows,\nchecked alongside committed files)
@@ -227,7 +250,7 @@ TL --> MC
 TL --> AC
 
 DFP --> QP
-DFP .[#993C1D].> AOP : NOT wired yet -- GetFlightInfo's\none-endpoint-per-file model doesn't\nfit GROUP BY's cross-file combine need
+DFP --> CQE  : combine-mode DoGet --\ngroupBy/aggregates/orderBy/limit\npresent, one combined endpoint\ninstead of one-per-file
 DFP --> WB   : DoPut → buffer first
 DFP --> TR
 DFP --> CAT
@@ -237,6 +260,8 @@ CLI --> TR2
 TR2 --> CAT
 TR2 --> TL
 CLI --> QP   : direct in-process query\n(catalog / describe / query only --\nno ingest/compact/vacuum subcommand yet)
+CLI --> SQTR : --sql "<SELECT ...>"\n(mutually exclusive with\n--table/--columns/--filter/--limit)
+CLI --> CQE  : combine-mode SQL --\nGROUP BY/ORDER BY/LIMIT present\n(same trigger DFP uses, so flight/\nand cli/ behave identically)
 
 ' ─── CLIENTS ─────────────────────────────────────────────
 actor "Python\n(pyarrow.flight)" as PY  #FAECE7

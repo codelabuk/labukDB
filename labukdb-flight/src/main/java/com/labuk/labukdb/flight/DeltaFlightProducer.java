@@ -5,8 +5,9 @@ import com.labuk.labukdb.core.catalog.TableCatalog;
 import com.labuk.labukdb.core.decode.ParquetToArrowReader;
 import com.labuk.labukdb.core.execution.AggregateOperator;
 import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
+import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.SortKey;
-import com.labuk.labukdb.core.execution.SortLimitOperator;
 import com.labuk.labukdb.flight.query.AggregateQueryCodec;
 import com.labuk.labukdb.flight.query.FlightQueryRequest;
 import com.labuk.labukdb.flight.query.PredicateCodec;
@@ -82,6 +83,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private final BufferAllocator allocator;
     private final TicketRegistry registry = new TicketRegistry();
     private final ParquetToArrowReader parquetReader = new ParquetToArrowReader();
+    private final CombinedQueryExecutor combinedQueryExecutor = new CombinedQueryExecutor();
     private final QueryPlanner queryPlanner = new QueryPlanner();
     private final TableCache tableCache = new TableCache();
     private final TableCatalog catalog;
@@ -319,12 +321,12 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         }
         List<String> projectedColumns = List.copyOf(neededColumns);
 
-        List<CombinedScanTicket.FileScan> files = new ArrayList<>();
+        List<FileScan> files = new ArrayList<>();
         for (AddFile file : plan.getFilesToScan()) {
             TableLocation dataFile = tableRoot.resolve(file.getPath());
             Predicate perFileResidual =
                     PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
-            files.add(new CombinedScanTicket.FileScan(dataFile, perFileResidual, file.getPartitionValues()));
+            files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
         }
 
         List<FlightEndpoint> endpoints = new ArrayList<>();
@@ -372,12 +374,11 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     @Override
     public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
         String ticketId = new String(ticket.getBytes(), StandardCharsets.UTF_8);
-        // Only ever non-null mid-pipeline in the CombinedScanTicket branch,
-        // where decode/aggregate/sort each produce a new root that
-        // supersedes the previous one -- tracked here so a failure at any
-        // stage still closes whatever was most recently allocated, via the
-        // finally block below, without risking a double-close on the
-        // success path (set back to null right after a clean stream).
+        // Only ever non-null mid-pipeline in the CombinedScanTicket branch
+        // -- tracked here so a failure there still closes the executor's
+        // result, via the finally block below, without risking a
+        // double-close on the success path (set back to null right after
+        // a clean stream).
         VectorSchemaRoot current = null;
         try {
             FlightTicket flightTicket = registry.lookup(ticketId);
@@ -394,36 +395,9 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             }
 
             CombinedScanTicket combinedTicket = (CombinedScanTicket) flightTicket;
-
-            // Decode every surviving file and combine into one root --
-            // same VectorSchemaRootAppender pattern Compactor/TableMerger
-            // already use, including the allocateNew() gotcha (a bare
-            // create() alone leaves zero-capacity buffers and fails on the
-            // first variable-width column appended into it).
-            for (CombinedScanTicket.FileScan file : combinedTicket.files) {
-                try (VectorSchemaRoot batch = parquetReader.read(
-                        file.dataFile(), allocator, combinedTicket.projectedColumns,
-                        file.residualPredicate(), file.partitionValues())) {
-                    if (current == null) {
-                        current = VectorSchemaRoot.create(batch.getSchema(), allocator);
-                        current.allocateNew();
-                    }
-                    org.apache.arrow.vector.util.VectorSchemaRootAppender.append(current, batch);
-                }
-            }
-
-            if (!combinedTicket.groupByColumns.isEmpty() || !combinedTicket.aggregates.isEmpty()) {
-                VectorSchemaRoot aggregated = new AggregateOperator().aggregate(
-                        List.of(current), combinedTicket.groupByColumns, combinedTicket.aggregates, allocator);
-                current.close();
-                current = aggregated;
-            }
-            if (!combinedTicket.sortKeys.isEmpty() || combinedTicket.limit >= 0) {
-                VectorSchemaRoot sorted = new SortLimitOperator().sortAndLimit(
-                        current, combinedTicket.sortKeys, combinedTicket.limit, allocator);
-                current.close();
-                current = sorted;
-            }
+            current = combinedQueryExecutor.execute(combinedTicket.files, combinedTicket.projectedColumns,
+                    combinedTicket.groupByColumns, combinedTicket.aggregates, combinedTicket.sortKeys,
+                    combinedTicket.limit, allocator);
 
             listener.start(current);
             listener.putNext();

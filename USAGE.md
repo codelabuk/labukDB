@@ -1,0 +1,439 @@
+# Using labukDB
+
+Four ways to talk to the same engine — pick based on whether you need a
+server, want real SQL, or are embedding the reader/writer directly inside
+your own JVM process. All four ultimately run the same `log/` →
+`planner/` → `decode/`/`execution/` pipeline; none of them is a "thin"
+or "limited" version of another.
+
+| Mode | Needs a server? | Read | Write | Best for |
+|---|---|---|---|---|
+| [CLI, flags](#1-cli-flag-based) | No | ✅ | ❌ (query-only) | Quick terminal lookups, scripting, debugging |
+| [CLI, SQL](#2-cli-sql) | No | ✅ | ❌ (query-only) | Real `SELECT` text, `GROUP BY`/`ORDER BY`/`LIMIT` from a terminal |
+| [Flight server](#3-flight-server-remote-clients) | Yes | ✅ | ✅ | Remote clients, any language, multiple concurrent readers/writers |
+| [Embedded library](#4-embedded-library-labukdb-core-directly) | No | ✅ | ✅ | Embedding inside your own JVM app, no IPC/network hop (DuckDB-style) |
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how the layers underneath
+these four modes actually work, and
+[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
+what's built vs. still planned.
+
+---
+
+## Building
+
+```
+mvn clean package          # runs tests too; add -DskipTests to skip them
+```
+
+Produces `labukdb-cli/target/labukdb-cli.jar` (one file, every dependency
+bundled) and `labukdb-server-app/target/labukdb-server-app.jar`, the
+standalone Flight server. (Windows: `bin\labukdb.bat ...`; on Git Bash,
+`chmod +x bin/labukdb` once, or just run
+`java -jar labukdb-cli/target/labukdb-cli.jar ...` directly.)
+
+Every subcommand below, and every `--table`/`FROM`, accepts **either** a
+name registered via `catalog add` **or** a raw filesystem/URI path —
+there's no separate "resolve a name" step to remember.
+
+---
+
+## 1. CLI, flag-based
+
+```
+bin/labukdb catalog add logs D:\repo\local-lakehouse-lab\lakehouse\logs_delta
+bin/labukdb catalog list
+bin/labukdb catalog remove logs
+bin/labukdb describe logs
+bin/labukdb query --table logs --filter "level=ERROR" --columns service,message --limit 10
+```
+
+`describe` prints the schema, partition columns, active file count, and
+current version — no row data touched.
+
+`query` options:
+
+| Flag | Meaning |
+|---|---|
+| `--table <name-or-path>` | required (unless `--sql` is used instead, see below) |
+| `--columns col1,col2` | project only these columns (default: all) |
+| `--filter "expr"` | see filter syntax below (`AND`-only) |
+| `--version N` | query as of a specific commit version |
+| `--as-of TIMESTAMP` | query as of an ISO-8601 instant, e.g. `2026-07-17T00:00:00Z` (mutually exclusive with `--version`) |
+| `--limit N` | cap printed rows, `0` = unlimited (default 50) |
+
+**Filter syntax** (`SimpleFilterParser`) — deliberately small, not SQL:
+
+```
+level=ERROR
+amount>2
+level='ERROR' AND amount>2        # AND only -- no OR, no parentheses
+level IN (ERROR,WARN)
+log_date LIKE '2026-07%'
+```
+
+`=`, `!=`, `<`, `<=`, `>`, `>=`, `IN`, `LIKE` (SQL-style `%`/`_`,
+case-sensitive). Values are inferred as Long, then Double, then String,
+unless wrapped in single quotes to force a string (useful when a value
+looks numeric, e.g. `region='001'`). No generic `NOT`. For `OR`,
+parentheses, or anything past this, use `--sql` instead (section 2) — the
+real wire format behind both (`Predicate`/`PredicateCodec`) already
+supports `OR` and nesting; this parser just doesn't expose it at the
+terminal.
+
+---
+
+## 2. CLI, SQL
+
+A real `SELECT` statement, parsed by `SqlQueryTranslator` (built on
+`jsqlparser`) straight into the same `Predicate`/`AggregateSpec`/
+`SortKey` structures the engine already executes correctly — not a
+separate, weaker code path.
+
+```
+bin/labukdb query --sql "SELECT level, COUNT(amount) AS cnt FROM logs GROUP BY level"
+bin/labukdb query --sql "SELECT amount FROM logs ORDER BY amount DESC LIMIT 3"
+bin/labukdb query --sql "SELECT service, amount FROM logs WHERE level = 'ERROR' AND amount > 2"
+```
+
+`--sql` is **mutually exclusive** with `--table`/`--columns`/`--filter`/
+`--limit` — the SQL text's own `FROM`/`SELECT`/`WHERE`/`LIMIT` clauses
+subsume all four. `--version`/`--as-of` still combine with `--sql`
+normally (time travel is orthogonal to query text):
+
+```
+bin/labukdb query --sql "SELECT * FROM logs" --as-of 2026-07-17T00:00:00Z
+```
+
+**Supported subset:**
+
+```
+SELECT <col> | <AGGFUNC>(<col>) AS <alias> [, ...]
+FROM <table>
+[WHERE <predicate>]
+[GROUP BY <col> [, ...]]
+[ORDER BY <col> [ASC|DESC] [, ...]]
+[LIMIT <n>]
+```
+
+- Predicate: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `IN (...)`,
+  `LIKE` — exactly `Predicate`'s own capability.
+- Aggregate functions: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` — an aggregate
+  `SELECT` item **requires an alias** (`COUNT(amount) AS cnt`, not bare
+  `COUNT(amount)`).
+- A plain `SELECT`+`WHERE` (no `GROUP BY`/aggregates/`ORDER BY`/`LIMIT`)
+  streams results per-file as it reads them. Anything needing `GROUP BY`/
+  `ORDER BY`/`LIMIT` is answered by `CombinedQueryExecutor` — every
+  surviving file is decoded and combined first, because those can't be
+  answered correctly file-by-file (a per-file top-N or per-file count
+  would be silently wrong). Unlike the flag-based path, a bare SQL
+  `SELECT` with no `LIMIT` clause prints **every** matching row — that's
+  what "no `LIMIT`" means in SQL, so it isn't silently capped at 50.
+
+**Rejected with a specific error, not silently mishandled:**
+
+| Construct | Why |
+|---|---|
+| `NOT`, `NOT IN`, `NOT LIKE` | `Predicate` has no generic negation — see its javadoc |
+| `IS NULL` | not a supported predicate shape |
+| Joins, subqueries | single-table only |
+| `COUNT(*)` | matches `AggregateOperator`'s pre-existing `COUNT(column)`-only semantics (non-null values of a named column) |
+| `IN` combined with `AND`/`OR` **without parentheses** | see below |
+
+**`IN` must be parenthesized when combined with `AND`/`OR`.** Confirmed
+against a real parse: `jsqlparser`'s grammar lets a bare `col IN (...)`
+greedily consume a trailing `OR`/`AND` as part of its own right-hand
+expression instead of binding tighter than `OR`, the way standard SQL
+precedence would. In practice:
+
+```sql
+-- Misparses -- rejected with an error naming the fix, not silently wrong:
+SELECT service FROM logs WHERE level IN ('ERROR','WARN') OR service LIKE 'auth%'
+
+-- Correct -- wrap the IN predicate:
+SELECT service FROM logs WHERE (level IN ('ERROR','WARN')) OR (service LIKE 'auth%')
+```
+
+See `SqlQueryTranslator`'s javadoc for the full, exact subset and the
+diagnosis behind this.
+
+---
+
+## 3. Flight server (remote clients)
+
+```
+java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED \
+     -jar labukdb-server-app/target/labukdb-server-app.jar
+```
+
+The `--add-opens` flag is required because Arrow's off-heap memory
+library needs it on Java 9+ (`mvn test` sets it automatically via
+Surefire's `argLine`; running the built jar directly needs it explicit).
+
+A client sends a JSON-encoded request as a `FlightDescriptor`'s command
+bytes. **Reads** go through `GetFlightInfo`/`DoGet`; **writes** through
+`DoPut`.
+
+### Reading — `GetFlightInfo` / `DoGet`
+
+Full `FlightQueryRequest` field reference:
+
+| Field | Meaning |
+|---|---|
+| `table` | a name registered in `TableCatalog` — exactly one of `table`/`tableRoot` required |
+| `tableRoot` | a raw filesystem/URI path (the original, still-supported form) |
+| `version` | query as of a specific commit version (mutually exclusive with `timestampMillis`) |
+| `timestampMillis` | query as of a specific instant |
+| `columns` | project only these columns; null/empty = all columns |
+| `predicate` | see predicate shape below; null = no filter |
+| `groupBy` | list of column names |
+| `aggregates` | list of `{"function", "column", "outputName"}` — `function` is `SUM`/`COUNT`/`MIN`/`MAX`/`AVG` |
+| `orderBy` | list of `{"column", "ascending"}` (`ascending` defaults to `true`) |
+| `limit` | row cap after any `GROUP BY`/`ORDER BY` |
+
+Predicate shape (`PredicateCodec`) — a small recursive tree:
+
+| `type` | Required fields |
+|---|---|
+| `cmp` | `column`, `op` (`EQ`/`NEQ`/`GT`/`GTE`/`LT`/`LTE`), `literal`, `literalType` |
+| `and` / `or` | `children`: array of nested predicate nodes |
+| `in` | `column`, `literals`: array, `literalType` |
+| `like` | `column`, `pattern` (SQL-style `%`/`_`, case-sensitive) |
+
+`literalType` is one of `string`, `long`, `double`, `boolean`,
+`timestamp` (ISO-8601, e.g. `"2026-07-17T10:00:00Z"`).
+
+**Plain scan** — one `FlightEndpoint` per surviving physical file,
+decoded lazily per ticket:
+
+```json
+{
+  "table": "logs",
+  "columns": ["level", "message", "event_ts"],
+  "predicate": {
+    "type": "cmp", "column": "level", "op": "EQ",
+    "literal": "ERROR", "literalType": "string"
+  }
+}
+```
+
+**`GROUP BY`/`ORDER BY`/`LIMIT`** — any of `groupBy`/`aggregates`/
+`orderBy`/`limit` present switches `GetFlightInfo` onto a **single
+combined endpoint** instead of one-per-file: every surviving file is
+decoded, combined, then run through `AggregateOperator`/
+`SortLimitOperator` server-side before streaming back one correct,
+cross-file result (a per-file-only answer would be silently wrong for a
+global top-N or a cross-partition count):
+
+```json
+{
+  "table": "logs",
+  "groupBy": ["level"],
+  "aggregates": [
+    {"function": "COUNT", "column": "amount", "outputName": "cnt"},
+    {"function": "SUM", "column": "amount", "outputName": "total"}
+  ],
+  "orderBy": [{"column": "total", "ascending": false}],
+  "limit": 10
+}
+```
+
+**No SQL-over-Flight yet** — a client builds this JSON shape directly
+today, the same way the CLI's flag-based path does under the hood;
+translating SQL text into this shape server-side is a deliberate,
+separate follow-up (the `--sql` CLI flag from section 2 is CLI-only for
+now).
+
+### Writing — `DoPut`
+
+The table must already exist (`DoPut` only appends — creating a table is
+`TableCreator`, a library-only capability not yet exposed over Flight).
+The command bytes carry a `FlightWriteRequest`:
+
+```json
+{
+  "table": "logs",
+  "partitionValues": {"level": "ERROR"}
+}
+```
+
+Exactly one of `table`/`tableRoot` is required, same rule as reads.
+`partitionValues` is required — `WriteBuffer` buffers one table **and**
+one fixed partition combination at a time, so a single `DoPut` call
+always targets exactly one partition. Stream Arrow batches matching the
+table's schema (minus partition columns) after the descriptor; the
+server buffers them (WAL-backed) and flushes to a committed Parquet file
++ log entry once a size/time threshold is hit.
+
+### From Python (or any Flight-capable client, any language)
+
+```python
+import json
+import pyarrow.flight as flight
+
+client = flight.FlightClient("grpc://localhost:9443")
+query = {
+    "tableRoot": r"D:\repo\local-lakehouse-lab\lakehouse\logs_delta",
+    "predicate": {"type": "cmp", "column": "level", "op": "EQ",
+                  "literal": "ERROR", "literalType": "string"},
+}
+descriptor = flight.FlightDescriptor.for_command(json.dumps(query).encode("utf-8"))
+
+info = client.get_flight_info(descriptor)
+for endpoint in info.endpoints:
+    table = client.do_get(endpoint.ticket).read_all()
+    print(table)
+```
+
+See `python/query_demo.py` for a complete, runnable version (including a
+`--schema`-only mode for discovering column names) and
+`python/rag_demo.py` for a small local-Ollama RAG demo built on top of
+it — proof any Flight client in any language works against this server
+unmodified, since Flight *is* gRPC.
+
+---
+
+## 4. Embedded library (`labukdb-core` directly)
+
+No CLI, no server — `labukdb-core` has no Flight/gRPC dependency, so this
+is the DuckDB-style embedded path: link it into your own JVM process and
+call the engine in-process.
+
+Not published to Maven Central — build and install it locally first:
+
+```
+mvn clean install -DskipTests
+```
+
+```xml
+<dependency>
+    <groupId>com.labuk</groupId>
+    <artifactId>labukdb-core</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+</dependency>
+```
+
+### Reading
+
+The four layers map onto four calls — resolve a snapshot, plan which
+files survive pruning, fold each file's partition values into the
+residual predicate, then decode:
+
+```java
+import com.labuk.labukdb.core.log.Snapshot;
+import com.labuk.labukdb.core.log.SnapshotManager;
+import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.planner.*;
+import com.labuk.labukdb.core.decode.ParquetToArrowReader;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VectorSchemaRoot;
+
+import java.io.File;
+import java.nio.file.Path;
+import java.util.List;
+
+Path tableRoot = Path.of("D:/repo/local-lakehouse-lab/lakehouse/logs_delta");
+
+SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
+Snapshot snapshot = snapshotManager.latest();          // or atVersion(n) / atTimestamp(instant)
+
+Predicate filter = Predicate.compare("level", ComparisonOp.EQ, "ERROR");
+ScanPlan plan = new QueryPlanner().plan(snapshot, filter, List.of("service", "message"));
+
+ParquetToArrowReader reader = new ParquetToArrowReader();
+try (RootAllocator allocator = new RootAllocator()) {
+    for (AddFile file : plan.getFilesToScan()) {
+        Predicate residual = PartitionValueSubstituter.simplify(
+                plan.getResidualPredicate(), file.getPartitionValues());
+        File parquetFile = tableRoot.resolve(file.getPath()).toFile();
+
+        try (VectorSchemaRoot root = reader.read(
+                parquetFile, allocator, plan.getProjectedColumns(), residual, file.getPartitionValues())) {
+            System.out.println(root.contentToTSVString());   // one Arrow batch per file
+        }
+    }
+}
+```
+
+Need `GROUP BY`/`ORDER BY`/`LIMIT` too, same as the CLI's `--sql` path
+and Flight's combine mode? Build a `List<FileScan>` from `plan.getFilesToScan()`
+(mirrors the loop above) and call `CombinedQueryExecutor.execute(...)` —
+or just reuse `SqlQueryTranslator.translate(sql)` first to get the
+`Predicate`/`AggregateSpec`/`SortKey` structures from real SQL text
+instead of building them by hand. See `QueryCommand` (`labukdb-cli`) for
+the complete wiring of both paths.
+
+`SnapshotManager` and `ParquetToArrowReader` also have `TableLocation`-based
+overloads (`SnapshotManager.forLocation(...)`) for S3/MinIO/ADLS tables —
+see [Configuring a remote backend](#configuring-a-remote-backend) below,
+and `labukdb-core/src/main/java/com/labuk/labukdb/core/tools/RealTableSmokeCheck.java`
+for a second, runnable end-to-end example.
+
+### Writing
+
+`TableCreator` and `CommitWriter` both take a `TableLocation`, so this
+works identically against a local path or a remote URI:
+
+```java
+import com.labuk.labukdb.core.log.CommitWriter;
+import com.labuk.labukdb.core.log.TableCreator;
+import com.labuk.labukdb.core.storage.TableLocation;
+import org.apache.arrow.vector.types.pojo.*;
+
+TableLocation location = TableLocation.forLocal(Path.of("/path/to/new/table"));
+Field service = new Field("service", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+
+new TableCreator().createTable(location, new Schema(List.of(service, amount)),
+        List.of("level"), null);   // partitioned by "level", no table properties
+
+// ... build a VectorSchemaRoot batch, then:
+CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", "ERROR"));
+```
+
+`TableMerger.merge(...)` does insert/update/delete by key on top of this
+(three separate batches, key supplied per call — not an
+operation-indicator column, not stored table metadata; see its javadoc
+for the exact semantics). `Compactor` (bin-packing) and `Vacuum`
+(orphaned-file removal) both have matching `TableLocation` overloads too
+— all four local and remote, live-MinIO-verified.
+
+### Configuring a remote backend
+
+No env-var auto-detection at the library layer (that convenience is
+CLI/Flight-only) — build the `Configuration` yourself:
+
+```java
+import com.labuk.labukdb.core.storage.MinioConfiguration;
+import com.labuk.labukdb.core.storage.TableLocation;
+import org.apache.hadoop.conf.Configuration;
+
+Configuration conf = MinioConfiguration.forMinio(endpoint, accessKey, secretKey);
+// or AdlsConfiguration.forSharedKey(account, key) / .forServicePrincipal(...)
+TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
+```
+
+`MinioConfiguration.fromEnvironment()` / `AdlsConfiguration.fromEnvironment()`
+are available too, if you want the same env-var convenience the CLI/Flight
+server use internally (`MINIO_ENDPOINT`/`MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`,
+`ADLS_STORAGE_ACCOUNT`/`ADLS_AUTH_TYPE`/...) — see the README's
+[Storage backends](README.md#storage-backends) section for the full
+environment-variable table.
+
+---
+
+## Choosing a mode
+
+- **Quick terminal lookup, scripting** → CLI, flags (section 1).
+- **Real SQL from a terminal, no server to run** → CLI, SQL (section 2).
+- **Multiple remote clients, concurrent readers/writers, any language** →
+  Flight server (section 3).
+- **Embedding directly inside a JVM app, no IPC hop** → embedded library
+  (section 4).
+
+All four are query-equivalent for `SELECT`/filter/`GROUP BY`/`ORDER BY`/
+`LIMIT` — none trades away correctness for convenience. Writes
+(`CommitWriter`/`TableCreator`/`TableMerger`/`Compactor`/`Vacuum`) are
+reachable from the embedded library and Flight's `DoPut` (append only);
+the CLI is query-only today — no `ingest`/`compact`/`vacuum`/`create-table`
+subcommands yet.
