@@ -87,7 +87,7 @@ class FlightRemoteAggregationMinioIntegrationTest {
         buildTwoPartitionFixture();
 
         TableCatalog catalog = new TableCatalog(catalogDir.resolve("catalog.json"));
-        DeltaFlightProducer producer = new DeltaFlightProducer(allocator, catalog, conf, walRoot);
+        LabukDbFlightProducer producer = new LabukDbFlightProducer(allocator, catalog, conf, walRoot);
 
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
         server = FlightServer.builder(allocator, serverLocation, producer).build();

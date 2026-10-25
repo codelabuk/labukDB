@@ -68,7 +68,7 @@ public final class TableLocation {
     /**
      * Like {@link #fromString(String)}, but a remote location picks up
      * MinIO/ADLS connector config from the environment (the same
-     * convenience {@code TableResolver}/{@code DeltaFlightProducer}
+     * convenience {@code TableResolver}/{@code LabukDbFlightProducer}
      * already give CLI/Flight users) instead of a bare default {@link
      * Configuration}. Useful when a caller has a raw location string
      * with no separately-supplied {@code Configuration} to merge in —

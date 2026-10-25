@@ -14,7 +14,7 @@
   <packaging>jar</packaging>
 
   <!--
-    Arrow Flight serving: DeltaFlightProducer (GetFlightInfo / DoGet /
+    Arrow Flight serving: LabukDbFlightProducer (GetFlightInfo / DoGet /
     GetSchema / ListFlights), TicketRegistry, the flight/query wire
     format. Depends on labukdb-core for the actual engine (snapshot
     resolution, pruning, decode), labukdb-format-iceberg for querying

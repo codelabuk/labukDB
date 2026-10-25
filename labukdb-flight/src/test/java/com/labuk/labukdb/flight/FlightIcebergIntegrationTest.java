@@ -81,7 +81,7 @@ class FlightIcebergIntegrationTest {
     void setUp() throws Exception {
         allocator = new RootAllocator(Long.MAX_VALUE);
         catalog = new TableCatalog(catalogDir.resolve("catalog.json"));
-        DeltaFlightProducer producer = new DeltaFlightProducer(allocator, catalog, new Configuration(), walRoot);
+        LabukDbFlightProducer producer = new LabukDbFlightProducer(allocator, catalog, new Configuration(), walRoot);
 
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
         server = FlightServer.builder(allocator, serverLocation, producer).build();

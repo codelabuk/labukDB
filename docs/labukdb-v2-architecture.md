@@ -338,8 +338,8 @@ somewhere both `labukdb-cli` and `labukdb-flight` can reach — so it was
 extracted into `labukdb-core` itself: new `execution/CombinedQueryExecutor`
 + `execution/FileScan` (moved out of being a `CombinedScanTicket`-local
 record in `labukdb-flight`), holding the exact decode → combine →
-aggregate → sort logic verbatim from `DeltaFlightProducer.getStream`'s
-`CombinedScanTicket` branch. `DeltaFlightProducer` now calls this shared
+aggregate → sort logic verbatim from `LabukDbFlightProducer.getStream`'s
+`CombinedScanTicket` branch. `LabukDbFlightProducer` now calls this shared
 executor instead of its own inline copy — verified behavior-preserving by
 re-running `FlightAggregationIntegrationTest`/`FlightIntegrationTest`
 unmodified after the extraction.
@@ -349,7 +349,7 @@ CLI: `--sql "<SELECT ...>"`, mutually exclusive with
 four). A plain `SELECT`+`WHERE` (no `GROUP BY`/aggregates/`ORDER BY`/
 `LIMIT`) reuses the existing per-file streaming scan unchanged — only a
 query needing cross-file combination (same `combineMode` trigger
-`DeltaFlightProducer` uses) goes through `CombinedQueryExecutor`. Unlike
+`LabukDbFlightProducer` uses) goes through `CombinedQueryExecutor`. Unlike
 `--limit` (defaults to capping output at 50 rows), a bare SQL `SELECT`
 with no `LIMIT` clause prints every matching row, matching real SQL
 semantics rather than silently truncating. Verified with a new
@@ -384,7 +384,7 @@ a new, non-optional dependency (same override precedent as
 now genuinely query Iceberg tables).
 
 **Delta's existing query path is completely untouched** — `QueryPlanner.plan`/
-`ScanPlan`/`AddFile`, in both `QueryCommand` and `DeltaFlightProducer`,
+`ScanPlan`/`AddFile`, in both `QueryCommand` and `LabukDbFlightProducer`,
 behave exactly as before (confirmed by re-running `FlightIntegrationTest`/
 `FlightAggregationIntegrationTest`/`QueryCommandSqlIntegrationTest`/
 `DeltaTableFormatTest`/`IcebergTableFormatTest` unmodified — all green).
@@ -500,7 +500,7 @@ FileSystem for scheme" error instead of routing it correctly. New
 `labukdb-format-iceberg`, since detecting a *catalog* reference isn't
 `core`'s concern the way detecting Delta-vs-Iceberg-by-directory-probe
 is) is checked *before* any `TableLocation` is constructed, in both
-`QueryCommand` and `DeltaFlightProducer`.
+`QueryCommand` and `LabukDbFlightProducer`.
 
 **Addressing, deliberately not a single combined URI.** Matching
 Spark/Trino/DuckDB's own Iceberg REST support, and this project's
@@ -519,7 +519,7 @@ session. A new `TableLocation.fromStringWithEnvironmentConfig(String)`
 (core, additive, zero risk to existing callers) derives where a loaded
 table's data files actually live from its own reported `location()`,
 reusing the exact remote-config-merging logic `TableResolver`/
-`DeltaFlightProducer` already had, since a catalog-loaded table has no
+`LabukDbFlightProducer` already had, since a catalog-loaded table has no
 caller-supplied `TableLocation` to work from.
 
 **Testing honesty, stated up front rather than discovered at
@@ -613,6 +613,20 @@ foundation under it is proven:
     library for *any* `Catalog` implementation, not just REST. Hive
     Metastore/Glue/Nessie remain unbuilt; implemented but not
     live-verified against a real REST server (see above for why).
+15. ✅ **Renamed `DeltaFlightProducer` → `LabukDbFlightProducer`.** The
+    class now serves both Delta and Iceberg (path- and catalog-based),
+    reads and writes — "Delta" in the name had become actively
+    misleading. Renamed via `git mv` to preserve history; every call
+    site (`LabukDbServerApp`, all `labukdb-flight` tests) and every
+    doc/javadoc mention across `labukdb-core`/`labukdb-cli` updated in
+    the same pass, confirmed via a repo-wide grep for the old name
+    afterward (none left except the class's own javadoc explaining the
+    rename). A pre-existing stale duplicate javadoc block on
+    `resolveTableRoot` (two `/** */` comments back to back, the first
+    superseded by the second) was also cleaned up while touching this
+    file, and the class-level javadoc's "DoPut/DoAction/DoExchange out
+    of scope" line — long stale, `DoPut` has been fully implemented for
+    several passes now — was corrected at the same time.
 
 **Known, pre-existing flaky test — not caused by the work above, root
 cause still genuinely open.** `labukdb-flight`'s `FlightIntegrationTest`

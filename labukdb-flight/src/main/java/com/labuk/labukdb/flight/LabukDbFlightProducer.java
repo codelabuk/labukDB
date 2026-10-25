@@ -65,29 +65,41 @@ import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Ties layers 1-3 together and exposes them over Arrow Flight.
+ * Ties layers 1-3 together and exposes them over Arrow Flight — both
+ * Delta and Iceberg tables, local or remote, path-based or
+ * catalog-based (see {@link DetectedFormat}/{@link IcebergRestLocation}).
+ * Named {@code LabukDbFlightProducer}, not {@code DeltaFlightProducer},
+ * precisely because it's no longer Delta-only.
  *
  * <b>{@code GetFlightInfo}</b> does all the planning: resolves the
  * requested snapshot (version, timestamp, or latest), runs partition and
  * file-stats pruning ({@link QueryPlanner}), and returns one
  * {@link FlightEndpoint} per surviving file — so a client can fetch
  * multiple files in parallel via multiple {@code DoGet} streams, rather
- * than this producer serializing everything through one connection.
+ * than this producer serializing everything through one connection. A
+ * query needing cross-file combination (`GROUP BY`/`ORDER BY`/`LIMIT`,
+ * or any Iceberg query) returns a single combined endpoint instead.
  *
- * <b>{@code DoGet}</b> does the actual work for exactly one file: row-group
+ * <b>{@code DoGet}</b> does the actual work for exactly one file (or, for
+ * a combined endpoint, every surviving file together): row-group
  * pruning, decode, and residual filtering, all inside
  * {@link ParquetToArrowReader}. It's lazy per endpoint — a client that never
  * calls {@code DoGet} for an endpoint never causes that file to be opened.
  *
+ * <b>{@code DoPut}</b> appends to an existing table — Delta via {@link
+ * WriteBuffer} (WAL-backed, cross-call buffering), Iceberg via {@link
+ * IcebergTableWriter} (one {@code DoPut} call, one commit, no buffering,
+ * since {@code iceberg-core} already retries commit conflicts internally).
+ *
  * Extends {@code NoOpFlightProducer} rather than implementing every
- * {@code FlightProducer} method by hand — {@code DoPut}, {@code DoAction},
- * {@code DoExchange} are genuinely out of scope for a read-only engine
- * right now, and {@code NoOpFlightProducer} gives them a correct
- * "unimplemented" response instead of this class guessing at signatures it
- * doesn't need. {@code ListFlights} IS implemented (see below) — it's the
- * one of the four that had a real, immediate use: listing catalog entries.
+ * {@code FlightProducer} method by hand — {@code DoAction}/{@code
+ * DoExchange} remain genuinely out of scope (no CREATE TABLE RPC, no
+ * push-based tailing yet), and {@code NoOpFlightProducer} gives them a
+ * correct "unimplemented" response instead of this class guessing at
+ * signatures it doesn't need. {@code ListFlights} IS implemented (see
+ * below) — listing catalog entries was a real, immediate use.
  */
-public class DeltaFlightProducer extends NoOpFlightProducer {
+public class LabukDbFlightProducer extends NoOpFlightProducer {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -115,12 +127,12 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     private static final long DEFAULT_MAX_BUFFERED_ROWS = 100_000;
     private static final long DEFAULT_MAX_BUFFERED_BYTES = 64L * 1024 * 1024;
 
-    public DeltaFlightProducer(BufferAllocator allocator) {
+    public LabukDbFlightProducer(BufferAllocator allocator) {
         this(allocator, TableCatalog.atDefaultLocation(), mergedStorageConf(), DEFAULT_WAL_ROOT);
     }
 
     /** Explicit-catalog constructor — mainly for tests that need an isolated catalog file. */
-    public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog) {
+    public LabukDbFlightProducer(BufferAllocator allocator, TableCatalog catalog) {
         this(allocator, catalog, mergedStorageConf(), DEFAULT_WAL_ROOT);
     }
 
@@ -145,7 +157,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      *                    endpoint, credentials, path-style access. See
      *                    {@link MinioConfiguration}. Unused for local tables.
      */
-    public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf) {
+    public LabukDbFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf) {
         this(allocator, catalog, storageConf, DEFAULT_WAL_ROOT);
     }
 
@@ -154,7 +166,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * WAL staging directory instead of the real {@code ~/.labukdb/wal}
      * default, same reasoning as the explicit-catalog constructor above.
      */
-    public DeltaFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf, Path walRoot) {
+    public LabukDbFlightProducer(BufferAllocator allocator, TableCatalog catalog, Configuration storageConf, Path walRoot) {
         this.allocator = allocator;
         this.catalog = catalog;
         this.storageConf = storageConf;
@@ -163,18 +175,13 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
 
     /**
      * Resolves {@code table} (a catalog name) first if present, otherwise
-     * falls back to the raw {@code tableRoot} path — the original form,
-     * still fully supported, not deprecated by this.
-     */
-    /**
-     * Resolves {@code table} (a catalog name) first if present, otherwise
      * falls back to the raw {@code tableRoot}. Returns a
      * {@link TableLocation}, which decides local-vs-remote once, here, so
      * everything downstream (log reads, data-file reads) follows the same
      * decision rather than each re-detecting a URI scheme.
      *
      * Remote locations get this producer's {@code storageConf} — supplied
-     * at construction (see {@link #DeltaFlightProducer(BufferAllocator,
+     * at construction (see {@link #LabukDbFlightProducer(BufferAllocator,
      * TableCatalog, Configuration)}), which is where MinIO/S3 endpoint and
      * credentials come from.
      */

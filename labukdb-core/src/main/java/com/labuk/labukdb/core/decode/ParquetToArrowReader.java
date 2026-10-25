@@ -89,7 +89,7 @@ public final class ParquetToArrowReader {
         return read(ParquetInputFiles.local(parquetFile), allocator, projectedColumns, residualPredicate, partitionValues);
     }
 
-    // --- TableLocation-based: dispatches local vs. remote, the entry point DeltaFlightProducer uses ---
+    // --- TableLocation-based: dispatches local vs. remote, the entry point LabukDbFlightProducer uses ---
 
     /**
      * Dispatches on the location - a local path uses the cached

@@ -20,7 +20,7 @@ import java.io.UncheckedIOException;
  * new {@code InputFile}-based overload. That overload is what a caller
  * wanting remote data would use directly via {@link #remote}.
  *
- * <b>Integration gap, stated plainly:</b> nothing in {@code DeltaFlightProducer},
+ * <b>Integration gap, stated plainly:</b> nothing in {@code LabukDbFlightProducer},
  * the catalog, or the CLI automatically chooses {@link #remote} based on a
  * URI scheme yet — they all still resolve local {@code File}s exclusively.
  * This class makes the decode engine itself remote-capable; wiring the

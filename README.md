@@ -89,7 +89,7 @@ below is deliberately small enough to reason about end to end.
 | Read | `decode/` | For each surviving file: prune row groups via Parquet footer stats, decode only the requested columns, apply the residual filter row-by-row, and reconstruct partition columns as constants. Decode and filter are fused into one pass. | `RowGroupPruner`, `GroupPredicateEvaluator`, `ParquetToArrowReader` |
 | Write | `encode/` | Arrow → Parquet (the write mirror of `decode/`), and Arrow `Schema` → Delta's JSON `schemaString` for creating a table. | `ArrowToParquetWriter`, `ArrowToDeltaSchema` |
 | Write | `log/` | Append a batch, upsert/MERGE by key, compact small files, vacuum expired ones, create a brand-new table — all as atomic commits with multi-writer optimistic concurrency control. | `CommitWriter`, `WriteBuffer`, `TableMerger`, `Compactor`, `Vacuum`, `TableCreator` |
-| Both | `flight/` | Serve it. A plain scan returns one `FlightEndpoint` per surviving file, decoded lazily per ticket. A query with `groupBy`/`aggregates`/`orderBy`/`limit` returns one combined endpoint instead — every surviving file is decoded, combined, and run through `execution/` server-side before streaming back one correct, cross-file result. `DoPut` for writes — streams incoming batches into a buffer, flushes to a committed file. | `DeltaFlightProducer`, `LabukDbServerApp` |
+| Both | `flight/` | Serve it. A plain scan returns one `FlightEndpoint` per surviving file, decoded lazily per ticket. A query with `groupBy`/`aggregates`/`orderBy`/`limit` returns one combined endpoint instead — every surviving file is decoded, combined, and run through `execution/` server-side before streaming back one correct, cross-file result. `DoPut` for writes — streams incoming batches into a buffer, flushes to a committed file. | `LabukDbFlightProducer`, `LabukDbServerApp` |
 | — | `execution/` | `GROUP BY` aggregation and `ORDER BY`/`LIMIT`, reachable via `flight/`'s `DoGet` (see above) and usable standalone as a library. | `AggregateOperator`, `SortLimitOperator` |
 
 Supporting packages: `storage/` (local/S3/MinIO/ADLS location resolution),
@@ -314,7 +314,7 @@ ADLS tables (`SnapshotManager.forLocation(...)`), and `ParquetToArrowReader`
 has matching `TableLocation`-based `readSchema`/`read` overloads — see
 `labukdb-core/src/main/java/com/labuk/labukdb/core/tools/RealTableSmokeCheck.java`
 for a second, runnable end-to-end example (schema inspection plus a
-side-by-side pruned vs. unpruned file count), and `DeltaFlightProducer`
+side-by-side pruned vs. unpruned file count), and `LabukDbFlightProducer`
 (in `labukdb-flight`) for exactly this same sequence wired into
 `GetFlightInfo`/`DoGet`.
 
@@ -376,7 +376,7 @@ something else.
 
 **Read path:** fully remote-capable — log/metadata and the Parquet data
 read in `decode/` both dispatch through `TableLocation`, the same path
-`DeltaFlightProducer` uses for every query. Live-verified against a real
+`LabukDbFlightProducer` uses for every query. Live-verified against a real
 MinIO cluster (scan, partition pruning, decode).
 
 **Write path:** also fully remote-capable now — `CommitWriter`,
@@ -397,7 +397,7 @@ genuinely gone from the bucket, not just logically removed from the log.
 No config file today — the CLI and Flight server both read connector
 settings from environment variables automatically whenever a table
 location uses a remote URI scheme (`TableResolver` and
-`DeltaFlightProducer`, respectively):
+`LabukDbFlightProducer`, respectively):
 
 | Backend | Environment variables | Example location |
 |---|---|---|
@@ -629,7 +629,7 @@ dependencies:
 | Item | Notes |
 |---|---|
 | Grafana as a Flight client | Grafana's Arrow Flight data source plugin needs no changes here — highest value, least new code |
-| Prometheus metrics | Micrometer registry in `DeltaFlightProducer`: queries/sec, p95 latency, files-scanned vs. files-pruned |
+| Prometheus metrics | Micrometer registry in `LabukDbFlightProducer`: queries/sec, p95 latency, files-scanned vs. files-pruned |
 | InfluxDB → Delta pipeline | Separate ingestion story, not something this engine does natively |
 
 ### Infrastructure

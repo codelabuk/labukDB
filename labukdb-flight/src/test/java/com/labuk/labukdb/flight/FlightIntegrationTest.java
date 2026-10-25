@@ -87,7 +87,7 @@ class FlightIntegrationTest {
         // server, not for a test suite run repeatedly on a dev machine).
         // No test here touches remote storage, so an empty Configuration
         // is equivalent to the producer's own default merged one.
-        DeltaFlightProducer producer = new DeltaFlightProducer(
+        LabukDbFlightProducer producer = new LabukDbFlightProducer(
                 allocator, catalog, new org.apache.hadoop.conf.Configuration(), walRoot);
 
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);

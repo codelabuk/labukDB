@@ -16,7 +16,7 @@ import java.util.List;
  * (one combined {@code DoGet} endpoint) and {@code labukdb-cli} (SQL
  * queries via {@code QueryCommand}) so both call one real implementation
  * instead of two copies that could drift — extracted from
- * {@code DeltaFlightProducer}'s original inline combine-mode logic
+ * {@code LabukDbFlightProducer}'s original inline combine-mode logic
  * verbatim, not rewritten.
  *
  * Decodes every file and combines them into one root (same

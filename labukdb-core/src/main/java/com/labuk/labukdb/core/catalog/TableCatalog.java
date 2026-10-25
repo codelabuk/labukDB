@@ -27,7 +27,7 @@ import java.util.regex.Pattern;
  * capable of pointing at remote storage.
  *
  * <b>Still an interim limitation, stated plainly:</b> {@link
- * com.labuk.labukdb.cli.TableResolver} and {@code DeltaFlightProducer}
+ * com.labuk.labukdb.cli.TableResolver} and {@code LabukDbFlightProducer}
  * still convert whatever this returns into a local {@code java.nio.file.Path}
  * at the point of use — so a remote URI can now be stored correctly, but
  * nothing downstream dispatches to the Hadoop-backed engine based on it

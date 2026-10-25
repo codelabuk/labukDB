@@ -94,7 +94,7 @@ public final class WriteBuffer implements AutoCloseable {
 
     /**
      * Local or remote (S3/MinIO/ADLS) table, via {@link TableLocation} —
-     * what {@code DeltaFlightProducer} uses so {@code DoPut} works the
+     * what {@code LabukDbFlightProducer} uses so {@code DoPut} works the
      * same way against either. The WAL still lives under {@code walRoot}
      * on local disk regardless — see this class's javadoc for why.
      */

@@ -199,7 +199,7 @@ package "labukdb-format-iceberg  (optional for core embedders;\nrequired by cli/
 
 ' ─── labukdb-flight ───────────────────────────────────────
 package "labukdb-flight  (depends on core, format-iceberg)" #EEEDFE {
-  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files;\nDoPut appends to Iceberg too now --\none DoPut = one Iceberg commit,\nno WriteBuffer equivalent)] as DFP
+  [LabukDbFlightProducer\n(renamed from DeltaFlightProducer --\nserves Delta AND Iceberg now)\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files;\nDoPut appends to Iceberg too now --\none DoPut = one Iceberg commit,\nno WriteBuffer equivalent)] as DFP
   [TicketRegistry] as TR
 }
 

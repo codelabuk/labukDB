@@ -33,7 +33,7 @@ read local disk, S3, or ADLS depending on the URI scheme. Parquet's
 | `storage/MinioConfiguration.java` | Builds a `Configuration` with `fs.s3a.*` keys (endpoint, keys, path-style access) for MinIO/S3 |
 | `storage/AdlsConfiguration.java` | Builds a `Configuration` with `fs.azure.*` keys (shared-key or service-principal auth) for ADLS |
 | `cli/TableResolver.java` | Assembles a merged `Configuration` from `AdlsConfiguration` / `MinioConfiguration` env vars |
-| `flight/DeltaFlightProducer.java` | Holds the merged storage `Configuration`, passes it down to `SnapshotManager` / `TableLocation` per request |
+| `flight/LabukDbFlightProducer.java` | Holds the merged storage `Configuration`, passes it down to `SnapshotManager` / `TableLocation` per request |
 
 `log/LocalNioLogStorage.java` is the non-Hadoop counterpart (plain
 `java.nio.file`) — `HadoopLogStorage` is an alternate implementation of the

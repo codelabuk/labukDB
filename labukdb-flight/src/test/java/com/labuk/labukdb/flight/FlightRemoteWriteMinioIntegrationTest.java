@@ -93,7 +93,7 @@ class FlightRemoteWriteMinioIntegrationTest {
         // Explicit walRoot -- same reasoning as FlightIntegrationTest:
         // otherwise this would accumulate stale directories under the
         // real ~/.labukdb/wal on every test run.
-        DeltaFlightProducer producer = new DeltaFlightProducer(allocator, catalog, conf, walRoot);
+        LabukDbFlightProducer producer = new LabukDbFlightProducer(allocator, catalog, conf, walRoot);
 
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
         server = FlightServer.builder(allocator, serverLocation, producer).build();

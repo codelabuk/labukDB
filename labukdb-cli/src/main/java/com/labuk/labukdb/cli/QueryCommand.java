@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
  * {@code delta-cli query --sql "<SELECT statement>"}
  *
  * Runs a query directly through log/planner/decode, in-process — no Flight
- * server needed. Exercises exactly the same engine {@code DeltaFlightProducer}
+ * server needed. Exercises exactly the same engine {@code LabukDbFlightProducer}
  * calls, just without gRPC in between. The {@code --sql} path reuses the same
  * {@link CombinedQueryExecutor} Flight's combine-mode {@code DoGet} uses, so
  * {@code GROUP BY}/{@code ORDER BY}/{@code LIMIT} behave identically here.
@@ -103,7 +103,7 @@ final class QueryCommand {
      * aggregates/{@code ORDER BY}/{@code LIMIT}) reuses the existing per-file
      * streaming scan; anything needing cross-file combination goes through
      * {@link CombinedQueryExecutor} — same {@code combineMode} trigger
-     * {@code DeltaFlightProducer} uses, for the same reason (those can't be
+     * {@code LabukDbFlightProducer} uses, for the same reason (those can't be
      * answered correctly file-by-file). Unlike {@code --limit} (which defaults
      * to capping output at 50 rows), a bare SQL {@code SELECT} with no
      * {@code LIMIT} clause prints every matching row — that is what "no LIMIT"

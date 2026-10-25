@@ -71,7 +71,7 @@ public final class CommitWriter {
      * Dispatches on the location — local or remote (S3/MinIO/ADLS) — the
      * same {@link TableLocation}-based entry point {@link SnapshotManager}
      * and {@code decode/ParquetToArrowReader} already use for reads. This
-     * is what {@code WriteBuffer}/{@code DeltaFlightProducer} use so a
+     * is what {@code WriteBuffer}/{@code LabukDbFlightProducer} use so a
      * {@code DoPut} against a remote table works the same way a local one
      * always has.
      */

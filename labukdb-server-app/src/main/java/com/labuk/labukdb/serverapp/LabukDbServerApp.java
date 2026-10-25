@@ -1,6 +1,6 @@
 package com.labuk.labukdb.serverapp;
 
-import com.labuk.labukdb.flight.DeltaFlightProducer;
+import com.labuk.labukdb.flight.LabukDbFlightProducer;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.Location;
 import org.apache.arrow.memory.BufferAllocator;
@@ -21,7 +21,7 @@ public final class LabukDbServerApp {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 9443;
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-            DeltaFlightProducer producer = new DeltaFlightProducer(allocator);
+            LabukDbFlightProducer producer = new LabukDbFlightProducer(allocator);
             Location location = Location.forGrpcInsecure("0.0.0.0", port);
 
             try (FlightServer server = FlightServer.builder(allocator, location, producer).build()) {

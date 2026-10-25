@@ -84,7 +84,7 @@ public class SnapshotManager {
      * Dispatches on the location itself - local or remote - so callers
      * don't have to pick a constructor based on inspecting a URI scheme
      * themselves. This is the one that {@code TableCache} and, through it,
-     * {@code DeltaFlightProducer} actually use.
+     * {@code LabukDbFlightProducer} actually use.
      */
     public static SnapshotManager forLocation(TableLocation location) throws IOException {
         return location.isRemote()
