@@ -20,12 +20,16 @@ import com.labuk.labukdb.core.planner.ScanPlan;
 import com.labuk.labukdb.core.query.SqlQuery;
 import com.labuk.labukdb.core.query.SqlQueryTranslator;
 import com.labuk.labukdb.core.storage.TableLocation;
+import com.labuk.labukdb.iceberg.IcebergRestConfiguration;
+import com.labuk.labukdb.iceberg.IcebergRestLocation;
 import com.labuk.labukdb.iceberg.IcebergTableFormat;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 
 import java.time.Instant;
 import java.util.ArrayList;
@@ -63,11 +67,20 @@ final class QueryCommand {
         }
 
         TableCatalog catalog = TableCatalog.atDefaultLocation();
-        TableLocation tableRoot = TableResolver.resolve(parsed.table, catalog);
+        String raw = catalog.resolve(parsed.table).orElse(parsed.table);
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            if (IcebergRestLocation.isRestUri(raw)) {
+                runIceberg(openIcebergRest(raw), raw, parsed.predicate, parsed.columns, List.of(), List.of(),
+                        List.of(), -1, parsed.limit > 0 ? parsed.limit : Integer.MAX_VALUE, parsed.limit,
+                        parsed.version, parsed.asOf, allocator);
+                return;
+            }
+
+            TableLocation tableRoot = TableResolver.resolve(parsed.table, catalog);
             if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                runIceberg(tableRoot, parsed.predicate, parsed.columns, List.of(), List.of(), List.of(), -1,
+                runIceberg(new IcebergTableFormat(tableRoot), tableRoot.toString(), parsed.predicate, parsed.columns,
+                        List.of(), List.of(), List.of(), -1,
                         parsed.limit > 0 ? parsed.limit : Integer.MAX_VALUE, parsed.limit,
                         parsed.version, parsed.asOf, allocator);
                 return;
@@ -102,13 +115,21 @@ final class QueryCommand {
                 || !query.orderBy().isEmpty() || query.limit() >= 0;
 
         TableCatalog catalog = TableCatalog.atDefaultLocation();
-        TableLocation tableRoot = TableResolver.resolve(query.table(), catalog);
+        String raw = catalog.resolve(query.table()).orElse(query.table());
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-            if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                runIceberg(tableRoot, query.predicate(), query.columns(), query.groupByColumns(),
+            if (IcebergRestLocation.isRestUri(raw)) {
+                runIceberg(openIcebergRest(raw), raw, query.predicate(), query.columns(), query.groupByColumns(),
                         query.aggregates(), query.orderBy(), query.limit(), Integer.MAX_VALUE, 0,
                         parsed.version, parsed.asOf, allocator);
+                return;
+            }
+
+            TableLocation tableRoot = TableResolver.resolve(query.table(), catalog);
+            if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+                runIceberg(new IcebergTableFormat(tableRoot), tableRoot.toString(), query.predicate(),
+                        query.columns(), query.groupByColumns(), query.aggregates(), query.orderBy(), query.limit(),
+                        Integer.MAX_VALUE, 0, parsed.version, parsed.asOf, allocator);
                 return;
             }
 
@@ -164,6 +185,21 @@ final class QueryCommand {
     }
 
     /**
+     * REST-catalog counterpart of a plain {@code TableLocation}-based
+     * Iceberg open — connects via {@link IcebergRestConfiguration}
+     * (env-var-configured, one catalog connection per process) and
+     * parses the {@code icebergrest://} reference via {@link
+     * IcebergRestLocation}. {@code raw} must already satisfy {@link
+     * IcebergRestLocation#isRestUri} — checked by the caller first,
+     * before this is reached.
+     */
+    private static IcebergTableFormat openIcebergRest(String raw) {
+        Catalog restCatalog = IcebergRestConfiguration.connect();
+        TableIdentifier identifier = IcebergRestLocation.parseTableIdentifier(raw);
+        return new IcebergTableFormat(restCatalog, identifier);
+    }
+
+    /**
      * The Iceberg counterpart of both {@link #run}'s flag-based path and
      * {@link #runSql}'s combine-mode path, unified into one helper since
      * Iceberg always routes through {@link CombinedQueryExecutor} —
@@ -171,8 +207,18 @@ final class QueryCommand {
      * implementation the way Delta's plain-scan path has. Delta's own
      * plain-scan-vs-combine-mode split in {@link #run}/{@link #runSql} is
      * completely untouched; this is reached only once {@link
-     * DetectedFormat#detect} says the table is Iceberg.
+     * DetectedFormat#detect} says the table is Iceberg, or once {@link
+     * IcebergRestLocation#isRestUri} says it's a REST-catalog reference.
+     * Works identically either way — {@code tableFormat} may have been
+     * constructed path-based or catalog-based; this method only ever
+     * calls its format-agnostic {@code TableFormat} surface plus the new
+     * {@link IcebergTableFormat#location} accessor, which both
+     * constructors populate correctly.
      *
+     * @param displayName  what to print as "Table: ..." — the original
+     *                     {@code TableLocation} for a path-based table,
+     *                     or the raw {@code icebergrest://} reference for
+     *                     a catalog-based one.
      * @param queryLimit   the real SQL-style {@code LIMIT} passed to {@link
      *                     CombinedQueryExecutor} ({@code -1} = none) — for
      *                     the flag-based path this is always {@code -1};
@@ -184,14 +230,20 @@ final class QueryCommand {
      *                     in play (the SQL path), otherwise the original
      *                     {@code --limit} value, purely for the footer line.
      */
-    private static void runIceberg(TableLocation tableRoot, Predicate predicate, List<String> columns,
-                                    List<String> groupByColumns, List<AggregateSpec> aggregates,
-                                    List<SortKey> orderBy, long queryLimit, int printCap, int limitForFooter,
-                                    Long version, Instant asOf, BufferAllocator allocator) throws Exception {
-        IcebergTableFormat tableFormat = new IcebergTableFormat(tableRoot);
+    private static void runIceberg(IcebergTableFormat tableFormat, String displayName, Predicate predicate,
+                                    List<String> columns, List<String> groupByColumns,
+                                    List<AggregateSpec> aggregates, List<SortKey> orderBy, long queryLimit,
+                                    int printCap, int limitForFooter, Long version, Instant asOf,
+                                    BufferAllocator allocator) throws Exception {
         NormalizedSnapshot snapshot = version != null ? tableFormat.atVersion(version)
                 : asOf != null ? tableFormat.atTimestamp(asOf)
                 : tableFormat.latest();
+        // Every DataFileRef path Iceberg reports is already absolute (confirmed
+        // this session, both path-based and catalog-based), so this is only
+        // ever used for its local-vs-remote dispatch, never its string value --
+        // deriving it from the table's own reported location works uniformly
+        // for both construction paths, not just a TableLocation-supplied one.
+        TableLocation dataFileRoot = TableLocation.fromStringWithEnvironmentConfig(tableFormat.location());
 
         boolean aggregating = !groupByColumns.isEmpty() || !aggregates.isEmpty();
         Set<String> neededColumns = new LinkedHashSet<>();
@@ -211,7 +263,7 @@ final class QueryCommand {
         List<String> projectedColumns = List.copyOf(neededColumns);
 
         NormalizedScanPlan plan = new QueryPlanner().planNormalized(snapshot, predicate, projectedColumns);
-        printIcebergSummary(tableRoot, snapshot, plan);
+        printIcebergSummary(displayName, snapshot, plan);
 
         if (plan.getFilesToScan().isEmpty()) {
             System.out.println("0 row(s)");
@@ -220,7 +272,7 @@ final class QueryCommand {
 
         List<FileScan> files = new ArrayList<>();
         for (DataFileRef file : plan.getFilesToScan()) {
-            TableLocation dataFile = tableRoot.resolve(file.getPath());
+            TableLocation dataFile = dataFileRoot.resolve(file.getPath());
             Predicate perFileResidual =
                     PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
             files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
@@ -242,11 +294,11 @@ final class QueryCommand {
         }
     }
 
-    private static void printIcebergSummary(TableLocation tableRoot, NormalizedSnapshot snapshot, NormalizedScanPlan plan) {
+    private static void printIcebergSummary(String displayName, NormalizedSnapshot snapshot, NormalizedScanPlan plan) {
         // Iceberg's "version" is a non-sequential snapshotId, not Delta's small
         // sequential integer -- see IcebergTableFormat's javadoc; stated plainly
         // here rather than printed as if it meant the same thing as Delta's.
-        System.out.println("Table: " + tableRoot + " (Iceberg snapshot " + snapshot.getVersion() + ")");
+        System.out.println("Table: " + displayName + " (Iceberg snapshot " + snapshot.getVersion() + ")");
         System.out.println("Files: " + plan.getFilesToScan().size() + " / " + plan.getTotalFilesInSnapshot()
                 + " (skipped " + plan.getFilesSkipped() + " via partition/file-stats pruning)");
         System.out.println();

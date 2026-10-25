@@ -28,8 +28,12 @@ import com.labuk.labukdb.core.storage.AdlsConfiguration;
 import com.labuk.labukdb.core.storage.MinioConfiguration;
 import com.labuk.labukdb.core.storage.TableLocation;
 import com.labuk.labukdb.flight.query.FlightWriteRequest;
+import com.labuk.labukdb.iceberg.IcebergRestConfiguration;
+import com.labuk.labukdb.iceberg.IcebergRestLocation;
 import com.labuk.labukdb.iceberg.IcebergTableFormat;
 import com.labuk.labukdb.iceberg.IcebergTableWriter;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -179,33 +183,47 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     }
 
     /**
+     * Resolves exactly one of a catalog name or a raw path/URI to the raw
+     * location string — the part of {@link #resolveTableLocation} that
+     * happens before deciding local-vs-remote, split out so a caller can
+     * check {@link com.labuk.labukdb.iceberg.IcebergRestLocation#isRestUri}
+     * on the raw string first (an {@code icebergrest://} reference has no
+     * {@link TableLocation} at all — see that class's javadoc for why).
+     */
+    private String resolveRawLocation(String table, String tableRoot) {
+        if (table != null) {
+            return catalog.resolve(table)
+                    .orElseThrow(() -> new IllegalArgumentException(
+                            "No table registered in the catalog under the name '" + table + "'"));
+        } else if (tableRoot != null) {
+            return tableRoot;
+        } else {
+            throw new IllegalArgumentException(
+                    "Request must set either 'table' (a catalog name) or 'tableRoot' (a raw path or URI)");
+        }
+    }
+
+    private TableLocation locationFromRaw(String raw) {
+        return TableLocation.isRemoteUri(raw)
+                ? TableLocation.forRemote(raw, storageConf)
+                : TableLocation.fromString(raw);
+    }
+
+    /**
      * Shared by {@code getFlightInfo}/{@code getSchema} (via
      * {@link #resolveTableRoot}) and {@code acceptPut} — resolves exactly
      * one of a catalog name or a raw path/URI to a {@link TableLocation},
      * with remote locations picking up this producer's {@code storageConf}.
      */
     private TableLocation resolveTableLocation(String table, String tableRoot) {
-        String raw;
-        if (table != null) {
-            raw = catalog.resolve(table)
-                    .orElseThrow(() -> new IllegalArgumentException(
-                            "No table registered in the catalog under the name '" + table + "'"));
-        } else if (tableRoot != null) {
-            raw = tableRoot;
-        } else {
-            throw new IllegalArgumentException(
-                    "Request must set either 'table' (a catalog name) or 'tableRoot' (a raw path or URI)");
-        }
-        return TableLocation.isRemoteUri(raw)
-                ? TableLocation.forRemote(raw, storageConf)
-                : TableLocation.fromString(raw);
+        return locationFromRaw(resolveRawLocation(table, tableRoot));
     }
 
     @Override
     public FlightInfo getFlightInfo(CallContext context, FlightDescriptor descriptor) {
         try {
             FlightQueryRequest query = MAPPER.readValue(descriptor.getCommand(), FlightQueryRequest.class);
-            TableLocation tableRoot = resolveTableRoot(query);
+            String raw = resolveRawLocation(query.getTable(), query.getTableRoot());
 
             Predicate predicate = PredicateCodec.fromJson(query.getPredicate());
             List<String> groupByColumns = query.getGroupBy() == null ? List.of() : query.getGroupBy();
@@ -213,9 +231,15 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             List<SortKey> sortKeys = AggregateQueryCodec.orderByFromJson(query.getOrderBy());
             long limit = query.getLimit() == null ? -1 : query.getLimit();
 
+            if (IcebergRestLocation.isRestUri(raw)) {
+                return icebergFlightInfo(descriptor, openIcebergRest(raw), query, predicate, groupByColumns,
+                        aggregates, sortKeys, limit);
+            }
+
+            TableLocation tableRoot = locationFromRaw(raw);
             if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                return icebergFlightInfo(descriptor, tableRoot, query, predicate, groupByColumns, aggregates,
-                        sortKeys, limit);
+                return icebergFlightInfo(descriptor, new IcebergTableFormat(tableRoot), query, predicate,
+                        groupByColumns, aggregates, sortKeys, limit);
             }
 
             SnapshotManager snapshotManager = tableCache.forTable(tableRoot);
@@ -386,28 +410,52 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
     }
 
     /**
+     * REST-catalog counterpart of a plain {@code TableLocation}-based
+     * Iceberg open — connects via {@link IcebergRestConfiguration}
+     * (env-var-configured, one catalog connection per process) and
+     * parses the {@code icebergrest://} reference via {@link
+     * IcebergRestLocation}. {@code raw} must already satisfy {@link
+     * IcebergRestLocation#isRestUri} — checked by the caller first.
+     */
+    private IcebergTableFormat openIcebergRest(String raw) {
+        Catalog restCatalog = IcebergRestConfiguration.connect();
+        TableIdentifier identifier = IcebergRestLocation.parseTableIdentifier(raw);
+        return new IcebergTableFormat(restCatalog, identifier);
+    }
+
+    /**
      * Iceberg's counterpart of {@link #combinedFlightInfo} — Delta's own
      * plain-scan and combine-mode logic above is completely untouched;
      * this is reached only once {@link DetectedFormat#detect} says the
-     * table is Iceberg. Always registers exactly one {@link
-     * CombinedScanTicket}, even for a plain scan with none of {@code
-     * groupBy}/{@code aggregates}/{@code orderBy}/{@code limit} present —
-     * deliberate v1 simplification (see {@code QueryCommand}'s matching
-     * note in {@code labukdb-cli}): Iceberg doesn't get its own parallel
-     * one-endpoint-per-file ticket type, it always reuses the combined
-     * path that already exists.
+     * table is Iceberg, or once {@link
+     * com.labuk.labukdb.iceberg.IcebergRestLocation#isRestUri} says it's
+     * a REST-catalog reference. Works identically either way —
+     * {@code tableFormat} may have been constructed path-based or
+     * catalog-based; only {@link IcebergTableFormat#location} (used to
+     * derive where data files physically live) and the format-agnostic
+     * {@code TableFormat} surface are called here. Always registers
+     * exactly one {@link CombinedScanTicket}, even for a plain scan with
+     * none of {@code groupBy}/{@code aggregates}/{@code orderBy}/{@code
+     * limit} present — deliberate v1 simplification (see {@code
+     * QueryCommand}'s matching note in {@code labukdb-cli}): Iceberg
+     * doesn't get its own parallel one-endpoint-per-file ticket type, it
+     * always reuses the combined path that already exists.
      */
-    private FlightInfo icebergFlightInfo(FlightDescriptor descriptor, TableLocation tableRoot,
+    private FlightInfo icebergFlightInfo(FlightDescriptor descriptor, IcebergTableFormat tableFormat,
                                           FlightQueryRequest query, Predicate predicate,
                                           List<String> groupByColumns, List<AggregateSpec> aggregates,
                                           List<SortKey> sortKeys, long limit) throws IOException {
-        IcebergTableFormat tableFormat = new IcebergTableFormat(tableRoot);
         // Iceberg's "version" is a non-sequential snapshotId, not Delta's small
         // sequential integer -- see IcebergTableFormat's own javadoc.
         NormalizedSnapshot snapshot = query.getVersion() != null ? tableFormat.atVersion(query.getVersion())
                 : query.getTimestampMillis() != null
                 ? tableFormat.atTimestamp(Instant.ofEpochMilli(query.getTimestampMillis()))
                 : tableFormat.latest();
+        // Every DataFileRef path Iceberg reports is already absolute, so this
+        // is only ever used for its local-vs-remote dispatch, never its string
+        // value -- deriving it from the table's own reported location works
+        // uniformly for both construction paths, not just a TableLocation one.
+        TableLocation dataFileRoot = TableLocation.fromStringWithEnvironmentConfig(tableFormat.location());
 
         boolean aggregating = !groupByColumns.isEmpty() || !aggregates.isEmpty();
         Set<String> neededColumns = new LinkedHashSet<>();
@@ -430,7 +478,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
 
         List<FileScan> files = new ArrayList<>();
         for (DataFileRef file : plan.getFilesToScan()) {
-            TableLocation dataFile = tableRoot.resolve(file.getPath());
+            TableLocation dataFile = dataFileRoot.resolve(file.getPath());
             Predicate perFileResidual =
                     PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
             files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
@@ -453,7 +501,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                 inputColumns.add(spec.column());
             }
             Schema inputSchema = parquetReader.readSchema(
-                    tableRoot.resolve(firstFile.getPath()), List.copyOf(inputColumns), firstFile.getPartitionValues());
+                    dataFileRoot.resolve(firstFile.getPath()), List.copyOf(inputColumns), firstFile.getPartitionValues());
 
             List<org.apache.arrow.vector.types.pojo.Field> outputFields = new ArrayList<>();
             for (String column : groupByColumns) {
@@ -466,7 +514,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         } else {
             DataFileRef firstFile = plan.getFilesToScan().get(0);
             schema = parquetReader.readSchema(
-                    tableRoot.resolve(firstFile.getPath()), projectedColumns, firstFile.getPartitionValues());
+                    dataFileRoot.resolve(firstFile.getPath()), projectedColumns, firstFile.getPartitionValues());
         }
 
         return FlightInfo.builder(schema, descriptor, endpoints)
@@ -559,10 +607,18 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
             try {
                 FlightWriteRequest request = MAPPER.readValue(
                         flightStream.getDescriptor().getCommand(), FlightWriteRequest.class);
-                TableLocation tableRoot = resolveTableLocation(request.getTable(), request.getTableRoot());
+                String raw = resolveRawLocation(request.getTable(), request.getTableRoot());
 
+                if (IcebergRestLocation.isRestUri(raw)) {
+                    acceptPutIceberg(openIcebergRestWriter(raw), request.getPartitionValues(), flightStream);
+                    ackStream.onNext(PutResult.empty());
+                    ackStream.onCompleted();
+                    return;
+                }
+
+                TableLocation tableRoot = locationFromRaw(raw);
                 if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                    acceptPutIceberg(tableRoot, request.getPartitionValues(), flightStream);
+                    acceptPutIceberg(new IcebergTableWriter(tableRoot), request.getPartitionValues(), flightStream);
                     ackStream.onNext(PutResult.empty());
                     ackStream.onCompleted();
                     return;
@@ -613,7 +669,7 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
      * built incrementally (plain commits existed before {@code WriteBuffer}
      * did).
      */
-    private void acceptPutIceberg(TableLocation tableRoot, Map<String, String> partitionValues,
+    private void acceptPutIceberg(IcebergTableWriter writer, Map<String, String> partitionValues,
                                    FlightStream flightStream) throws IOException {
         if (partitionValues == null) {
             throw new IllegalArgumentException("'partitionValues' is required");
@@ -630,13 +686,20 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                 VectorSchemaRootAppender.append(combined, batch);
             }
             if (combined != null && combined.getRowCount() > 0) {
-                new IcebergTableWriter(tableRoot).appendBatch(combined, partitionValues);
+                writer.appendBatch(combined, partitionValues);
             }
         } finally {
             if (combined != null) {
                 combined.close();
             }
         }
+    }
+
+    /** REST-catalog counterpart of {@link #openIcebergRest}, for writes. */
+    private IcebergTableWriter openIcebergRestWriter(String raw) {
+        Catalog restCatalog = IcebergRestConfiguration.connect();
+        TableIdentifier identifier = IcebergRestLocation.parseTableIdentifier(raw);
+        return new IcebergTableWriter(restCatalog, identifier);
     }
 
     /**

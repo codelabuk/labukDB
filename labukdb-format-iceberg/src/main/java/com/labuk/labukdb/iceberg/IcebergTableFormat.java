@@ -11,6 +11,8 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
 
@@ -64,6 +66,28 @@ public final class IcebergTableFormat implements TableFormat {
      */
     public IcebergTableFormat(TableLocation location) {
         this(location.raw(), location.isRemote() ? location.hadoopConf() : new Configuration());
+    }
+
+    /**
+     * Catalog-service-based constructor — REST, Hive Metastore, Glue,
+     * Nessie, or any other {@link Catalog} implementation, all sharing
+     * this one interface. {@code normalize}/everything below is
+     * unchanged from the path-based constructor; only how the {@link
+     * Table} is obtained differs.
+     */
+    public IcebergTableFormat(Catalog catalog, TableIdentifier identifier) {
+        this.table = catalog.loadTable(identifier);
+    }
+
+    /**
+     * The table's own storage location, as Iceberg itself reports it —
+     * for a caller that needs to resolve a {@link DataFileRef}'s
+     * (already-absolute) path against something, without having supplied
+     * a {@code TableLocation} directly (e.g. after loading via a {@link
+     * Catalog}, where none was given).
+     */
+    public String location() {
+        return table.location();
     }
 
     @Override

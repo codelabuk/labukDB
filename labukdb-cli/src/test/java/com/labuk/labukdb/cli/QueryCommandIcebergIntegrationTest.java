@@ -156,4 +156,19 @@ class QueryCommandIcebergIntegrationTest {
         String output = capturedOut.toString(StandardCharsets.UTF_8);
         assertTrue(output.contains("10 row(s)"), "all 10 rows across both partition files: " + output);
     }
+
+    @Test
+    void icebergRestReference_routesToRestPath_notDeltaOrPathBasedIceberg() {
+        // No real REST catalog server is available in this environment (see
+        // IcebergRestConfiguration's javadoc) -- this proves the ROUTING is
+        // correct (an icebergrest:// --table reaches IcebergRestConfiguration,
+        // not TableResolver/DetectedFormat) by asserting the specific,
+        // REST-connection-stage error it throws, rather than some unrelated
+        // "file not found"/"_delta_log missing" error a misrouted request
+        // would produce instead.
+        assertNull(System.getenv("ICEBERG_REST_URI"), "test assumes ICEBERG_REST_URI isn't set in this environment");
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> QueryCommand.run(new String[] {"--table", "icebergrest://analytics.logs"}));
+        assertTrue(thrown.getMessage().contains("ICEBERG_REST_URI"), thrown.getMessage());
+    }
 }

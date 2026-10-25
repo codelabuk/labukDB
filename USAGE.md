@@ -22,9 +22,11 @@ what's built vs. still planned.
 
 Modes 1–3 (CLI flags, CLI SQL, Flight) all auto-detect which table format
 a location holds — probing for a `_delta_log/` directory (Delta) or a
-`metadata/` directory (Iceberg) — so the same `--table`/`FROM`/
-`FlightQueryRequest` works against either without saying which one it is.
-A few real differences to know about:
+`metadata/` directory (Iceberg), or recognizing an `icebergrest://`
+reference before any path-probing happens at all (see
+[Iceberg via a REST catalog](#iceberg-via-a-rest-catalog) below) — so the
+same `--table`/`FROM`/`FlightQueryRequest` works against any of them
+without saying which one it is. A few real differences to know about:
 
 - **Iceberg writes are append-only, and not reachable from the CLI.**
   `DoPut` (Flight) and `IcebergTableWriter` (embedded library) can append
@@ -48,6 +50,62 @@ A few real differences to know about:
   aren't mapped into the shape the pruner reads today. Files are kept
   rather than wrongly skipped, so this is a missed optimization, not a
   correctness gap.
+
+### Iceberg via a REST catalog
+
+Most real Iceberg deployments register tables in a catalog *service*
+(REST, Hive Metastore, Glue, Nessie) rather than addressing them by a raw
+filesystem path — `HadoopTables` (everything above) only covers the
+path-based minority case. A REST catalog is reachable too, in the same
+three modes (CLI flags, CLI SQL, Flight), using an `icebergrest://`
+reference instead of a path:
+
+```
+bin/labukdb query --table icebergrest://analytics.logs --filter "level=ERROR"
+bin/labukdb query --sql "SELECT level, COUNT(amount) AS cnt FROM icebergrest://analytics.logs GROUP BY level"
+```
+
+The identifier after `icebergrest://` is the table's catalog identifier
+(`<namespace>.<table>`, dotted — multi-level namespaces work too, e.g.
+`icebergrest://prod.analytics.logs`), **not** a filesystem path. It can
+also be registered under a short catalog name the normal way
+(`bin/labukdb catalog add logs icebergrest://analytics.logs`).
+
+**The catalog *connection* is separate from the table reference**,
+configured once from the environment — deliberately not packed into the
+URI itself, the same separation `MinioConfiguration`/`AdlsConfiguration`
+already use for storage connectors:
+
+| Variable | Required? | Meaning |
+|---|---|---|
+| `ICEBERG_REST_URI` | Yes | The REST catalog's base URL |
+| `ICEBERG_REST_WAREHOUSE` | No | Warehouse location, if the catalog needs one |
+| `ICEBERG_REST_AUTH_TYPE` | No | `none` (default) / `basic` / `oauth2` / `sigv4` / `google` |
+| `ICEBERG_REST_TOKEN`, `ICEBERG_REST_CREDENTIAL`, `ICEBERG_REST_OAUTH2_SERVER_URI` | For `oauth2` | OAuth2 bearer token / client credential / token-endpoint override |
+| `ICEBERG_REST_BASIC_USERNAME`, `ICEBERG_REST_BASIC_PASSWORD` | For `basic` | HTTP Basic auth |
+
+**v1 limitation, stated plainly: one REST catalog connection per
+process.** Not a registry of multiple catalogs — same scope the existing
+MinIO/ADLS env-var config already has.
+
+**The catalog only resolves *which table*; its underlying storage still
+needs its own connector config too.** If the REST catalog's tables live
+on S3/MinIO/ADLS, set `MINIO_*`/`ADLS_*` env vars the normal way *in
+addition to* `ICEBERG_REST_*` — the REST catalog hands back a storage
+location, and reading/writing that location still goes through this
+project's existing `TableLocation`-based connectors, same as everywhere
+else.
+
+**Implemented, not live-verified against a real REST catalog server** —
+no such server was available in this project's development environment
+to test the actual network round-trip against. The format-agnostic
+`Catalog`-based logic this feeds into (`IcebergTableFormat`/
+`IcebergTableWriter`'s `Catalog` constructors) is fully tested against a
+real `InMemoryCatalog` (a genuine Iceberg `Catalog` implementation, not a
+mock) — proving the actual read/write logic is correct for *any*
+catalog, `RESTCatalog` included, since they share one interface — same
+honesty standard this project already applies to native S3/ADLS
+("implemented, not yet verified against a real endpoint").
 
 ---
 
@@ -304,7 +362,9 @@ as exactly **one new Iceberg snapshot** per `DoPut` call (via the new
 `IcebergTableWriter`, reusing `iceberg-core`'s own `Table.newAppend()`,
 which already retries internally under a concurrent-writer conflict — no
 hand-built OCC loop needed here, unlike Delta's). The table must already
-exist; there's still no Iceberg CREATE TABLE support.
+exist; there's still no Iceberg CREATE TABLE support. `tableRoot`/`table`
+works as an `icebergrest://` reference too, same as reads — see
+[Iceberg via a REST catalog](#iceberg-via-a-rest-catalog) above.
 
 ### From Python (or any Flight-capable client, any language)
 
@@ -438,10 +498,17 @@ for (DataFileRef file : plan.getFilesToScan()) {
 
 `IcebergTableFormat` also has a `TableLocation`-based constructor
 (`new IcebergTableFormat(location)`) for the same local/remote dispatch
-`DeltaTableFormat` and everything else use. See
-[Delta vs. Iceberg](#delta-vs-iceberg) above for the real differences
-(read-only, `atVersion`'s `snapshotId` semantics, no file-stats pruning
-yet) — all three apply here too, not just to the CLI/Flight paths.
+`DeltaTableFormat` and everything else use, **and** a catalog-based one —
+`new IcebergTableFormat(catalog, identifier)`, taking any real Iceberg
+`Catalog` (`RESTCatalog`, `HadoopCatalog`, your own) and a
+`TableIdentifier` — for addressing a table by catalog registration
+instead of a path; see
+[Iceberg via a REST catalog](#iceberg-via-a-rest-catalog) above for the
+CLI/Flight-level `icebergrest://` convenience built on top of this same
+constructor. See [Delta vs. Iceberg](#delta-vs-iceberg) above for the
+real differences (append-only writes, `atVersion`'s `snapshotId`
+semantics, no file-stats pruning yet) — all apply here too, not just to
+the CLI/Flight paths.
 
 ### Writing
 
@@ -487,7 +554,11 @@ Same `appendBatch(VectorSchemaRoot, Map<String,String>)` shape as
 `iceberg-core`'s own `Table.newAppend().commit()` already retries
 internally under a concurrent-writer conflict (confirmed against its
 real bytecode), so there's nothing to hand-roll the way Delta's
-`CommitWriter` has to.
+`CommitWriter` has to. `IcebergTableWriter` also has the same
+catalog-based constructor as `IcebergTableFormat` —
+`new IcebergTableWriter(catalog, identifier)` — for appending to a
+catalog-registered table instead of a path-based one; see
+[Iceberg via a REST catalog](#iceberg-via-a-rest-catalog) above.
 
 ### Configuring a remote backend
 

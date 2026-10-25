@@ -68,7 +68,7 @@ system alone.
 | Module | Contains (today's package) | Depends on | Produces |
 |---|---|---|---|
 | `labukdb-core` | `log/`, `planner/`, `decode/`, `storage/`, `catalog/` (reused) + `encode/`, `execution/`, `format/`, `query/` (new) | — | embeddable library jar |
-| `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat` (reads) + `IcebergTableWriter` (append-only writes), delegating manifest/table loading and commit protocol to `iceberg-core:1.12.0`'s `HadoopTables`/`Table` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional for a pure core embedder; required by cli/flight) |
+| `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat` (reads) + `IcebergTableWriter` (append-only writes), path-based (`HadoopTables`) or catalog-based (`Catalog`/`TableIdentifier`, incl. `IcebergRestConfiguration`/`IcebergRestLocation` for `icebergrest://` REST-catalog references) | `labukdb-core`, `iceberg-core` | embeddable library jar (optional for a pure core embedder; required by cli/flight) |
 | `labukdb-flight` | `flight/` (adds `DoPut`, including Iceberg append) | `labukdb-core`, `labukdb-format-iceberg` (Iceberg query + write support) | library jar |
 | `labukdb-server-app` | `DeltaFlightServerApp` → `LabukDbServerApp` | `labukdb-core`, `labukdb-flight` | shaded standalone server jar |
 | `labukdb-cli` | `cli/` | `labukdb-core`, `labukdb-format-iceberg` (for Iceberg `--table`/`--sql` support) in-process — no Flight needed | shaded CLI executable |
@@ -468,6 +468,77 @@ real `DoPut`-then-`DoGet` round trip added to `FlightIcebergIntegrationTest`
 (replacing its now-obsolete rejection test, which asserted behavior this
 pass intentionally replaced).
 
+**Update — Iceberg REST catalog integration is now done, closing the
+second (and last) of the two blockers behind "Delta DB with an Iceberg
+reader" vs. a genuine cross-format engine.** Until now, Iceberg tables
+were only addressable path-based (`HadoopTables`) — the minority case in
+real deployments, where tables are almost always registered in a catalog
+service instead.
+
+**Real API findings that shaped this, confirmed before writing anything:**
+`RESTCatalog`/`HadoopCatalog`/`JdbcCatalog`/`InMemoryCatalog` are all
+already bundled in `iceberg-core:1.12.0` (`unzip -l`), and
+`httpclient5`/`httpcore5`/`httpcore5-h2` — the HTTP client `RESTCatalog`
+needs — are already transitively resolved on `labukdb-format-iceberg`'s
+classpath (`mvn dependency:tree`; `iceberg-core` declares `httpclient5`
+as a plain `runtime` dependency, not optional). **Zero new Maven
+dependency for REST catalog support.** `Catalog` (the interface
+`RESTCatalog`/`HadoopCatalog`/`InMemoryCatalog` all share) exposes
+exactly `loadTable(TableIdentifier)` — the one method a thin adapter
+needs. `TableIdentifier.parse(String)` already handles dotted
+multi-level namespace syntax natively. Real config keys confirmed via
+`javap -constants` on `CatalogProperties`/`OAuth2Properties`/
+`AuthProperties`: `uri`, `warehouse`, `rest.auth.type`, `token`,
+`credential`, `oauth2-server-uri`, `rest.auth.basic.username`/`password`.
+
+**A real footgun this design had to avoid:** `TableLocation.isRemoteUri`'s
+generic `scheme://` regex matches a new `icebergrest://` scheme too, so
+without an earlier, explicit interception, the existing code would hand
+it to Hadoop's `FileSystem` resolution and fail with a confusing "No
+FileSystem for scheme" error instead of routing it correctly. New
+`format/`-adjacent `IcebergRestLocation.isRestUri(raw)` (in
+`labukdb-format-iceberg`, since detecting a *catalog* reference isn't
+`core`'s concern the way detecting Delta-vs-Iceberg-by-directory-probe
+is) is checked *before* any `TableLocation` is constructed, in both
+`QueryCommand` and `DeltaFlightProducer`.
+
+**Addressing, deliberately not a single combined URI.** Matching
+Spark/Trino/DuckDB's own Iceberg REST support, and this project's
+existing `MinioConfiguration`/`AdlsConfiguration.fromEnvironment()`
+pattern: new `IcebergRestConfiguration` connects one REST catalog per
+process from `ICEBERG_REST_*` environment variables (v1 limitation,
+stated plainly — not a multi-catalog registry); the table reference
+itself is just `icebergrest://<namespace>.<table>`, parsed via the real
+`TableIdentifier.parse`. `IcebergTableFormat`/`IcebergTableWriter` each
+gained one additive `(Catalog, TableIdentifier)` constructor —
+`catalog.loadTable(identifier)` instead of `HadoopTables.load(path)`;
+everything downstream (`normalize`/`appendBatch`) is unchanged, since
+both already only operate on the resulting `Table`, not on how it was
+obtained — the same thin-adapter shape proven twice already this
+session. A new `TableLocation.fromStringWithEnvironmentConfig(String)`
+(core, additive, zero risk to existing callers) derives where a loaded
+table's data files actually live from its own reported `location()`,
+reusing the exact remote-config-merging logic `TableResolver`/
+`DeltaFlightProducer` already had, since a catalog-loaded table has no
+caller-supplied `TableLocation` to work from.
+
+**Testing honesty, stated up front rather than discovered at
+verification time:** no real or fake Iceberg REST catalog server exists
+in this development environment. The format-agnostic `Catalog`-based
+core (both new constructors) is fully tested against a real
+`InMemoryCatalog` — a genuine `iceberg-core`-bundled `Catalog`
+implementation, not a mock — proving the actual read/write logic correct
+for *any* catalog, `RESTCatalog` included, since they share one
+interface. `IcebergRestConfiguration`'s env-var → property-map mapping is
+unit-tested. The actual `RESTCatalog` network round-trip and the
+`icebergrest://` CLI/Flight routing are implemented and proven to *route
+correctly* (new tests assert the specific `ICEBERG_REST_URI`-required
+error a REST-catalog reference reaches, not some unrelated
+Delta/path-based error a misrouted request would produce instead) but
+not live-verified against a real server — same honesty standard this
+project already applies to native S3/ADLS ("implemented, not yet
+verified against a real endpoint").
+
 ## Build order
 
 Not all five new subsystems carry equal risk — ordered to get something
@@ -533,11 +604,15 @@ foundation under it is proven:
 13. ✅ **Iceberg writes (append-only).** Done, see above — new
     `IcebergTableWriter`, reachable via `DoPut` and the embedded library.
     No Iceberg CREATE TABLE, merge/upsert, compaction, or vacuum yet; no
-    CLI write subcommands for either format. Iceberg catalog-service
-    integration (REST/Hive/Glue, vs. today's path-only `HadoopTables`)
-    remains a separate, deliberately later follow-up — it needs a new
-    addressing model alongside `TableLocation`, not just a different
-    loader.
+    CLI write subcommands for either format.
+14. ✅ **Iceberg REST catalog integration.** Done, see above — new
+    `IcebergRestConfiguration`/`IcebergRestLocation`, `icebergrest://`
+    table references reachable via `--table`/`--sql`/Flight (reads and
+    `DoPut` writes), plus `(Catalog, TableIdentifier)` constructors on
+    `IcebergTableFormat`/`IcebergTableWriter` usable directly as a
+    library for *any* `Catalog` implementation, not just REST. Hive
+    Metastore/Glue/Nessie remain unbuilt; implemented but not
+    live-verified against a real REST server (see above for why).
 
 **Known, pre-existing flaky test — not caused by the work above, root
 cause still genuinely open.** `labukdb-flight`'s `FlightIntegrationTest`

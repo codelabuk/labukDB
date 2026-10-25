@@ -8,6 +8,8 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.hadoop.HadoopTables;
 
 import java.io.IOException;
@@ -49,6 +51,23 @@ public final class IcebergTableWriter {
         this.tableLocation = location;
         Configuration conf = location.isRemote() ? location.hadoopConf() : new Configuration();
         this.table = new HadoopTables(conf).load(location.raw());
+    }
+
+    /**
+     * Catalog-service-based constructor — REST, Hive Metastore, Glue,
+     * Nessie, or any other {@link Catalog} implementation. The catalog
+     * only resolves *which table*; actually writing its data files still
+     * goes through this project's existing {@code TableLocation}/Hadoop
+     * {@code FileSystem}-based connectors, derived here from the loaded
+     * table's own {@link Table#location()} via {@link
+     * TableLocation#fromStringWithEnvironmentConfig} — so a remote
+     * table's underlying storage (S3/MinIO/ADLS) still needs its own
+     * connector env vars set (same as everywhere else in this project),
+     * in addition to the catalog's own connection config.
+     */
+    public IcebergTableWriter(Catalog catalog, TableIdentifier identifier) {
+        this.table = catalog.loadTable(identifier);
+        this.tableLocation = TableLocation.fromStringWithEnvironmentConfig(table.location());
     }
 
     /**

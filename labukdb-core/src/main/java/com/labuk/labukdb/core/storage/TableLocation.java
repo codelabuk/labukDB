@@ -65,6 +65,25 @@ public final class TableLocation {
         return location != null && URI_SCHEME.matcher(location).matches();
     }
 
+    /**
+     * Like {@link #fromString(String)}, but a remote location picks up
+     * MinIO/ADLS connector config from the environment (the same
+     * convenience {@code TableResolver}/{@code DeltaFlightProducer}
+     * already give CLI/Flight users) instead of a bare default {@link
+     * Configuration}. Useful when a caller has a raw location string
+     * with no separately-supplied {@code Configuration} to merge in —
+     * e.g. a location read back from an already-loaded Iceberg {@code
+     * Table}'s own {@code location()}, not typed by a user directly.
+     */
+    public static TableLocation fromStringWithEnvironmentConfig(String location) {
+        if (!isRemoteUri(location)) {
+            return fromString(location);
+        }
+        Configuration conf = AdlsConfiguration.fromEnvironment();
+        MinioConfiguration.fromEnvironment().iterator().forEachRemaining(entry -> conf.set(entry.getKey(), entry.getValue()));
+        return forRemote(location, conf);
+    }
+
     public boolean isRemote() {
         return remote;
     }

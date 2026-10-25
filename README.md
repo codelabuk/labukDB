@@ -405,6 +405,7 @@ location uses a remote URI scheme (`TableResolver` and
 | MinIO | `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | `s3a://bucket/table` |
 | S3 (real AWS) | *(none specific to this project)* — falls back to Hadoop's default AWS credential chain (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, `~/.aws/credentials`, or an IAM role) when no `MINIO_*` vars are set | `s3a://bucket/table` |
 | ADLS Gen2 | `ADLS_STORAGE_ACCOUNT`, `ADLS_AUTH_TYPE` (`SharedKey` or `OAuth`), then `ADLS_ACCOUNT_KEY` **or** `ADLS_TENANT_ID`/`ADLS_CLIENT_ID`/`ADLS_CLIENT_SECRET` | `abfss://container@account.dfs.core.windows.net/table` |
+| Iceberg REST catalog | `ICEBERG_REST_URI` (required), `ICEBERG_REST_WAREHOUSE`, `ICEBERG_REST_AUTH_TYPE`/`_TOKEN`/`_CREDENTIAL`/etc. — see [USAGE.md](USAGE.md#iceberg-via-a-rest-catalog) for the full list | `icebergrest://namespace.table` |
 
 ```
 export MINIO_ENDPOINT=https://your-minio-host
@@ -611,8 +612,9 @@ dependencies:
 ### Multi-format
 | Item | Notes |
 |---|---|
-| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — path-based, local and remote (live-MinIO-verified), tested against a self-built fixture rather than a Spark/Trino-written table. Reachable via `--table`/`--sql`/Flight now too (auto-detected by probing for `_delta_log/` vs. `metadata/`), not just as a library call — see [USAGE.md](USAGE.md#delta-vs-iceberg) |
+| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — path-based and REST-catalog-based, local and remote (live-MinIO-verified for path-based), tested against a self-built fixture rather than a Spark/Trino-written table. Reachable via `--table`/`--sql`/Flight now too (auto-detected: `_delta_log/`/`metadata/` probing, or an `icebergrest://` reference), not just as a library call — see [USAGE.md](USAGE.md#delta-vs-iceberg) |
 | Iceberg write support | ✅ Append only (`IcebergTableWriter`, `DoPut` + embedded library) — no CREATE TABLE, merge/upsert, compaction, or vacuum. `iceberg-core`'s own commit protocol handles OCC retry internally, unlike Delta's hand-built one |
+| Iceberg catalog-service integration | ✅ REST catalog done (`IcebergRestConfiguration`, `icebergrest://` references) — `RESTCatalog` and its HTTP client (`httpclient5`) are already bundled/transitively resolved via `iceberg-core`, zero new dependency needed. **Implemented, not live-verified** — no real REST catalog server was available to test the network round-trip against; the format-agnostic `Catalog`-based read/write logic it feeds into is fully tested against a real `InMemoryCatalog` instead. Hive Metastore/Glue/Nessie remain unbuilt |
 | `TableFormat` wired into `cli`/`flight` | ✅ Done for Iceberg's query path specifically (`DetectedFormat` + `QueryPlanner.planNormalized`) — Delta's own query path still bypasses it (`SnapshotManager`/`QueryPlanner.plan`/`ScanPlan`/`AddFile`, deliberately left unchanged; `Snapshot` is built from real commit-log actions in a way nothing can fake for Iceberg, so this was a genuine second path, not a shared-everything refactor) |
 | Parquet-only tables (no transaction log) | Direct file listing with stats, no commit log |
 

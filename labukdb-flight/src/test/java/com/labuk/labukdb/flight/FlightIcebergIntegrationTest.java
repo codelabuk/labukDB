@@ -7,6 +7,7 @@ import org.apache.arrow.flight.FlightClient;
 import org.apache.arrow.flight.FlightDescriptor;
 import org.apache.arrow.flight.FlightEndpoint;
 import org.apache.arrow.flight.FlightInfo;
+import org.apache.arrow.flight.FlightRuntimeException;
 import org.apache.arrow.flight.FlightServer;
 import org.apache.arrow.flight.FlightStream;
 import org.apache.arrow.flight.Location;
@@ -228,5 +229,43 @@ class FlightIcebergIntegrationTest {
         }
         assertEquals(11, totalRows, "10 original rows + 1 newly appended row via DoPut");
         assertTrue(sawNewRow, "the newly appended row must be readable through the existing, unmodified read path");
+    }
+
+    @Test
+    void icebergRestReference_getFlightInfo_routesToRestPath_notDeltaOrPathBasedIceberg() {
+        // No real REST catalog server is available in this environment (see
+        // IcebergRestConfiguration's javadoc). Proves ROUTING is correct --
+        // an icebergrest:// tableRoot reaches IcebergRestConfiguration, not
+        // DetectedFormat/SnapshotManager -- by asserting the specific
+        // REST-connection-stage error, not some unrelated one a misrouted
+        // request would produce instead.
+        assertNull(System.getenv("ICEBERG_REST_URI"), "test assumes ICEBERG_REST_URI isn't set in this environment");
+        String queryJson = "{\"tableRoot\":\"icebergrest://analytics.logs\"}";
+        FlightRuntimeException thrown = assertThrows(FlightRuntimeException.class,
+                () -> client.getInfo(FlightDescriptor.command(queryJson.getBytes(StandardCharsets.UTF_8))));
+        assertTrue(thrown.getMessage().contains("ICEBERG_REST_URI"), thrown.getMessage());
+    }
+
+    @Test
+    void icebergRestReference_doPut_routesToRestPath_notDeltaOrPathBasedIceberg() {
+        assertNull(System.getenv("ICEBERG_REST_URI"), "test assumes ICEBERG_REST_URI isn't set in this environment");
+        FlightDescriptor descriptor = FlightDescriptor.command(
+                "{\"tableRoot\":\"icebergrest://analytics.logs\",\"partitionValues\":{\"level\":\"ERROR\"}}"
+                        .getBytes(StandardCharsets.UTF_8));
+
+        Field amountField = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        try (VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(amountField)), allocator);
+             SyncPutListener putListener = new SyncPutListener()) {
+            batch.allocateNew();
+            ((BigIntVector) batch.getVector("amount")).setSafe(0, 1L);
+            batch.setRowCount(1);
+
+            var putStream = client.startPut(descriptor, batch, putListener);
+            putStream.putNext();
+            putStream.completed();
+
+            FlightRuntimeException thrown = assertThrows(FlightRuntimeException.class, putListener::getResult);
+            assertTrue(thrown.getMessage().contains("ICEBERG_REST_URI"), thrown.getMessage());
+        }
     }
 }
