@@ -18,8 +18,9 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * <b>Same supported-type set {@link ArrowToParquetWriter} already has</b> —
  * deliberately, since a column this can't express in {@code schemaString}
  * couldn't be written by {@code ArrowToParquetWriter} either: Int32,
- * Int64, Float, Double, Bool, Utf8, Timestamp. Anything else throws
- * rather than silently guessing a Delta type name.
+ * Int64, Float, Double, Bool, Utf8, Timestamp, Decimal (Delta's own
+ * {@code "decimal(p,s)"} type-string form). Anything else throws rather
+ * than silently guessing a Delta type name.
  */
 public final class ArrowToDeltaSchema {
 
@@ -72,6 +73,10 @@ public final class ArrowToDeltaSchema {
         }
         if (type instanceof ArrowType.Timestamp) {
             return "timestamp";
+        }
+        if (type instanceof ArrowType.Decimal decimalType) {
+            // Delta's own type-string form, e.g. "decimal(10,2)".
+            return "decimal(" + decimalType.getPrecision() + "," + decimalType.getScale() + ")";
         }
         throw unsupported(field, type);
     }

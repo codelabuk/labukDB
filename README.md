@@ -448,9 +448,14 @@ convenience the CLI uses inside your own application.
 
 **Type support (`decode/`/`encode/`):** INT32, INT64, FLOAT, DOUBLE,
 BOOLEAN, BINARY/UTF-8, timestamp (INT96 legacy on read via
-`Int96TimestampCodec`, a modern `TIMESTAMP` logical type on write), and
-`LIST<float/double/int/long/string>` for flat vector/array columns (read
-only). Not yet supported: DECIMAL, nested `LIST<LIST<...>>`, MAP, STRUCT.
+`Int96TimestampCodec`, a modern `TIMESTAMP` logical type on write),
+DECIMAL (Decimal128 only, precision ≤38; `Decimal256` is rejected with a
+clear error, not silently truncated — read side handles any of Parquet's
+four physical encodings (INT32/INT64/FIXED_LEN_BYTE_ARRAY/BINARY), write
+side always emits a constant 16-byte `FIXED_LEN_BYTE_ARRAY` regardless of
+precision, see `DecimalCodec`), and `LIST<float/double/int/long/string>`
+for flat vector/array columns (read only). Not yet supported: nested
+`LIST<LIST<...>>`, MAP, STRUCT.
 
 **Pruning:** `LIKE` filters correctly but don't get range-based pruning at
 the file/row-group level yet — correctness isn't affected, since the

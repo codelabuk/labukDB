@@ -17,6 +17,7 @@ import org.apache.parquet.io.ColumnIOFactory;
 import org.apache.parquet.io.InputFile;
 import org.apache.parquet.io.MessageColumnIO;
 import org.apache.parquet.io.RecordReader;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.Type;
@@ -185,9 +186,14 @@ public final class ParquetToArrowReader {
                         appenders.add((row, destIndex) ->
                                 NestedTypeDecoder.appendList(row, capturedColumn, capturedType, listVector, destIndex));
                     } else {
-                        PrimitiveType.PrimitiveTypeName typeName =
-                                parquetType.asPrimitiveType().getPrimitiveTypeName();
-                        appenders.add(new RowAppender(column, typeName, vector));
+                        PrimitiveType primitiveType = parquetType.asPrimitiveType();
+                        PrimitiveType.PrimitiveTypeName typeName = primitiveType.getPrimitiveTypeName();
+                        Integer decimalScale = null;
+                        if (primitiveType.getLogicalTypeAnnotation()
+                                instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation decimalType) {
+                            decimalScale = decimalType.getScale();
+                        }
+                        appenders.add(new RowAppender(column, typeName, vector, decimalScale));
                     }
                 } else {
                     appenders.add(new PartitionValueAppender((VarCharVector) vector, partitionValues.get(column)));

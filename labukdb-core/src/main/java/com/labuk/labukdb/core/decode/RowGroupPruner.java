@@ -6,6 +6,8 @@ import org.apache.parquet.column.statistics.Statistics;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
+import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 import java.util.List;
@@ -64,8 +66,8 @@ final class RowGroupPruner {
             if (stats == null || stats.isEmpty()) {
                 return true;
             }
-            Object min = toJavaValue(stats.genericGetMin(), column.getPrimitiveType().getPrimitiveTypeName());
-            Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType().getPrimitiveTypeName());
+            Object min = toJavaValue(stats.genericGetMin(), column.getPrimitiveType());
+            Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType());
             return PredicateEvaluation.mightMatchRange(min, max, cmp.op, cmp.literal);
         }
         if (predicate instanceof Predicate.In in) {
@@ -77,8 +79,8 @@ final class RowGroupPruner {
             if (stats == null || stats.isEmpty()) {
                 return true;
             }
-            Object min = toJavaValue(stats.genericGetMin(), column.getPrimitiveType().getPrimitiveTypeName());
-            Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType().getPrimitiveTypeName());
+            Object min = toJavaValue(stats.genericGetMin(), column.getPrimitiveType());
+            Object max = toJavaValue(stats.genericGetMax(), column.getPrimitiveType());
             return PredicateEvaluation.mightMatchRangeIn(min, max, in.literals);
         }
         if (predicate instanceof Predicate.Like) {
@@ -96,7 +98,7 @@ final class RowGroupPruner {
         return null;
     }
 
-    private static Object toJavaValue(Object statValue, PrimitiveTypeName typeName) {
+    private static Object toJavaValue(Object statValue, PrimitiveType primitiveType) {
         // Parquet's Binary stat type needs explicit handling to line up
         // with what a predicate would compare against: UTF-8 decode for a
         // real string column, but the INT96 timestamp codec for a
@@ -105,8 +107,27 @@ final class RowGroupPruner {
         // tells them apart. Every other stat type (Integer, Long, Float,
         // Double, Boolean) is already a plain Comparable PredicateEvaluation
         // understands.
+        //
+        // Decimal stats need the same disambiguation, a level deeper: an
+        // INT32/INT64-backed decimal's stat arrives as a plain Integer/Long
+        // here, but it's the *unscaled* value (e.g. 1050 meaning 10.50 at
+        // scale 2) -- comparing it directly against a query's real literal
+        // without rescaling would be wrong, not just unoptimized. Checked
+        // first, before the Binary/INT96 disambiguation above, since a
+        // decimal stat can arrive as either shape.
+        if (primitiveType.getLogicalTypeAnnotation()
+                instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation decimalType) {
+            int scale = decimalType.getScale();
+            if (statValue instanceof Binary binary) {
+                return DecimalCodec.fromBytes(binary.getBytes(), scale);
+            }
+            if (statValue instanceof Number n) {
+                return DecimalCodec.fromUnscaledLong(n.longValue(), scale);
+            }
+            return statValue; // shouldn't happen; pass through rather than guess
+        }
         if (statValue instanceof Binary binary) {
-            if (typeName == PrimitiveTypeName.INT96) {
+            if (primitiveType.getPrimitiveTypeName() == PrimitiveTypeName.INT96) {
                 return Int96TimestampCodec.toInstant(binary);
             }
             return binary.toStringUsingUTF8();

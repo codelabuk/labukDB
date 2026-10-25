@@ -6,9 +6,10 @@ import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
 import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
-import org.apache.parquet.schema.Type;
 import org.apache.parquet.schema.Type;
 
 import java.util.ArrayList;
@@ -27,9 +28,12 @@ import java.util.Set;
  *
  * <b>Scope, stated plainly, for physical columns:</b> flat primitives only
  * - INT32, INT64, FLOAT, DOUBLE, BOOLEAN, INT96 (legacy timestamp - see
- * {@link Int96TimestampCodec}), and BINARY (treated as UTF-8 string).
- * Not yet supported: DECIMAL, and any nested/repeated (LIST, MAP, GROUP)
- * structure.
+ * {@link Int96TimestampCodec}), BINARY (treated as UTF-8 string unless
+ * decimal-annotated - see below), and DECIMAL (any of its four legal
+ * physical encodings - INT32/INT64/FIXED_LEN_BYTE_ARRAY/BINARY - see
+ * {@link DecimalCodec}; Decimal128 only, precision ≤38).
+ * Not yet supported: nested/repeated (MAP, STRUCT) structure beyond
+ * {@code LIST<primitive>} (see {@link NestedTypeDecoder}).
  */
 final class ArrowSchemaMapper {
 
@@ -47,8 +51,7 @@ final class ArrowSchemaMapper {
             if (containsField(parquetSchema, column)) {
                 Type parquetType = parquetSchema.getType(column);
                 if (parquetType.isPrimitive()) {
-                    PrimitiveTypeName typeName = parquetType.asPrimitiveType().getPrimitiveTypeName();
-                    fields.add(new Field(column, FieldType.nullable(toArrowType(typeName, column)), null));
+                    fields.add(new Field(column, FieldType.nullable(toArrowType(parquetType.asPrimitiveType(), column)), null));
                 } else if (NestedTypeDecoder.isSupported(parquetType)) {
                     // Nested type (LIST<float> etc.) — delegate to NestedTypeDecoder
                     // for the Arrow field definition so the schema matches
@@ -78,7 +81,16 @@ final class ArrowSchemaMapper {
         return false;
     }
 
-    static ArrowType toArrowType(PrimitiveTypeName typeName, String column) {
+    static ArrowType toArrowType(PrimitiveType primitiveType, String column) {
+        if (primitiveType.getLogicalTypeAnnotation() instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation decimalType) {
+            // Decimal can legally be physically INT32/INT64/FIXED_LEN_BYTE_ARRAY/
+            // BINARY -- checked here, before the physical-type switch below,
+            // since those physical types already have other meanings there
+            // (plain int/long/string) and FIXED_LEN_BYTE_ARRAY has no case at
+            // all otherwise. See DecimalCodec for the four-way decode.
+            return DecimalCodec.toArrowType(decimalType.getPrecision(), decimalType.getScale());
+        }
+        PrimitiveTypeName typeName = primitiveType.getPrimitiveTypeName();
         switch (typeName) {
             case INT32:
                 return new ArrowType.Int(32, true);

@@ -539,6 +539,71 @@ not live-verified against a real server — same honesty standard this
 project already applies to native S3/ADLS ("implemented, not yet
 verified against a real endpoint").
 
+**Update — DECIMAL type support is now done, in the shared `decode/`/
+`encode/` codec both Delta and Iceberg already go through unchanged (not
+a per-format change).** Chosen as the first of three remaining follow-up
+items (checkpoint verification against real Spark output and a
+remote+Iceberg OCC stress test are separate, later, infrastructure-
+dependent passes) since it's self-contained and DECIMAL — money/prices —
+is the single most common real-world type gap.
+
+**Scope, stated plainly: Decimal128 only, precision ≤38.** `Decimal256`
+(precision up to 76) is rejected with a clear error by the new
+`decode/DecimalCodec`, not silently truncated or mishandled. Nested
+`LIST<decimal>` and MAP/STRUCT remain separate, unstarted follow-ups.
+
+**Four independent dispatch points needed a decimal check, confirmed via
+direct reads — no single chokepoint exists (the same shape as the
+existing INT96 precedent, which also touches four files):**
+`ArrowSchemaMapper.toArrowType` (schema; signature widened from
+`PrimitiveTypeName` to the full `PrimitiveType` since it's its own only
+caller), `RowAppender.append` (value decode), `GroupPredicateEvaluator
+.readValue` (residual-filter value), and `RowGroupPruner.toJavaValue`
+(row-group min/max stats). Decimal is physically INT32, INT64,
+FIXED_LEN_BYTE_ARRAY, or BINARY — all four already meant something else
+in the existing per-dispatch-point switches — so every site needed an
+early decimal check *before* its existing switch, not a new case folded
+into it.
+
+**A real pre-existing bug found during research, fixed as part of this:**
+`RowGroupPruner.toJavaValue` had no decimal handling at all — an
+INT32/INT64-backed decimal stat would have passed through as the raw
+*unscaled* integer (e.g. unscaled `1050` compared directly against a
+query literal, instead of the `10.50` it actually means at scale 2), and
+a FIXED_LEN_BYTE_ARRAY/BINARY-backed one would have been mis-decoded as a
+UTF-8 string. Both are fixed; proven by a dedicated
+`ParquetToArrowReaderDecimalTest` case that asserts row-group pruning
+makes the correct keep/skip decision against real decimal stats.
+
+**Write narrow, read broad — the same split `Int96TimestampCodec`
+established for legacy-vs-modern timestamps.** This project's own writer
+(`ArrowToParquetWriter`) always encodes a decimal as a constant 16-byte
+`FIXED_LEN_BYTE_ARRAY` regardless of actual precision — one simple
+encoding path, not the minimal-bytes-for-precision optimization real
+writers like Spark use. The read side isn't limited to that convention:
+`DecimalCodec.fromBytes`/`fromUnscaledLong` between them decode a decimal
+column backed by *any* of Parquet's four legal physical representations,
+proven against a hand-built, non-this-project-written fixture (one column
+per physical type) in `ParquetToArrowReaderDecimalTest`, not just a
+round-trip of this project's own narrow write convention.
+
+`PredicateEvaluation.coerce` needed **no changes** — confirmed by reading
+the real coercion logic, not assumed — since it already coerces any
+`Number` (`BigDecimal` included) into a `Double` when the predicate
+literal is a `Double`, which is what `SqlQueryTranslator`/`PredicateCodec`
+already produce for decimal-looking literals.
+
+Verified with `DecimalCodecTest` (pure unit: round-trip encode/decode,
+the >38-precision rejection, the scale-mismatch rejection),
+`ParquetToArrowReaderDecimalTest` (real-world interop across all four
+physical encodings, a residual-filter predicate, and the row-group-
+pruning bug fix), and `ArrowToParquetWriterTest` (`encode/`'s first test
+file: write + full write-then-read round trip, null handling, and the
+>38-precision rejection at schema-build time). Full `labukdb-core` suite
+re-run clean: 161/161 passing (146 pre-existing + 15 new), 0
+failures/errors, 5 skipped — unchanged from baseline, confirming zero
+regression.
+
 ## Build order
 
 Not all five new subsystems carry equal risk — ordered to get something

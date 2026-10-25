@@ -3,7 +3,9 @@ package com.labuk.labukdb.core.decode;
 import com.labuk.labukdb.core.planner.Predicate;
 import com.labuk.labukdb.core.planner.PredicateEvaluation;
 import org.apache.parquet.example.data.Group;
+import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 
 /**
@@ -80,7 +82,20 @@ final class GroupPredicateEvaluator {
         if (row.getFieldRepetitionCount(column) == 0) {
             return null;
         }
-        PrimitiveTypeName typeName = schema.getType(column).asPrimitiveType().getPrimitiveTypeName();
+        PrimitiveType primitiveType = schema.getType(column).asPrimitiveType();
+        if (primitiveType.getLogicalTypeAnnotation()
+                instanceof LogicalTypeAnnotation.DecimalLogicalTypeAnnotation decimalType) {
+            int scale = decimalType.getScale();
+            return switch (primitiveType.getPrimitiveTypeName()) {
+                case INT32 -> DecimalCodec.fromUnscaledLong(row.getInteger(column, 0), scale);
+                case INT64 -> DecimalCodec.fromUnscaledLong(row.getLong(column, 0), scale);
+                case FIXED_LEN_BYTE_ARRAY, BINARY -> DecimalCodec.fromBytes(row.getBinary(column, 0).getBytes(), scale);
+                default -> throw new IllegalStateException(
+                        "Decimal-annotated column '" + column + "' has unexpected physical type: "
+                                + primitiveType.getPrimitiveTypeName());
+            };
+        }
+        PrimitiveTypeName typeName = primitiveType.getPrimitiveTypeName();
         switch (typeName) {
             case INT32:
                 return (long) row.getInteger(column, 0); // widened so it lines up with Long-typed literals
