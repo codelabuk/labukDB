@@ -2,6 +2,7 @@ package com.labuk.labukdb.core.planner;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.labuk.labukdb.core.format.DataFileRef;
 import com.labuk.labukdb.core.log.action.AddFile;
 
 import java.util.Collection;
@@ -37,13 +38,35 @@ public final class FileStatsPruner {
                 .collect(Collectors.toList());
     }
 
+    /** {@link #prune}'s format-agnostic counterpart, same stats-JSON logic, for {@link DataFileRef}. */
+    public static List<DataFileRef> pruneNormalized(Predicate predicate, Collection<DataFileRef> files) {
+        if (predicate == null) {
+            return List.copyOf(files);
+        }
+        return files.stream()
+                .filter(f -> mightMatch(predicate, f.getStats()))
+                .collect(Collectors.toList());
+    }
+
     static boolean mightMatch(Predicate predicate, AddFile file) {
-        if (file.getStats() == null) {
+        return mightMatch(predicate, file.getStats());
+    }
+
+    /**
+     * Shared core both {@link #mightMatch(Predicate, AddFile)} and {@link
+     * #pruneNormalized} delegate to — a nullable Delta-shaped stats JSON
+     * string either way ({@code DataFileRef.getStats()} is {@code null}
+     * for Iceberg files today, since Iceberg's own column stats aren't in
+     * this shape; that just means "fail open," same as a Delta file with
+     * no stats, not a correctness issue).
+     */
+    static boolean mightMatch(Predicate predicate, String statsJson) {
+        if (statsJson == null) {
             return true;
         }
         JsonNode stats;
         try {
-            stats = MAPPER.readTree(file.getStats());
+            stats = MAPPER.readTree(statsJson);
         } catch (Exception e) {
             return true; // malformed stats — fail open, don't let a parse hiccup drop data
         }

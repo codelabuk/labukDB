@@ -18,6 +18,36 @@ these four modes actually work, and
 [docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
 what's built vs. still planned.
 
+### Delta vs. Iceberg
+
+Modes 1–3 (CLI flags, CLI SQL, Flight) all auto-detect which table format
+a location holds — probing for a `_delta_log/` directory (Delta) or a
+`metadata/` directory (Iceberg) — so the same `--table`/`FROM`/
+`FlightQueryRequest` works against either without saying which one it is.
+A few real differences to know about:
+
+- **Iceberg is read-only.** There's no write support for it at all —
+  `DoPut` against a detected-Iceberg location is rejected with a clear
+  error before touching anything, and no CLI/library write path exists
+  for it either.
+- **`--version`/`version` means something different per format.** For
+  Delta it's a small sequential commit version; for Iceberg it's a real,
+  non-sequential `snapshotId` (a large pseudo-random long) — see
+  `IcebergTableFormat`'s javadoc. Pointing `--version 5` at an Iceberg
+  table almost certainly won't mean what it means for Delta.
+- **Iceberg queries always run in combine mode.** Even a plain `SELECT`
+  with no `GROUP BY`/`ORDER BY`/`LIMIT` decodes and combines every
+  surviving file through the same executor combine-mode queries use,
+  rather than streaming per file the way Delta's plain scans do — a
+  deliberate v1 simplification so Iceberg doesn't need its own parallel
+  per-file-streaming implementation. Correctness isn't affected; very
+  large Iceberg result sets just won't stream incrementally yet.
+- **File-stats pruning doesn't apply to Iceberg files yet** (only
+  partition-value pruning does) — Iceberg's own column-level stats
+  aren't mapped into the shape the pruner reads today. Files are kept
+  rather than wrongly skipped, so this is a missed optimization, not a
+  correctness gap.
+
 ---
 
 ## Building
@@ -368,6 +398,39 @@ overloads (`SnapshotManager.forLocation(...)`) for S3/MinIO/ADLS tables —
 see [Configuring a remote backend](#configuring-a-remote-backend) below,
 and `labukdb-core/src/main/java/com/labuk/labukdb/core/tools/RealTableSmokeCheck.java`
 for a second, runnable end-to-end example.
+
+**Reading an Iceberg table** looks the same, swapping `SnapshotManager`/
+`QueryPlanner.plan`/`ScanPlan`/`AddFile` for `IcebergTableFormat`/
+`QueryPlanner.planNormalized`/`NormalizedScanPlan`/`DataFileRef` — the
+`labukdb-format-iceberg` module, a separate dependency (`iceberg-core`
+isn't pulled in unless you ask for it):
+
+```java
+import com.labuk.labukdb.core.format.DataFileRef;
+import com.labuk.labukdb.core.format.NormalizedSnapshot;
+import com.labuk.labukdb.core.planner.NormalizedScanPlan;
+import com.labuk.labukdb.iceberg.IcebergTableFormat;
+import org.apache.hadoop.conf.Configuration;
+
+IcebergTableFormat tableFormat = new IcebergTableFormat(tableRoot.toString(), new Configuration());
+NormalizedSnapshot snapshot = tableFormat.latest();   // or atVersion(snapshotId) / atTimestamp(instant)
+
+Predicate filter = Predicate.compare("level", ComparisonOp.EQ, "ERROR");
+NormalizedScanPlan plan = new QueryPlanner().planNormalized(snapshot, filter, List.of("service", "message"));
+
+for (DataFileRef file : plan.getFilesToScan()) {
+    Predicate residual = PartitionValueSubstituter.simplify(
+            plan.getResidualPredicate(), file.getPartitionValues());
+    // same ParquetToArrowReader.read(...) call as the Delta example above
+}
+```
+
+`IcebergTableFormat` also has a `TableLocation`-based constructor
+(`new IcebergTableFormat(location)`) for the same local/remote dispatch
+`DeltaTableFormat` and everything else use. See
+[Delta vs. Iceberg](#delta-vs-iceberg) above for the real differences
+(read-only, `atVersion`'s `snapshotId` semantics, no file-stats pruning
+yet) — all three apply here too, not just to the CLI/Flight paths.
 
 ### Writing
 

@@ -22,6 +22,7 @@ import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -148,13 +149,18 @@ class QueryCommandSqlIntegrationTest {
                 "SELECT amount FROM logs ORDER BY amount DESC LIMIT 3"});
 
         String output = capturedOut.toString(StandardCharsets.UTF_8);
-        int idxHeader = output.indexOf("amount");
-        int idx104 = output.indexOf("104");
-        int idx103 = output.indexOf("103");
-        int idx102 = output.indexOf("102");
-        assertTrue(idxHeader >= 0 && idx104 > idxHeader && idx103 > idx104 && idx102 > idx103,
+        // Data rows only, after the "amount\n---..." header -- a plain
+        // output.indexOf("104") search is fragile here: @TempDir's own
+        // randomly-generated numeric directory name can coincidentally
+        // contain "104"/"103"/"102" as a substring earlier in the output
+        // than the real data (observed in practice, not hypothetical).
+        List<String> dataLines = output.lines()
+                .dropWhile(line -> !line.startsWith("---"))
+                .skip(1)
+                .takeWhile(line -> !line.isBlank())
+                .toList();
+        assertEquals(List.of("104", "103", "102"), dataLines,
                 "must list the true global top-3 (104, 103, 102), not a per-file-local one: " + output);
-        assertFalse(output.contains("\n5 "), "row with amount=5 (ERROR's max) must not appear in the global top-3: " + output);
         assertTrue(output.contains("3 row(s)"), output);
     }
 

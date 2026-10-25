@@ -61,6 +61,11 @@
         <artifactId>labukdb-flight</artifactId>
         <version>${project.version}</version>
       </dependency>
+      <dependency>
+        <groupId>com.labuk</groupId>
+        <artifactId>labukdb-format-iceberg</artifactId>
+        <version>${project.version}</version>
+      </dependency>
 
       <dependency>
         <groupId>com.fasterxml.jackson.core</groupId>

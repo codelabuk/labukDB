@@ -80,10 +80,21 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [AdlsConfiguration]  as AC
   }
 
-  package "format/ — TableFormat SPI (built, additive-only --\nnot yet wired into planner/flight/cli)" #D9F2C4 {
+  package "format/ — TableFormat SPI (wired into cli/flight\nfor Iceberg's query path; Delta's own\npath still bypasses it, see note)" #D9F2C4 {
     [TableFormat\n(interface: snapshot → schema +\npartitionSpec + List<DataFileRef>)] as TF #D9F2C4
-    [DeltaTableFormat\n(wraps log/ below)] as DTF #D9F2C4
+    [DeltaTableFormat\n(wraps log/ below --\nunused by cli/flight today)] as DTF #D9F2C4
+    [DetectedFormat\n(probes _delta_log/ vs metadata/\nto pick Delta or Iceberg per table)] as DF #D9F2C4
   }
+
+  note bottom of DF
+    cli/flight call this first for every
+    query; core can't construct
+    IcebergTableFormat itself
+    (labukdb-format-iceberg depends on
+    core, not the reverse) -- so
+    detection lives here, construction
+    lives in cli/flight.
+  end note
 
   package "log/ — commit log + write path (reused + new in v2)" #EEEDFE {
     [CommitLogReader] as CLR
@@ -120,12 +131,13 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     end note
   }
 
-  package "planner/ — pruning (reused, format-agnostic)" #EEEDFE {
+  package "planner/ — pruning (reused Delta path unchanged;\nplanNormalized/NormalizedScanPlan new,\nfor TableFormat/DataFileRef)" #EEEDFE {
     [PartitionPruner] as PP
     [FileStatsPruner] as FSP
-    [QueryPlanner] as QP
+    [QueryPlanner\n(plan() unchanged; new\nplanNormalized() alongside it)] as QP
     [PartitionValueSubstituter] as PVS
     [PredicateColumns] as PC
+    [NormalizedScanPlan\n(ScanPlan's DataFileRef-based\ncounterpart)] as NSP #D9F2C4
   }
 
   package "decode/ — Parquet → Arrow (reused)" #EEEDFE {
@@ -173,18 +185,18 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
   end note
 
   package "catalog/ — name → location (reused)" #EEEDFE {
-    [TableCatalog\n(name → location + format,\n~/.labukdb/catalog.json)] as CAT
+    [TableCatalog\n(name → location only -- format is\ndetected lazily via DetectedFormat,\nnot stored here; ~/.labukdb/catalog.json)] as CAT
   }
 }
 
-' ─── optional format module ──────────────────────────────
-package "labukdb-format-iceberg  (optional — pulls in iceberg-core)" #D9F2C4 {
+' ─── format module, optional only for a pure core embedder ──
+package "labukdb-format-iceberg  (optional for core embedders;\nrequired by cli/flight below)" #D9F2C4 {
   [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core — READ-ONLY,\nno Iceberg write support yet)] as ITF #D9F2C4
 }
 
 ' ─── labukdb-flight ───────────────────────────────────────
-package "labukdb-flight  (depends on core [+ format-iceberg])" #EEEDFE {
-  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files)] as DFP
+package "labukdb-flight  (depends on core, format-iceberg)" #EEEDFE {
+  [DeltaFlightProducer\nGetFlightInfo · DoGet · DoPut\nGetSchema · ListFlights\n(local + remote s3a://abfss://\nreads AND writes live-MinIO-\nverified; combine-mode DoGet for\nGROUP BY/ORDER BY/LIMIT, single\nendpoint across all surviving files;\nDoPut rejects a detected-Iceberg\nlocation -- no write support for it)] as DFP
   [TicketRegistry] as TR
 }
 
@@ -192,8 +204,8 @@ package "labukdb-server-app" #EEEDFE {
   [LabukDbServerApp\n(bootstrap main, shaded jar)] as DFSA
 }
 
-package "labukdb-cli  (depends on core in-process, no server)" #EEEDFE {
-  [LabukDbCli\ncatalog / describe / query\n(--table/--filter or real --sql;\nno ingest/compact/vacuum yet)] as CLI
+package "labukdb-cli  (depends on core, format-iceberg;\nin-process, no server)" #EEEDFE {
+  [LabukDbCli\ncatalog / describe / query\n(--table/--filter or real --sql,\nDelta or Iceberg, auto-detected;\nno ingest/compact/vacuum yet)] as CLI
   [TableResolver] as TR2
 }
 
@@ -225,7 +237,11 @@ QP  --> PP
 QP  --> FSP
 QP  --> PVS
 QP  --> PC
-TF  .[#993C1D].> QP : NOT wired yet -- two real shape\nmismatches surfaced (atVersion's\nsequential-version assumption vs.\nIceberg's snapshotId; schemaString's\nDelta-JSON shape vs. Iceberg's typed Schema)
+QP  ..> NSP : planNormalized() returns
+PP  --> NSP : pruneNormalized()\n(same mightMatch logic,\nDataFileRef overload)
+FSP --> NSP : pruneNormalized()\n(same mightMatch logic,\nDataFileRef overload)
+DF  --> TL  : exists("_delta_log") /\nexists("metadata")
+ITF --> QP  : planNormalized() --\nIceberg's query path only;\nDeltaTableFormat/DTF above\nstays unused by cli/flight
 
 PTAR --> RGP
 PTAR --> GPE
@@ -249,9 +265,11 @@ WB ..> PTAR : read-your-writes\n(not-yet-flushed rows,\nchecked alongside commit
 TL --> MC
 TL --> AC
 
-DFP --> QP
-DFP --> CQE  : combine-mode DoGet --\ngroupBy/aggregates/orderBy/limit\npresent, one combined endpoint\ninstead of one-per-file
-DFP --> WB   : DoPut → buffer first
+DFP --> DF   : every query, first --\nDelta or Iceberg?
+DFP --> QP   : Delta-detected -- plan()/ScanPlan,\nunchanged one-endpoint-per-file\nor combine-mode split
+DFP --> ITF  : Iceberg-detected --\nalways combine mode\n(see ITF --> QP above)
+DFP --> CQE  : combine-mode DoGet --\ngroupBy/aggregates/orderBy/limit\npresent (Delta), or any Iceberg\nquery, one combined endpoint\ninstead of one-per-file
+DFP --> WB   : DoPut → buffer first\n(rejects Iceberg-detected first)
 DFP --> TR
 DFP --> CAT
 DFSA --> DFP
@@ -259,9 +277,11 @@ DFSA --> DFP
 CLI --> TR2
 TR2 --> CAT
 TR2 --> TL
-CLI --> QP   : direct in-process query\n(catalog / describe / query only --\nno ingest/compact/vacuum subcommand yet)
+CLI --> DF   : every query, first --\nDelta or Iceberg?
+CLI --> QP   : Delta-detected -- direct\nin-process query (catalog / describe /\nquery only -- no ingest/compact/vacuum yet)
+CLI --> ITF  : Iceberg-detected --\nalways combine mode\n(see ITF --> QP above)
 CLI --> SQTR : --sql "<SELECT ...>"\n(mutually exclusive with\n--table/--columns/--filter/--limit)
-CLI --> CQE  : combine-mode SQL --\nGROUP BY/ORDER BY/LIMIT present\n(same trigger DFP uses, so flight/\nand cli/ behave identically)
+CLI --> CQE  : combine-mode SQL --\nGROUP BY/ORDER BY/LIMIT present\n(Delta), or any Iceberg SQL query
 
 ' ─── CLIENTS ─────────────────────────────────────────────
 actor "Python\n(pyarrow.flight)" as PY  #FAECE7

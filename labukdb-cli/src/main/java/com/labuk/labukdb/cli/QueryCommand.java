@@ -6,9 +6,13 @@ import com.labuk.labukdb.core.execution.AggregateSpec;
 import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.SortKey;
+import com.labuk.labukdb.core.format.DataFileRef;
+import com.labuk.labukdb.core.format.DetectedFormat;
+import com.labuk.labukdb.core.format.NormalizedSnapshot;
 import com.labuk.labukdb.core.log.Snapshot;
 import com.labuk.labukdb.core.log.SnapshotManager;
 import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.planner.NormalizedScanPlan;
 import com.labuk.labukdb.core.planner.PartitionValueSubstituter;
 import com.labuk.labukdb.core.planner.Predicate;
 import com.labuk.labukdb.core.planner.QueryPlanner;
@@ -16,12 +20,14 @@ import com.labuk.labukdb.core.planner.ScanPlan;
 import com.labuk.labukdb.core.query.SqlQuery;
 import com.labuk.labukdb.core.query.SqlQueryTranslator;
 import com.labuk.labukdb.core.storage.TableLocation;
+import com.labuk.labukdb.iceberg.IcebergTableFormat;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -60,6 +66,13 @@ final class QueryCommand {
         TableLocation tableRoot = TableResolver.resolve(parsed.table, catalog);
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+                runIceberg(tableRoot, parsed.predicate, parsed.columns, List.of(), List.of(), List.of(), -1,
+                        parsed.limit > 0 ? parsed.limit : Integer.MAX_VALUE, parsed.limit,
+                        parsed.version, parsed.asOf, allocator);
+                return;
+            }
+
             SnapshotManager snapshotManager = SnapshotManager.forLocation(tableRoot);
             Snapshot snapshot = resolveSnapshot(snapshotManager, parsed.version, parsed.asOf);
 
@@ -92,6 +105,13 @@ final class QueryCommand {
         TableLocation tableRoot = TableResolver.resolve(query.table(), catalog);
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+                runIceberg(tableRoot, query.predicate(), query.columns(), query.groupByColumns(),
+                        query.aggregates(), query.orderBy(), query.limit(), Integer.MAX_VALUE, 0,
+                        parsed.version, parsed.asOf, allocator);
+                return;
+            }
+
             SnapshotManager snapshotManager = SnapshotManager.forLocation(tableRoot);
             Snapshot snapshot = resolveSnapshot(snapshotManager, parsed.version, parsed.asOf);
 
@@ -141,6 +161,95 @@ final class QueryCommand {
                 System.out.println(result.getRowCount() + " row(s)");
             }
         }
+    }
+
+    /**
+     * The Iceberg counterpart of both {@link #run}'s flag-based path and
+     * {@link #runSql}'s combine-mode path, unified into one helper since
+     * Iceberg always routes through {@link CombinedQueryExecutor} —
+     * deliberately, so it doesn't need its own parallel per-file-streaming
+     * implementation the way Delta's plain-scan path has. Delta's own
+     * plain-scan-vs-combine-mode split in {@link #run}/{@link #runSql} is
+     * completely untouched; this is reached only once {@link
+     * DetectedFormat#detect} says the table is Iceberg.
+     *
+     * @param queryLimit   the real SQL-style {@code LIMIT} passed to {@link
+     *                     CombinedQueryExecutor} ({@code -1} = none) — for
+     *                     the flag-based path this is always {@code -1};
+     *                     row capping there is {@code printCap} instead,
+     *                     mirroring how {@code --limit} already behaves for
+     *                     Delta (a print cap, not a query {@code LIMIT}).
+     * @param printCap     how many of the resulting rows to actually print.
+     * @param limitForFooter 0 when {@code printCap} isn't a CLI {@code --limit}
+     *                     in play (the SQL path), otherwise the original
+     *                     {@code --limit} value, purely for the footer line.
+     */
+    private static void runIceberg(TableLocation tableRoot, Predicate predicate, List<String> columns,
+                                    List<String> groupByColumns, List<AggregateSpec> aggregates,
+                                    List<SortKey> orderBy, long queryLimit, int printCap, int limitForFooter,
+                                    Long version, Instant asOf, BufferAllocator allocator) throws Exception {
+        IcebergTableFormat tableFormat = new IcebergTableFormat(tableRoot);
+        NormalizedSnapshot snapshot = version != null ? tableFormat.atVersion(version)
+                : asOf != null ? tableFormat.atTimestamp(asOf)
+                : tableFormat.latest();
+
+        boolean aggregating = !groupByColumns.isEmpty() || !aggregates.isEmpty();
+        Set<String> neededColumns = new LinkedHashSet<>();
+        if (aggregating) {
+            neededColumns.addAll(groupByColumns);
+            for (AggregateSpec spec : aggregates) {
+                neededColumns.add(spec.column());
+            }
+        } else {
+            if (columns != null) {
+                neededColumns.addAll(columns);
+            }
+            for (SortKey key : orderBy) {
+                neededColumns.add(key.column());
+            }
+        }
+        List<String> projectedColumns = List.copyOf(neededColumns);
+
+        NormalizedScanPlan plan = new QueryPlanner().planNormalized(snapshot, predicate, projectedColumns);
+        printIcebergSummary(tableRoot, snapshot, plan);
+
+        if (plan.getFilesToScan().isEmpty()) {
+            System.out.println("0 row(s)");
+            return;
+        }
+
+        List<FileScan> files = new ArrayList<>();
+        for (DataFileRef file : plan.getFilesToScan()) {
+            TableLocation dataFile = tableRoot.resolve(file.getPath());
+            Predicate perFileResidual =
+                    PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
+            files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
+        }
+
+        try (VectorSchemaRoot result = new CombinedQueryExecutor().execute(files, projectedColumns,
+                groupByColumns, aggregates, orderBy, queryLimit, allocator)) {
+            printHeader(result);
+            int toPrint = Math.min(result.getRowCount(), printCap);
+            printRows(result, toPrint);
+            System.out.println();
+            // The true total is already known here (CombinedQueryExecutor never
+            // stops early, unlike Delta's per-file streaming loop), so this can
+            // state it exactly rather than Delta's vaguer "more may exist."
+            System.out.println(toPrint + " row(s)"
+                    + (toPrint < result.getRowCount()
+                    ? " shown of " + result.getRowCount() + " total (--limit " + limitForFooter + ")"
+                    : ""));
+        }
+    }
+
+    private static void printIcebergSummary(TableLocation tableRoot, NormalizedSnapshot snapshot, NormalizedScanPlan plan) {
+        // Iceberg's "version" is a non-sequential snapshotId, not Delta's small
+        // sequential integer -- see IcebergTableFormat's javadoc; stated plainly
+        // here rather than printed as if it meant the same thing as Delta's.
+        System.out.println("Table: " + tableRoot + " (Iceberg snapshot " + snapshot.getVersion() + ")");
+        System.out.println("Files: " + plan.getFilesToScan().size() + " / " + plan.getTotalFilesInSnapshot()
+                + " (skipped " + plan.getFilesSkipped() + " via partition/file-stats pruning)");
+        System.out.println();
     }
 
     private static Snapshot resolveSnapshot(SnapshotManager snapshotManager, Long version, java.time.Instant asOf) {

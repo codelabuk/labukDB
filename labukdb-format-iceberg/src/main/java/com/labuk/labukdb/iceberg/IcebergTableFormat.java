@@ -3,6 +3,7 @@ package com.labuk.labukdb.iceberg;
 import com.labuk.labukdb.core.format.DataFileRef;
 import com.labuk.labukdb.core.format.NormalizedSnapshot;
 import com.labuk.labukdb.core.format.TableFormat;
+import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
@@ -51,6 +52,18 @@ public final class IcebergTableFormat implements TableFormat {
 
     public IcebergTableFormat(String tableLocation, Configuration conf) {
         this.table = new HadoopTables(conf).load(tableLocation);
+    }
+
+    /**
+     * {@code TableLocation}-based constructor — local or remote (S3/MinIO/
+     * ADLS), the same dispatch every other {@code TableLocation}-aware
+     * reader/writer in this project uses. A local location has no {@code
+     * Configuration} of its own ({@link TableLocation#hadoopConf()} throws
+     * for one); an empty default {@code Configuration} is sufficient for
+     * local Hadoop {@code FileSystem} access, same as Hadoop's own default.
+     */
+    public IcebergTableFormat(TableLocation location) {
+        this(location.raw(), location.isRemote() ? location.hadoopConf() : new Configuration());
     }
 
     @Override

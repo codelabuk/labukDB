@@ -38,11 +38,15 @@ Three decisions drive the whole layout:
    labukDB. This is the single highest-leverage decision in the whole
    plan — it turns "build a database" into "build a writer for a log
    format already deeply understood as a reader."
-2. **The gateway/Iceberg plan is reused whole, not replaced.** `planner/`,
-   `decode/`, `storage/` don't change. `DeltaTableFormat` and
-   `IcebergTableFormat` both implement the same `TableFormat` interface
-   designed for the multi-format gateway — labukDB is a strict superset
-   of that plan, not a different path.
+2. **The gateway/Iceberg plan is reused whole, not replaced.** `decode/`,
+   `storage/` don't change. `DeltaTableFormat` and `IcebergTableFormat`
+   both implement the same `TableFormat` interface designed for the
+   multi-format gateway — labukDB is a strict superset of that plan, not
+   a different path. (Update: `planner/` later gained an additive
+   `TableFormat`-based counterpart — `QueryPlanner.planNormalized`/
+   `NormalizedScanPlan` — once Iceberg's CLI/Flight query path needed it;
+   Delta's own `plan`/`ScanPlan` are unchanged, see the Iceberg wiring
+   update below.)
 3. **The embeddable core stays dependency-light.** `labukdb-core` has no
    Flight/gRPC dependency, so an application that only wants in-process
    query access (the DuckDB use case) isn't forced to pull in Netty/gRPC
@@ -65,9 +69,9 @@ system alone.
 |---|---|---|---|
 | `labukdb-core` | `log/`, `planner/`, `decode/`, `storage/`, `catalog/` (reused) + `encode/`, `execution/`, `format/`, `query/` (new) | — | embeddable library jar |
 | `labukdb-format-iceberg` | ✅ **Done** — `IcebergTableFormat`, delegating manifest/table loading to `iceberg-core:1.12.0`'s `HadoopTables` | `labukdb-core`, `iceberg-core` | embeddable library jar (optional) |
-| `labukdb-flight` | `flight/` (adds `DoPut`) | `labukdb-core` [+ `labukdb-format-iceberg`] | library jar |
+| `labukdb-flight` | `flight/` (adds `DoPut`) | `labukdb-core`, `labukdb-format-iceberg` (for Iceberg query support) | library jar |
 | `labukdb-server-app` | `DeltaFlightServerApp` → `LabukDbServerApp` | `labukdb-core`, `labukdb-flight` | shaded standalone server jar |
-| `labukdb-cli` | `cli/` | `labukdb-core` in-process — no Flight needed, same as today | shaded CLI executable |
+| `labukdb-cli` | `cli/` | `labukdb-core`, `labukdb-format-iceberg` (for Iceberg `--table`/`--sql` support) in-process — no Flight needed | shaded CLI executable |
 
 ## What's new inside `labukdb-core`
 
@@ -358,6 +362,66 @@ top-N `ORDER BY ... LIMIT`, the same correctness bar
 into the `FlightQueryRequest` JSON shape server-side) — a client still
 builds that JSON shape directly; this pass is CLI-only.
 
+**Update — Iceberg reads are now wired into `cli`/`flight`, closing a
+real honesty gap.** Confirmed via grep before this change: zero
+references to `IcebergTableFormat` existed anywhere in `labukdb-cli` or
+`labukdb-flight` — an Iceberg table was readable only by writing Java
+directly against it, not through `--table`, `--sql`, or Flight, even
+read-only. New `format/DetectedFormat` enum auto-detects which format a
+`TableLocation` holds by probing for `_delta_log/` (Delta) vs.
+`metadata/` (Iceberg) — the one new generic primitive this needed,
+`TableLocation.exists(String)`.
+
+**A real module-dependency constraint shaped this:** `labukdb-core`
+cannot reference `IcebergTableFormat` — `labukdb-format-iceberg` depends
+on `labukdb-core`, not the reverse, and that can't become circular. So
+detection lives in core (it only needs `TableLocation`), but constructing
+the right `TableFormat` implementation had to move into `labukdb-cli`
+and `labukdb-flight` themselves — both gained `labukdb-format-iceberg` as
+a new, non-optional dependency (same override precedent as
+`hadoop-aws`/`hadoop-azure`/`jsqlparser`: optional for a pure
+`labukdb-core` embedder, required in the actual shipped binaries that
+now genuinely query Iceberg tables).
+
+**Delta's existing query path is completely untouched** — `QueryPlanner.plan`/
+`ScanPlan`/`AddFile`, in both `QueryCommand` and `DeltaFlightProducer`,
+behave exactly as before (confirmed by re-running `FlightIntegrationTest`/
+`FlightAggregationIntegrationTest`/`QueryCommandSqlIntegrationTest`/
+`DeltaTableFormatTest`/`IcebergTableFormatTest` unmodified — all green).
+`Snapshot` is built from real Delta commit-log actions in a way nothing
+can fake for Iceberg, so a real parallel path was necessary, not a
+refactor of the first: new `planner/NormalizedScanPlan` +
+`QueryPlanner.planNormalized`, and `PartitionPruner`/`FileStatsPruner`
+each gained a `pruneNormalized` overload reusing their *existing*
+`mightMatch` logic unchanged (it only ever needed a partition-values
+`Map<String,String>` and a nullable stats string, never `AddFile`
+itself, so the new `DataFileRef`-based overloads are thin wrappers, not
+reimplementations). `FileScan`/`CombinedQueryExecutor`/
+`ParquetToArrowReader`'s `TableLocation` overload needed **zero** changes
+— already format-agnostic, confirmed before writing anything.
+
+**Deliberate v1 simplification:** Iceberg queries always run through
+`CombinedQueryExecutor` — even a plain `SELECT` with no `GROUP BY`/
+`ORDER BY`/`LIMIT` — rather than getting its own parallel
+per-file-streaming implementation the way Delta's plain-scan path has.
+Correctness isn't affected; large Iceberg results just don't stream
+incrementally yet. On Flight this means Iceberg always registers exactly
+one `CombinedScanTicket`, reusing the *existing* ticket/executor/`getStream`
+dispatch completely unchanged (already polymorphic over `FlightTicket`).
+`DoPut` against a detected-Iceberg location is now rejected with a clear
+error before touching anything — without that guard it would have
+silently created Delta-shaped commit-log files inside what's actually
+meant to be an Iceberg table's directory, a real risk this change's added
+reachability increased, not a hypothetical one.
+
+Verified with new real-fixture tests (same `HadoopTables.create` +
+`ArrowToParquetWriter` + commit pattern `IcebergTableFormatTest` already
+used, extended to two partition files): `QueryCommandIcebergIntegrationTest`
+(CLI `--table`/`--filter` and `--sql`, including genuine cross-file
+`GROUP BY`) and `FlightIcebergIntegrationTest` (real server + client,
+plain scan and `GROUP BY` over real `DoGet`, plus the `DoPut`-rejection
+test asserting the table directory is provably untouched afterward).
+
 ## Build order
 
 Not all five new subsystems carry equal risk — ordered to get something
@@ -415,20 +479,40 @@ foundation under it is proven:
     shared `core/execution/CombinedQueryExecutor` both `labukdb-cli` and
     `labukdb-flight` now call, wired into the CLI's new `--sql` flag.
     SQL-over-Flight remains a deliberate, separate follow-up.
+12. ✅ **Iceberg reads wired into `cli`/`flight`.** Done, see above —
+    `format/DetectedFormat` auto-detects Delta vs. Iceberg per table
+    location; `--table`/`--sql`/Flight all reach Iceberg tables now, not
+    just a direct Java call to `IcebergTableFormat`. Delta's own query
+    path is completely unchanged. Iceberg writes remain unbuilt, and
+    `DoPut` now explicitly rejects a detected-Iceberg location rather
+    than silently mishandling it.
 
-**Known, pre-existing flaky test — not caused by the work above.**
-`labukdb-flight`'s `FlightIntegrationTest` intermittently fails (~1-in-4
-observed) with `IllegalStateException: Memory was leaked by query` during
-`@AfterEach`'s `allocator.close()`. Confirmed not specific to any one
-test — it's hit a pure-read test (`partitionPruningAndResidualFilter...`,
-untouched by this session's write-path changes) as often as a `DoPut`
-one, and Arrow's own issue tracker has the identical error message on
-Arrow's own Flight test suite, explicitly concluded to be a flake, not a
-real bug ([ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448)).
-Left alone deliberately rather than spending effort hardening something
-upstream also treats as environmental gRPC/Flight teardown timing, not a
-logic defect — revisit if it starts failing CI at a materially higher
-rate than observed here.
+**Known, pre-existing flaky test — not caused by the work above, root
+cause still genuinely open.** `labukdb-flight`'s `FlightIntegrationTest`
+intermittently fails (~1-in-4 observed) with `IllegalStateException:
+Memory was leaked by query` during `@AfterEach`'s `allocator.close()`.
+Confirmed not specific to any one test — it's hit a pure-read test
+(`partitionPruningAndResidualFilter...`, untouched by this session's
+write-path changes) as often as a `DoPut` one, and has now also been
+observed once on the new `FlightIcebergIntegrationTest` (passed cleanly
+on every other run, standalone and full-suite, with no resource-handling
+difference from the already-stable `FlightAggregationIntegrationTest` it
+mirrors) — reinforcing that this is suite-wide timing/load-dependent
+flakiness, not tied to any one test's own code.
+
+**Correction to an earlier note in this doc:** this was previously
+attributed to Arrow's own [ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448)
+(same ticket as [apache/arrow#21006](https://github.com/apache/arrow/issues/21006)
+post-migration), "explicitly concluded to be a flake." On closer reading
+that's wrong: the ticket was **resolved as fixed**, not dismissed, via
+[PR #3805](https://github.com/apache/arrow/pull/3805) targeting Arrow
+0.13.0 (2019). This project pins Arrow **16.1.0** — the fix shipped many
+major versions before that, so this can't be the same bug recurring; the
+match was only the generic leak-detector message text, not a confirmed
+shared root cause. The actual cause here is unverified and still open —
+not assumed to be Arrow's fault or this project's own code without
+actually reproducing and diagnosing it (e.g. a heap-dump/allocator-debug
+run under a loop that reproduces the ~1-in-4 rate).
 
 ## Phase roadmap beyond v1 core
 

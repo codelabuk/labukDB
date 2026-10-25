@@ -1,5 +1,6 @@
 package com.labuk.labukdb.core.planner;
 
+import com.labuk.labukdb.core.format.DataFileRef;
 import com.labuk.labukdb.core.log.action.AddFile;
 
 import java.util.Collection;
@@ -23,6 +24,16 @@ public final class PartitionPruner {
     }
 
     public static List<AddFile> prune(Predicate predicate, Collection<AddFile> files) {
+        if (predicate == null) {
+            return List.copyOf(files);
+        }
+        return files.stream()
+                .filter(f -> mightMatch(predicate, f.getPartitionValues()))
+                .collect(Collectors.toList());
+    }
+
+    /** {@link #prune}'s format-agnostic counterpart, same {@code mightMatch} logic, for {@link DataFileRef}. */
+    public static List<DataFileRef> pruneNormalized(Predicate predicate, Collection<DataFileRef> files) {
         if (predicate == null) {
             return List.copyOf(files);
         }

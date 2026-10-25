@@ -14,10 +14,11 @@
   <packaging>jar</packaging>
 
   <!--
-    catalog / describe / query subcommands, kubectl-style. Depends on
-    labukdb-core ONLY — it talks to the engine in-process, no Flight
-    server involved, which also makes it useful for isolating "is this a
-    server problem or an engine problem."
+    catalog / describe / query subcommands, kubectl-style. Talks to the
+    engine in-process, no Flight server involved, which also makes it
+    useful for isolating "is this a server problem or an engine problem."
+    Depends on labukdb-core and labukdb-format-iceberg (for querying
+    Iceberg tables) — no labukdb-flight.
 
     hadoop-aws/hadoop-azure are `optional` in labukdb-core's own pom (so
     an embedding library consumer isn't forced into either cloud SDK),
@@ -31,6 +32,10 @@
     <dependency>
       <groupId>com.labuk</groupId>
       <artifactId>labukdb-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.labuk</groupId>
+      <artifactId>labukdb-format-iceberg</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.hadoop</groupId>

@@ -17,12 +17,17 @@
     Arrow Flight serving: DeltaFlightProducer (GetFlightInfo / DoGet /
     GetSchema / ListFlights), TicketRegistry, the flight/query wire
     format. Depends on labukdb-core for the actual engine (snapshot
-    resolution, pruning, decode) and adds only flight-core on top.
+    resolution, pruning, decode), labukdb-format-iceberg for querying
+    Iceberg tables, and adds only flight-core on top.
   -->
   <dependencies>
     <dependency>
       <groupId>com.labuk</groupId>
       <artifactId>labukdb-core</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.labuk</groupId>
+      <artifactId>labukdb-format-iceberg</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.arrow</groupId>

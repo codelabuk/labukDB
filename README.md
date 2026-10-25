@@ -92,13 +92,20 @@ below is deliberately small enough to reason about end to end.
 
 Supporting packages: `storage/` (local/S3/MinIO/ADLS location resolution),
 `catalog/` (name → table-root registry), `cli/` (the `labukdb` tool),
-`format/` (the `TableFormat` SPI Delta and Iceberg both implement, prepped
-for multi-format but not yet wired into `planner`/`flight`/`cli`).
+`format/` (the `TableFormat` SPI Delta and Iceberg both implement —
+`DetectedFormat` auto-detects which one a location holds by probing for
+`_delta_log/` vs. `metadata/`, and `cli`/`flight` dispatch through it for
+Iceberg tables specifically; Delta's own query path still goes straight
+through `log`/`planner` unchanged, see [Query/analytics support](#status--known-limitations)
+below for why), `query/` (SQL text → the engine's own `Predicate`/
+`AggregateSpec`/`SortKey` structures, via `SqlQueryTranslator`).
 
 **Multi-module:** `labukdb-core` (everything above except `flight/`, no
 Flight/gRPC dependency, embeddable like DuckDB), `labukdb-flight` (Flight
-serving), `labukdb-format-iceberg` (optional, read-only Iceberg support),
-`labukdb-server-app` (the runnable server jar), `labukdb-cli` (the
+serving), `labukdb-format-iceberg` (read-only Iceberg support — optional
+for `labukdb-core` embedders, but a required dependency of `labukdb-cli`
+and `labukdb-flight` themselves now, since both query Iceberg tables
+directly), `labukdb-server-app` (the runnable server jar), `labukdb-cli` (the
 `labukdb` binary — `catalog`/`describe`/`query` only today, no write
 subcommands yet). See
 [docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
@@ -506,14 +513,30 @@ above for the supported subset. SQL-over-Flight (translating SQL text
 into the JSON request shape server-side) is not built yet; a Flight
 client still builds that shape directly.
 
-**A known, pre-existing flaky test:** `FlightIntegrationTest`
-intermittently fails (~1-in-4 observed) with a Flight/gRPC buffer-release
-timing error during teardown — confirmed not tied to any specific code
-path (it hits read-only tests as often as write ones), and Arrow's own
-issue tracker has the identical failure on Arrow's own Flight test suite,
-already concluded to be a flake
-([ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448)), not a
-real bug.
+**A known, pre-existing flaky test — root cause still open, not Arrow's.**
+`FlightIntegrationTest` intermittently fails (~1-in-4 observed) with
+`IllegalStateException: Memory was leaked by query` during
+`allocator.close()` in teardown — confirmed not tied to any specific code
+path (it hits read-only tests as often as write ones, and has now also
+been observed once on `FlightIcebergIntegrationTest`, a brand-new test
+with no resource-handling difference from the already-stable
+`FlightAggregationIntegrationTest` it mirrors — passed cleanly on every
+other run, standalone and full-suite, reinforcing that this is suite-wide
+timing/load-dependent flakiness, not a defect in any one test). Earlier notes in
+this project cited Arrow's own
+[ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448) /
+[apache/arrow#21006](https://github.com/apache/arrow/issues/21006) (the
+same ticket — ARROW-4448 is its old JIRA id, #21006 its GitHub-migration
+id) as an explanation; that was wrong on closer reading. That issue was
+**resolved as fixed** (not dismissed as an unfixable flake) via
+[PR #3805](https://github.com/apache/arrow/pull/3805), targeting Arrow
+**0.13.0** in 2019. This project pins Arrow **16.1.0** — the fix already
+shipped many major versions before the version this project depends on,
+so it can't be the same recurring bug; the resemblance is only the
+generic leak-detector message, not the root cause. The actual cause here
+is genuinely unverified and still needs real investigation (e.g. a
+heap-dump/leak-detector run under the loop that reproduces it), not
+assumed to be either an Arrow bug or this project's own code.
 
 ---
 
@@ -573,14 +596,14 @@ dependencies:
 | Nested `LIST<LIST<...>>`, MAP, STRUCT | `LIST<primitive>` already supported, read-only |
 | Checkpoint multi-part support for writes | Multi-part checkpoints are read-supported; `CommitWriter` doesn't write checkpoints at all yet (every version replays from JSON) |
 | Row-data caching (LRU) | Metadata is cached; scanned rows are not |
-| A SQL text parser | `GROUP BY`/`ORDER BY`/`LIMIT` are reachable via `DoGet` now (see Status above) — a client still builds the request shape directly rather than SQL text; this is the natural next layer on top of that, not possible before it existed |
+| SQL-over-Flight | A real SQL text parser (`SqlQueryTranslator`) is done and wired into the CLI's `--sql` flag — Flight clients still build the `FlightQueryRequest` JSON shape directly; this is the natural next layer on top of that, not possible before it existed |
 | Streaming/tailing subscriptions (`DoExchange`) | Push-based freshness for readers, not pull |
 
 ### Multi-format
 | Item | Notes |
 |---|---|
-| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — read-only, path-based, local and remote (live-MinIO-verified), tested against a self-built fixture rather than a Spark/Trino-written table |
-| `TableFormat` wired into `planner`/`flight`/`cli` | The SPI exists and is implemented by both Delta and Iceberg, but nothing actually dispatches through it yet |
+| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — read-only, path-based, local and remote (live-MinIO-verified), tested against a self-built fixture rather than a Spark/Trino-written table. Reachable via `--table`/`--sql`/Flight now too (auto-detected by probing for `_delta_log/` vs. `metadata/`), not just as a library call — see [USAGE.md](USAGE.md#delta-vs-iceberg) |
+| `TableFormat` wired into `cli`/`flight` | ✅ Done for Iceberg's query path specifically (`DetectedFormat` + `QueryPlanner.planNormalized`) — Delta's own query path still bypasses it (`SnapshotManager`/`QueryPlanner.plan`/`ScanPlan`/`AddFile`, deliberately left unchanged; `Snapshot` is built from real commit-log actions in a way nothing can fake for Iceberg, so this was a genuine second path, not a shared-everything refactor) |
 | Parquet-only tables (no transaction log) | Direct file listing with stats, no commit log |
 
 ### AI / LLM

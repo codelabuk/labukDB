@@ -2,6 +2,8 @@ package com.labuk.labukdb.core.storage;
 
 import org.apache.hadoop.conf.Configuration;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.regex.Pattern;
@@ -101,6 +103,20 @@ public final class TableLocation {
             return new TableLocation(true, new org.apache.hadoop.fs.Path(hadoopPath(), relativePath).toString(), conf);
         }
         return new TableLocation(false, localPath().resolve(relativePath).toString(), null);
+    }
+
+    /**
+     * Whether a path relative to this location exists — the generic FS
+     * primitive {@code format.DetectedFormat} probes with (e.g.
+     * {@code "_delta_log"} vs. {@code "metadata"}) to tell a Delta table
+     * from an Iceberg one before committing to either read path.
+     */
+    public boolean exists(String relativePath) throws IOException {
+        if (remote) {
+            org.apache.hadoop.fs.Path path = new org.apache.hadoop.fs.Path(hadoopPath(), relativePath);
+            return path.getFileSystem(conf).exists(path);
+        }
+        return Files.exists(localPath().resolve(relativePath));
     }
 
     @Override

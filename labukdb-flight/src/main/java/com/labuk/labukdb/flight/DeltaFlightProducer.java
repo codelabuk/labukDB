@@ -8,6 +8,9 @@ import com.labuk.labukdb.core.execution.AggregateSpec;
 import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.SortKey;
+import com.labuk.labukdb.core.format.DataFileRef;
+import com.labuk.labukdb.core.format.DetectedFormat;
+import com.labuk.labukdb.core.format.NormalizedSnapshot;
 import com.labuk.labukdb.flight.query.AggregateQueryCodec;
 import com.labuk.labukdb.flight.query.FlightQueryRequest;
 import com.labuk.labukdb.flight.query.PredicateCodec;
@@ -16,6 +19,7 @@ import com.labuk.labukdb.core.log.SnapshotManager;
 import com.labuk.labukdb.core.log.TableCache;
 import com.labuk.labukdb.core.log.WriteBuffer;
 import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.planner.NormalizedScanPlan;
 import com.labuk.labukdb.core.planner.Predicate;
 import com.labuk.labukdb.core.planner.PartitionValueSubstituter;
 import com.labuk.labukdb.core.planner.QueryPlanner;
@@ -24,6 +28,7 @@ import com.labuk.labukdb.core.storage.AdlsConfiguration;
 import com.labuk.labukdb.core.storage.MinioConfiguration;
 import com.labuk.labukdb.core.storage.TableLocation;
 import com.labuk.labukdb.flight.query.FlightWriteRequest;
+import com.labuk.labukdb.iceberg.IcebergTableFormat;
 import org.apache.arrow.flight.CallStatus;
 import org.apache.arrow.flight.Criteria;
 import org.apache.arrow.flight.FlightDescriptor;
@@ -199,6 +204,18 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
         try {
             FlightQueryRequest query = MAPPER.readValue(descriptor.getCommand(), FlightQueryRequest.class);
             TableLocation tableRoot = resolveTableRoot(query);
+
+            Predicate predicate = PredicateCodec.fromJson(query.getPredicate());
+            List<String> groupByColumns = query.getGroupBy() == null ? List.of() : query.getGroupBy();
+            List<AggregateSpec> aggregates = AggregateQueryCodec.aggregatesFromJson(query.getAggregates());
+            List<SortKey> sortKeys = AggregateQueryCodec.orderByFromJson(query.getOrderBy());
+            long limit = query.getLimit() == null ? -1 : query.getLimit();
+
+            if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+                return icebergFlightInfo(descriptor, tableRoot, query, predicate, groupByColumns, aggregates,
+                        sortKeys, limit);
+            }
+
             SnapshotManager snapshotManager = tableCache.forTable(tableRoot);
 
             Snapshot snapshot;
@@ -210,13 +227,8 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                 snapshot = snapshotManager.latest();
             }
 
-            Predicate predicate = PredicateCodec.fromJson(query.getPredicate());
             ScanPlan plan = queryPlanner.plan(snapshot, predicate, query.getColumns());
 
-            List<String> groupByColumns = query.getGroupBy() == null ? List.of() : query.getGroupBy();
-            List<AggregateSpec> aggregates = AggregateQueryCodec.aggregatesFromJson(query.getAggregates());
-            List<SortKey> sortKeys = AggregateQueryCodec.orderByFromJson(query.getOrderBy());
-            long limit = query.getLimit() == null ? -1 : query.getLimit();
             boolean combineMode = !groupByColumns.isEmpty() || !aggregates.isEmpty()
                     || !sortKeys.isEmpty() || limit >= 0;
 
@@ -371,6 +383,96 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                 .build();
     }
 
+    /**
+     * Iceberg's counterpart of {@link #combinedFlightInfo} — Delta's own
+     * plain-scan and combine-mode logic above is completely untouched;
+     * this is reached only once {@link DetectedFormat#detect} says the
+     * table is Iceberg. Always registers exactly one {@link
+     * CombinedScanTicket}, even for a plain scan with none of {@code
+     * groupBy}/{@code aggregates}/{@code orderBy}/{@code limit} present —
+     * deliberate v1 simplification (see {@code QueryCommand}'s matching
+     * note in {@code labukdb-cli}): Iceberg doesn't get its own parallel
+     * one-endpoint-per-file ticket type, it always reuses the combined
+     * path that already exists.
+     */
+    private FlightInfo icebergFlightInfo(FlightDescriptor descriptor, TableLocation tableRoot,
+                                          FlightQueryRequest query, Predicate predicate,
+                                          List<String> groupByColumns, List<AggregateSpec> aggregates,
+                                          List<SortKey> sortKeys, long limit) throws IOException {
+        IcebergTableFormat tableFormat = new IcebergTableFormat(tableRoot);
+        // Iceberg's "version" is a non-sequential snapshotId, not Delta's small
+        // sequential integer -- see IcebergTableFormat's own javadoc.
+        NormalizedSnapshot snapshot = query.getVersion() != null ? tableFormat.atVersion(query.getVersion())
+                : query.getTimestampMillis() != null
+                ? tableFormat.atTimestamp(Instant.ofEpochMilli(query.getTimestampMillis()))
+                : tableFormat.latest();
+
+        boolean aggregating = !groupByColumns.isEmpty() || !aggregates.isEmpty();
+        Set<String> neededColumns = new LinkedHashSet<>();
+        if (aggregating) {
+            neededColumns.addAll(groupByColumns);
+            for (AggregateSpec spec : aggregates) {
+                neededColumns.add(spec.column());
+            }
+        } else {
+            if (query.getColumns() != null) {
+                neededColumns.addAll(query.getColumns());
+            }
+            for (SortKey key : sortKeys) {
+                neededColumns.add(key.column());
+            }
+        }
+        List<String> projectedColumns = List.copyOf(neededColumns);
+
+        NormalizedScanPlan plan = queryPlanner.planNormalized(snapshot, predicate, projectedColumns);
+
+        List<FileScan> files = new ArrayList<>();
+        for (DataFileRef file : plan.getFilesToScan()) {
+            TableLocation dataFile = tableRoot.resolve(file.getPath());
+            Predicate perFileResidual =
+                    PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
+            files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
+        }
+
+        List<FlightEndpoint> endpoints = new ArrayList<>();
+        if (!files.isEmpty()) {
+            String ticketId = registry.register(new CombinedScanTicket(
+                    files, projectedColumns, groupByColumns, aggregates, sortKeys, limit));
+            endpoints.add(new FlightEndpoint(new Ticket(ticketId.getBytes(StandardCharsets.UTF_8))));
+        }
+
+        Schema schema;
+        if (plan.getFilesToScan().isEmpty()) {
+            schema = new Schema(List.of());
+        } else if (aggregating) {
+            DataFileRef firstFile = plan.getFilesToScan().get(0);
+            Set<String> inputColumns = new LinkedHashSet<>(groupByColumns);
+            for (AggregateSpec spec : aggregates) {
+                inputColumns.add(spec.column());
+            }
+            Schema inputSchema = parquetReader.readSchema(
+                    tableRoot.resolve(firstFile.getPath()), List.copyOf(inputColumns), firstFile.getPartitionValues());
+
+            List<org.apache.arrow.vector.types.pojo.Field> outputFields = new ArrayList<>();
+            for (String column : groupByColumns) {
+                outputFields.add(inputSchema.findField(column));
+            }
+            for (AggregateSpec spec : aggregates) {
+                outputFields.add(AggregateOperator.outputFieldFor(spec, inputSchema));
+            }
+            schema = new Schema(outputFields);
+        } else {
+            DataFileRef firstFile = plan.getFilesToScan().get(0);
+            schema = parquetReader.readSchema(
+                    tableRoot.resolve(firstFile.getPath()), projectedColumns, firstFile.getPartitionValues());
+        }
+
+        return FlightInfo.builder(schema, descriptor, endpoints)
+                .setRecords(-1)
+                .setBytes(-1)
+                .build();
+    }
+
     @Override
     public void getStream(CallContext context, Ticket ticket, ServerStreamListener listener) {
         String ticketId = new String(ticket.getBytes(), StandardCharsets.UTF_8);
@@ -450,6 +552,17 @@ public class DeltaFlightProducer extends NoOpFlightProducer {
                 FlightWriteRequest request = MAPPER.readValue(
                         flightStream.getDescriptor().getCommand(), FlightWriteRequest.class);
                 TableLocation tableRoot = resolveTableLocation(request.getTable(), request.getTableRoot());
+
+                // Iceberg write support doesn't exist -- without this check, DoPut
+                // would silently create Delta-shaped commit-log files inside what's
+                // actually meant to be an Iceberg table's directory, since nothing
+                // downstream of this point knows Iceberg exists. Fail clearly before
+                // touching anything, now that Iceberg tables are visible/reachable
+                // at all through this same system (see getFlightInfo).
+                if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+                    throw new IllegalArgumentException(
+                            "Writes are not supported for Iceberg tables (detected at " + tableRoot + ")");
+                }
 
                 Map<String, String> partitionValues = request.getPartitionValues();
                 if (partitionValues == null) {
