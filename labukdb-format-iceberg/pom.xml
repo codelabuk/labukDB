@@ -40,6 +40,19 @@
       <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+    <!--
+      Test-scope only. hadoop-aws is optional in labukdb-core (so a
+      library consumer isn't forced into the AWS SDK), but
+      IcebergRemoteMinioIntegrationTest needs S3AFileSystem on the
+      classpath to actually reach MinIO. Same reasoning as
+      labukdb-flight's pom for its own MinIO-dependent test.
+    -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <optional>false</optional>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>

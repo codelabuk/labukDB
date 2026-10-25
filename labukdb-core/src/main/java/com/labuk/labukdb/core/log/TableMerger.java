@@ -2,6 +2,7 @@ package com.labuk.labukdb.core.log;
 
 import com.labuk.labukdb.core.decode.ParquetToArrowReader;
 import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
@@ -16,7 +17,6 @@ import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.arrow.vector.util.VectorSchemaRootAppender;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -82,6 +82,8 @@ public final class TableMerger {
     private final ParquetToArrowReader parquetReader = new ParquetToArrowReader();
 
     /**
+     * Local disk — unchanged behavior from before {@link TableLocation} existed.
+     *
      * @param inserts rows to add, keyed by {@code keyColumns}; {@code null} means none
      * @param updates rows that replace an existing key's full row; {@code null} means none
      * @param deletes rows (only {@code keyColumns} are read) to remove by key; {@code null} means none
@@ -90,12 +92,19 @@ public final class TableMerger {
     public long merge(Path tableRoot, Map<String, String> partitionValues, List<String> keyColumns,
                        VectorSchemaRoot inserts, VectorSchemaRoot updates, VectorSchemaRoot deletes,
                        BufferAllocator allocator) throws IOException {
+        return merge(TableLocation.forLocal(tableRoot), partitionValues, keyColumns, inserts, updates, deletes, allocator);
+    }
+
+    /** Local or remote (S3/MinIO/ADLS), via {@link TableLocation} — same semantics as the {@code Path} overload. */
+    public long merge(TableLocation location, Map<String, String> partitionValues, List<String> keyColumns,
+                       VectorSchemaRoot inserts, VectorSchemaRoot updates, VectorSchemaRoot deletes,
+                       BufferAllocator allocator) throws IOException {
         if (keyColumns.isEmpty()) {
             throw new IllegalArgumentException("merge() requires at least one key column");
         }
 
-        SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
-        CommitWriter commitWriter = new CommitWriter(tableRoot);
+        SnapshotManager snapshotManager = SnapshotManager.forLocation(location);
+        CommitWriter commitWriter = CommitWriter.forLocation(location);
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
             Snapshot snapshot = snapshotManager.latest();
@@ -103,7 +112,7 @@ public final class TableMerger {
                     .filter(f -> f.getPartitionValues().equals(partitionValues))
                     .toList();
 
-            VectorSchemaRoot merged = buildMergedBatch(tableRoot, filesInPartition, keyColumns,
+            VectorSchemaRoot merged = buildMergedBatch(location, filesInPartition, keyColumns,
                     inserts, updates, deletes, allocator);
             try {
                 if (!stillFresh(snapshotManager, partitionValues, filesInPartition)) {
@@ -116,7 +125,7 @@ public final class TableMerger {
                 merged.close();
             }
         }
-        throw new IOException("Too much write contention on " + tableRoot
+        throw new IOException("Too much write contention on " + location
                 + " -- merge failed to commit after " + MAX_RETRIES + " attempts");
     }
 
@@ -138,7 +147,7 @@ public final class TableMerger {
         return currentPaths.equals(expectedPaths);
     }
 
-    private VectorSchemaRoot buildMergedBatch(Path tableRoot, List<AddFile> filesInPartition, List<String> keyColumns,
+    private VectorSchemaRoot buildMergedBatch(TableLocation location, List<AddFile> filesInPartition, List<String> keyColumns,
                                                VectorSchemaRoot inserts, VectorSchemaRoot updates, VectorSchemaRoot deletes,
                                                BufferAllocator allocator) throws IOException {
         Map<List<Object>, Object[]> rows = new LinkedHashMap<>();
@@ -148,7 +157,7 @@ public final class TableMerger {
             VectorSchemaRoot combined = null;
             try {
                 for (AddFile file : filesInPartition) {
-                    File dataFile = tableRoot.resolve(file.getPath()).toFile();
+                    TableLocation dataFile = location.resolve(file.getPath());
                     try (VectorSchemaRoot batch = parquetReader.read(dataFile, allocator, null, null, Map.of())) {
                         if (combined == null) {
                             combined = VectorSchemaRoot.create(batch.getSchema(), allocator);

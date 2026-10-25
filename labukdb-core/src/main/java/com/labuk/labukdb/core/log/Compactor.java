@@ -2,11 +2,11 @@ package com.labuk.labukdb.core.log;
 
 import com.labuk.labukdb.core.decode.ParquetToArrowReader;
 import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.util.VectorSchemaRootAppender;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.List;
@@ -37,12 +37,19 @@ public final class Compactor {
     private final ParquetToArrowReader parquetReader = new ParquetToArrowReader();
 
     /**
+     * Local disk — unchanged behavior from before {@link TableLocation} existed.
+     *
      * @return the new table version, or -1 if fewer than 2 active files
      *         matched {@code partitionValues} — nothing meaningful to
      *         compact, not an error.
      */
     public long compact(Path tableRoot, Map<String, String> partitionValues, BufferAllocator allocator) throws IOException {
-        SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
+        return compact(TableLocation.forLocal(tableRoot), partitionValues, allocator);
+    }
+
+    /** Local or remote (S3/MinIO/ADLS), via {@link TableLocation} — same semantics as the {@code Path} overload. */
+    public long compact(TableLocation location, Map<String, String> partitionValues, BufferAllocator allocator) throws IOException {
+        SnapshotManager snapshotManager = SnapshotManager.forLocation(location);
         Snapshot snapshot = snapshotManager.latest();
 
         List<AddFile> filesToCompact = snapshot.getActiveFiles().stream()
@@ -56,7 +63,7 @@ public final class Compactor {
         VectorSchemaRoot combined = null;
         try {
             for (AddFile file : filesToCompact) {
-                File dataFile = tableRoot.resolve(file.getPath()).toFile();
+                TableLocation dataFile = location.resolve(file.getPath());
                 try (VectorSchemaRoot batch = parquetReader.read(dataFile, allocator, null, null, Map.of())) {
                     if (combined == null) {
                         combined = VectorSchemaRoot.create(batch.getSchema(), allocator);
@@ -66,7 +73,7 @@ public final class Compactor {
                 }
             }
 
-            CommitWriter commitWriter = new CommitWriter(tableRoot);
+            CommitWriter commitWriter = CommitWriter.forLocation(location);
             // Bin-packing doesn't change the table's logical data, only
             // which physical file holds it — dataChange=false, same as
             // real Delta's OPTIMIZE, so change-data-feed-style readers can

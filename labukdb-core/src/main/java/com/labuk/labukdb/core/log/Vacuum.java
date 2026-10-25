@@ -3,6 +3,7 @@ package com.labuk.labukdb.core.log;
 import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.log.action.RemoveFile;
 import com.labuk.labukdb.core.log.action.SingleAction;
+import com.labuk.labukdb.core.storage.TableLocation;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -39,35 +40,44 @@ public final class Vacuum {
     /** Matches real Delta Lake's own default retention — not invented here. */
     public static final Duration DEFAULT_RETENTION = Duration.ofDays(7);
 
-    /** @return the relative paths actually deleted. */
+    /** Local disk — unchanged behavior from before {@link TableLocation} existed. @return the relative paths actually deleted. */
     public List<String> vacuum(Path tableRoot) throws IOException {
-        return vacuum(tableRoot, DEFAULT_RETENTION);
+        return vacuum(TableLocation.forLocal(tableRoot), DEFAULT_RETENTION);
     }
 
     public List<String> vacuum(Path tableRoot, Duration retentionPeriod) throws IOException {
-        Snapshot current = new SnapshotManager(tableRoot).latest();
+        return vacuum(TableLocation.forLocal(tableRoot), retentionPeriod);
+    }
+
+    /** Local or remote (S3/MinIO/ADLS), via {@link TableLocation}. @return the relative paths actually deleted. */
+    public List<String> vacuum(TableLocation location) throws IOException {
+        return vacuum(location, DEFAULT_RETENTION);
+    }
+
+    public List<String> vacuum(TableLocation location, Duration retentionPeriod) throws IOException {
+        Snapshot current = SnapshotManager.forLocation(location).latest();
         Set<String> activePaths = new LinkedHashSet<>();
         for (AddFile file : current.getActiveFiles()) {
             activePaths.add(file.getPath());
         }
 
         long cutoffMillis = System.currentTimeMillis() - retentionPeriod.toMillis();
-        Set<String> staleRemovedPaths = collectStaleRemovedPaths(tableRoot, cutoffMillis);
+        Set<String> staleRemovedPaths = collectStaleRemovedPaths(location, cutoffMillis);
 
         List<String> deleted = new ArrayList<>();
         for (String path : staleRemovedPaths) {
             if (activePaths.contains(path)) {
                 continue; // safety invariant: never delete a file still in the live set
             }
-            if (Files.deleteIfExists(tableRoot.resolve(path))) {
+            if (deleteDataFile(location.resolve(path))) {
                 deleted.add(path);
             }
         }
         return deleted;
     }
 
-    private Set<String> collectStaleRemovedPaths(Path tableRoot, long cutoffMillis) throws IOException {
-        LocalNioLogStorage storage = new LocalNioLogStorage(tableRoot.resolve("_delta_log"));
+    private Set<String> collectStaleRemovedPaths(TableLocation location, long cutoffMillis) throws IOException {
+        LogStorage storage = LogStorage.forLocation(location);
         CommitLogReader commitLogReader = new CommitLogReader();
 
         Set<String> stalePaths = new LinkedHashSet<>();
@@ -83,5 +93,13 @@ public final class Vacuum {
             }
         }
         return stalePaths;
+    }
+
+    /** @return true if a file was actually deleted (mirrors {@code Files.deleteIfExists}'s return contract). */
+    private boolean deleteDataFile(TableLocation dataFile) throws IOException {
+        if (!dataFile.isRemote()) {
+            return Files.deleteIfExists(dataFile.localPath());
+        }
+        return dataFile.hadoopPath().getFileSystem(dataFile.hadoopConf()).delete(dataFile.hadoopPath(), false);
     }
 }

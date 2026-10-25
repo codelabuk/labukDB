@@ -259,10 +259,12 @@ new TableCreator().createTable(location, new Schema(List.of(service, amount)),
 CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", "ERROR"));
 ```
 
-`TableMerger.merge(...)` does insert/update/delete by key on top of this
-(local disk only today) — see its javadoc for the exact semantics
-(three separate batches, not an operation-indicator column; key supplied
-per call, not stored table metadata).
+`TableMerger.merge(...)` does insert/update/delete by key on top of this,
+local or remote (`merge(TableLocation, ...)`, same `forLocation`-style
+pattern) — see its javadoc for the exact semantics (three separate
+batches, not an operation-indicator column; key supplied per call, not
+stored table metadata). `Compactor`/`Vacuum` have matching
+`TableLocation` overloads too.
 
 ---
 
@@ -300,8 +302,12 @@ through `TableLocation`, local or remote, the same pattern the read path
 uses. Live-verified against a real MinIO cluster end to end: creating a
 brand-new table, appending data to it, and reading it back — both as a
 library call and through a real `DoPut`/`DoGet` round trip over Flight.
-`Compactor`, `Vacuum`, and `TableMerger` (upsert/MERGE) remain local-disk
-only by design — not yet extended to remote.
+`Compactor`, `Vacuum`, and `TableMerger` (upsert/MERGE) are also fully
+remote-capable now, live-MinIO-verified — the same additive
+`TableLocation`-overload pattern, with one new piece `Vacuum` needed on
+top of it: an actual remote file **delete** (Hadoop `FileSystem.delete`),
+confirmed with a real `FileSystem.exists()` check proving bytes are
+genuinely gone from the bucket, not just logically removed from the log.
 
 ### Configuring a remote backend
 
@@ -388,14 +394,18 @@ push-based tailing/subscription yet.
 - **Append** (`CommitWriter.appendBatch`, `WriteBuffer`/`DoPut`) — done,
   local and remote, with multi-writer optimistic concurrency control
   (bounded retry, conflict detection — real 10-thread concurrency tests).
-- **Upsert/MERGE by key** (`TableMerger`) — done, **local disk only**.
-  The key is supplied fresh on every call, not stored as table metadata —
-  matches real Delta `MERGE INTO`'s own behavior rather than inventing a
-  non-standard extension to the Delta protocol.
-- **Compaction and vacuum** (`Compactor`, `Vacuum`) — done, **local disk
-  only**. No size/age heuristic for which files to compact yet (merges
-  everything in a partition every time); no orphan-file detection in
-  `Vacuum` (only acts on files a `remove` action actually named).
+- **Upsert/MERGE by key** (`TableMerger`) — done, local and remote,
+  live-MinIO-verified. The key is supplied fresh on every call, not
+  stored as table metadata — matches real Delta `MERGE INTO`'s own
+  behavior rather than inventing a non-standard extension to the Delta
+  protocol.
+- **Compaction and vacuum** (`Compactor`, `Vacuum`) — done, local and
+  remote, live-MinIO-verified (`Vacuum`'s remote delete via Hadoop
+  `FileSystem.delete`, confirmed with a real `FileSystem.exists()` check
+  that bytes are actually gone). No size/age heuristic for which files
+  to compact yet (merges everything in a partition every time); no
+  orphan-file detection in `Vacuum` (only acts on files a `remove`
+  action actually named).
 - **CREATE TABLE** (`TableCreator`) — done, local and remote, live-MinIO-
   verified. Library capability only — no Flight `DoAction` RPC or CLI
   subcommand yet.
@@ -475,7 +485,6 @@ dependencies:
 | Item | Notes |
 |---|---|
 | Iceberg write support | `IcebergTableFormat` is read-only today; `CommitWriter`'s Delta-specific write path has no Iceberg equivalent yet |
-| `TableMerger`/`Compactor`/`Vacuum` for remote tables | All three remain local-disk only by design; `CommitWriter`/`ArrowToParquetWriter`/`WriteBuffer` already aren't |
 | CLI write subcommands | `ingest`/`compact`/`vacuum`/`create-table` — the write-path classes all exist as library capabilities, none are exposed via the CLI yet |
 | Flight `DoAction` for CREATE TABLE | `TableCreator` is a library capability only; needs its own request/response shape decision |
 | Remote multi-writer OCC stress-testing | Conflict-retry logic handles both local (NIO) and remote (Hadoop) exception types; not separately stress-tested under concurrent remote writers the way local disk is |
@@ -493,7 +502,7 @@ dependencies:
 ### Multi-format
 | Item | Notes |
 |---|---|
-| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — read-only, path-based, tested against a self-built fixture rather than a Spark/Trino-written table |
+| Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — read-only, path-based, local and remote (live-MinIO-verified), tested against a self-built fixture rather than a Spark/Trino-written table |
 | `TableFormat` wired into `planner`/`flight`/`cli` | The SPI exists and is implemented by both Delta and Iceberg, but nothing actually dispatches through it yet |
 | Parquet-only tables (no transaction log) | Direct file listing with stats, no commit log |
 

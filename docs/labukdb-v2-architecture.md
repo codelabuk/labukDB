@@ -92,8 +92,13 @@ Everything else in the diagram (`log/`, `planner/`, `decode/`, `storage/`,
   own default) and deletes their bytes — proven to never delete a file
   still in the *current* active set even when a stale historical commit
   claims to have removed that same path (the one safety invariant that
-  actually matters). No new concurrency risk from either: old bytes stay
-  on disk until `Vacuum` runs, so an in-flight reader's isolation already
+  actually matters). **Both also work against remote (S3/MinIO/ADLS)
+  tables now** — additive `TableLocation`-based overloads, same pattern
+  as `CommitWriter`; `Vacuum`'s remote delete uses Hadoop `FileSystem.delete`,
+  live-MinIO-verified with a real `FileSystem.exists()` check proving
+  bytes were actually gone, not just logically removed. No new concurrency
+  risk from either: old bytes stay on disk until `Vacuum` runs, so an
+  in-flight reader's isolation already
   holds via `Snapshot`'s existing defensive copy.
 - **`log/TableMerger`** — ✅ **Done**: upsert/MERGE by key — `CommitWriter`
   alone can only blind-append or compact, never apply an update/delete
@@ -263,8 +268,10 @@ path has (the 10-thread test above is local-disk only).
 `SnapshotManager`/`ParquetToArrowReader` already used for reads) via
 additive `forLocation`/`TableLocation`-based constructors — the original
 local-only constructors are unchanged, zero blast radius on
-`Compactor`/`TableMerger`, which stay local-only by design. `DoPut` no
-longer rejects remote table locations. A new `TableCreator` class writes
+`Compactor`/`TableMerger`, which stayed local-only by design *at the
+time* (both later gained the same additive remote support — see the
+build-order section below). `DoPut` no longer rejects remote table
+locations. A new `TableCreator` class writes
 a table's version-0 commit (`protocol` + `metaData`, no `add` actions) —
 the capability this project never had before; every fixture until now
 hand-wrote an initial commit directly. `ArrowToDeltaSchema` is the new
@@ -326,8 +333,27 @@ foundation under it is proven:
    library and Flight levels.
 9. ✅ **`execution/` wired into `flight`.** Done, see above —
    `GROUP BY`/`ORDER BY`/`LIMIT` now reachable through a real `DoGet`
-   round trip, combined correctly across multiple files. A SQL layer
-   (deliberately deferred until this existed) is the natural next step.
+   round trip, combined correctly across multiple files, **live-MinIO-verified
+   for remote too** (`FlightRemoteAggregationMinioIntegrationTest`). A SQL
+   layer (deliberately deferred until this existed) is the natural next step.
+10. ✅ **Remote completion for the remaining local-only pieces —
+    `TableMerger`, `Compactor`, `Vacuum`, and Iceberg reads.** All four
+    were either genuinely local-only (the first three — hardcoded `Path`/
+    local `SnapshotManager`/`CommitWriter` construction throughout) or
+    structurally remote-capable but never actually run against a live
+    cluster (`IcebergTableFormat` — its constructor already took an
+    arbitrary location string + `Configuration`). `TableMerger`/`Compactor`
+    each gained an additive `TableLocation`-based overload, same pattern
+    as `CommitWriter`/`ArrowToParquetWriter`/`WriteBuffer` before them —
+    old `Path`-based public methods completely unchanged, zero blast
+    radius on existing callers/tests. `Vacuum` needed one genuinely new
+    piece on top of that: a `TableLocation`-aware file **delete** (local →
+    `Files.deleteIfExists`; remote → Hadoop `FileSystem.delete`), since
+    nothing in this codebase had needed to delete a data file remotely
+    before. All four live-MinIO-verified, including the one assertion
+    that actually matters for `Vacuum`: a real `FileSystem.exists()`
+    check against the bucket proving bytes were genuinely deleted, not
+    just that a log entry claims so.
 
 **Known, pre-existing flaky test — not caused by the work above.**
 `labukdb-flight`'s `FlightIntegrationTest` intermittently fails (~1-in-4
@@ -358,7 +384,7 @@ v1 core is the current priority; these are sequenced, not shelved.
 | `WriteBuffer` | Build-order step 2 | ✅ Done — auto-flush, crash recovery, tested |
 | Remote atomic commits (S3/MinIO/ADLS) | `HadoopLogStorage.createCommitFile`, Hadoop bumped to 3.4.3 | ✅ Implemented; **MinIO real-infra verified**, S3/ADLS implemented-but-unverified |
 | `format/TableFormat` + `DeltaTableFormat` | Additive SPI prep | ✅ Done, tested standalone |
-| **Multi-format — `labukdb-format-iceberg`** | `IcebergTableFormat`, using `iceberg-core:1.12.0` (not hand-rolled) | ✅ **Done** — read-only, path-based (`HadoopTables`, no catalog service). Validated the `TableFormat` shape as intended: surfaced two real mismatches (`atVersion`'s Delta-sequential assumption vs. Iceberg's non-sequential `snapshotId`; `schemaString`'s Delta-JSON shape vs. Iceberg's typed `Schema`) — named, not silently papered over. Also empirically proved `decode/ParquetToArrowReader` is format-agnostic: reads an Iceberg-committed file with zero changes. Tested against a self-built fixture table (`iceberg-core`'s own create API), not a Spark/Trino-written one — same caveat `CheckpointReader` carries for Delta checkpoints. |
+| **Multi-format — `labukdb-format-iceberg`** | `IcebergTableFormat`, using `iceberg-core:1.12.0` (not hand-rolled) | ✅ **Done** — read-only, path-based (`HadoopTables`, no catalog service). Validated the `TableFormat` shape as intended: surfaced two real mismatches (`atVersion`'s Delta-sequential assumption vs. Iceberg's non-sequential `snapshotId`; `schemaString`'s Delta-JSON shape vs. Iceberg's typed `Schema`) — named, not silently papered over. Also empirically proved `decode/ParquetToArrowReader` is format-agnostic: reads an Iceberg-committed file with zero changes. Tested against a self-built fixture table (`iceberg-core`'s own create API), not a Spark/Trino-written one — same caveat `CheckpointReader` carries for Delta checkpoints. **Remote (MinIO) now live-verified too** — the constructor was always location-agnostic (`HadoopTables` resolves via Hadoop's own `FileSystem`), just never actually run against a live cluster before; Iceberg's own file paths are absolute, not relative like Delta's, confirmed from how the fixture-building code registers them. |
 | `flight/DoPut` | Ingest endpoint | ✅ Done — local and remote, real `pyarrow.flight` client (local) and real `FlightClient` against live MinIO (remote) both verified |
 | `TableFormat` wired into `planner`/`flight`/`cli` | Still deferred | Two implementations now exist and have already informed the interface (see mismatches above) — wiring itself still not done |
 | Read scale-out | Self-describing Flight tickets (encode the scan directly in the ticket bytes instead of a `TicketRegistry` lookup), stateless server replicas behind a load balancer | Not started — cheap once started, no new distributed-systems machinery needed since snapshot resolution is already stateless against shared object storage |
