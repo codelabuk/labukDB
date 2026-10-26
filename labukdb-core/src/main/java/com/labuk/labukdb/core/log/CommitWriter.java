@@ -17,6 +17,7 @@ import java.util.Collection;
 import java.util.ConcurrentModificationException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
@@ -53,18 +54,20 @@ public final class CommitWriter {
     private final TableLocation tableLocation;
     private final LogStorage storage;
     private final SnapshotManager snapshotManager;
+    private final LockProvider lockProvider;
     private final ArrowToParquetWriter parquetWriter = new ArrowToParquetWriter();
     private final ObjectMapper mapper = new ObjectMapper();
 
     /** Local disk — unchanged behavior from before {@link TableLocation} existed. */
     public CommitWriter(Path tableRoot) throws IOException {
-        this(TableLocation.forLocal(tableRoot));
+        this(TableLocation.forLocal(tableRoot), null);
     }
 
-    private CommitWriter(TableLocation location) throws IOException {
+    private CommitWriter(TableLocation location, LockProvider lockProvider) throws IOException {
         this.tableLocation = location;
         this.storage = LogStorage.forLocation(location);
         this.snapshotManager = SnapshotManager.forLocation(location);
+        this.lockProvider = lockProvider;
     }
 
     /**
@@ -74,9 +77,28 @@ public final class CommitWriter {
      * is what {@code WriteBuffer}/{@code LabukDbFlightProducer} use so a
      * {@code DoPut} against a remote table works the same way a local one
      * always has.
+     *
+     * <b>No external lock</b> — safe for a single remote writer only (see
+     * {@link #forLocation(TableLocation, LockProvider)} for genuine
+     * multi-writer safety on object storage whose conditional-create isn't
+     * trustworthy under concurrency, confirmed broken on at least one real
+     * deployment; see {@link LockProvider}'s javadoc).
      */
     public static CommitWriter forLocation(TableLocation location) throws IOException {
-        return new CommitWriter(location);
+        return new CommitWriter(location, null);
+    }
+
+    /**
+     * Same as {@link #forLocation(TableLocation)}, but every commit is
+     * mediated through {@code lockProvider} — the fix for a real, confirmed
+     * gap in plain object-store conditional-create under genuine
+     * concurrency (see {@link LockProvider}'s javadoc). Opt-in: every
+     * writer of a given table must use the same {@link LockProvider} (same
+     * backing table) for this to actually provide mutual exclusion — one
+     * writer bypassing it defeats the scheme for that table.
+     */
+    public static CommitWriter forLocation(TableLocation location, LockProvider lockProvider) throws IOException {
+        return new CommitWriter(location, lockProvider);
     }
 
     /**
@@ -219,6 +241,18 @@ public final class CommitWriter {
             if (attempt > 0) {
                 backoff(attempt);
             }
+            if (lockProvider != null) {
+                // Must run BEFORE resolving `current` below: a plain file
+                // listing can't see that a *previous* writer already
+                // claimed (and maybe finished, maybe crashed on) the very
+                // next version slot via the lock -- only the lock itself
+                // knows that. Recovering any stuck entries first makes the
+                // listing below accurate, exactly mirroring why real
+                // Delta's BaseExternalLogStore treats the external store,
+                // not a directory listing, as the source of truth for
+                // "what's the real latest version."
+                catchUpViaLock(lockProvider);
+            }
             Snapshot current = snapshotManager.latest();
             long nextVersion = current.getVersion() + 1;
             List<SingleAction> actions = actionsBuilder.build(current);
@@ -228,7 +262,12 @@ public final class CommitWriter {
                 commit.append(mapper.writeValueAsString(action)).append('\n');
             }
             try {
-                storage.createCommitFile(CommitFileNames.jsonFileName(nextVersion), commit.toString());
+                String fileName = CommitFileNames.jsonFileName(nextVersion);
+                if (lockProvider != null) {
+                    commitViaLock(lockProvider, fileName, commit.toString());
+                } else {
+                    storage.createCommitFile(fileName, commit.toString());
+                }
                 return nextVersion;
             } catch (FileAlreadyExistsException | org.apache.hadoop.fs.FileAlreadyExistsException conflict) {
                 lastConflict = conflict;
@@ -237,6 +276,129 @@ public final class CommitWriter {
         }
         throw new IOException("Too much write contention on " + tableLocation
                 + " -- failed to commit after " + MAX_RETRIES + " attempts", lastConflict);
+    }
+
+    private static final long DEFAULT_LOCK_EXPIRY_SECONDS = 86_400; // 24h, matches Delta's own default entry-expiration delay
+    private static final int MAX_RECOVERY_ATTEMPTS = 3;
+
+    /**
+     * Scans forward from {@code snapshotManager.latest()}'s version + 1,
+     * recovering any stuck (incomplete) lock entries, until it finds a
+     * version with no lock entry at all — a genuinely free slot. This is
+     * what makes the lock provider (not a plain file listing) the real
+     * source of truth for "what's the next version," matching why real
+     * Delta's {@code BaseExternalLogStore} overrides {@code listFrom} to
+     * consult the external store rather than trusting a directory listing
+     * alone: a previous writer may have claimed the very next slot (and
+     * crashed, or simply not finished yet) in a way a plain listing can't
+     * see until that version's file actually exists.
+     *
+     * <b>A version check here checking only N-1 (not N itself) would be
+     * wrong</b> — found and fixed during design, not assumed correct: if
+     * the stuck entry is for the version this writer is about to attempt,
+     * checking only N-1 never notices it, the plain listing never advances
+     * past the stuck slot, and every retry recomputes the exact same
+     * {@code nextVersion}, livelocking against {@link #MAX_RETRIES} instead
+     * of self-healing.
+     */
+    private void catchUpViaLock(LockProvider lock) throws IOException {
+        String tablePath = tableLocation.raw();
+        long candidate = snapshotManager.latest().getVersion() + 1;
+        while (true) {
+            Optional<ExternalCommitEntry> existing = lock.getEntry(tablePath, CommitFileNames.jsonFileName(candidate));
+            if (existing.isEmpty()) {
+                return; // genuinely free slot
+            }
+            if (!existing.get().complete()) {
+                recoverEntry(existing.get());
+            }
+            candidate++;
+        }
+    }
+
+    /**
+     * The real fix for the confirmed MinIO conditional-create gap — mirrors
+     * real Delta Lake's {@code io.delta.storage.BaseExternalLogStore.write}
+     * (confirmed from its real source, not invented), minus the per-JVM
+     * path lock that method also takes (not needed here: {@link
+     * #commitWithRetry}'s own loop structure already serializes attempts
+     * within this process) and minus the N-1 recovery check (hoisted out to
+     * {@link #catchUpViaLock}, which runs earlier and covers this case more
+     * correctly — see its javadoc).
+     *
+     * <b>Order, exactly matching the real algorithm:</b> write the commit
+     * content to a temp file first (so a <i>different</i> process can
+     * finish this commit later if this one crashes — it has no in-memory
+     * copy of {@code content}) → write an incomplete external entry
+     * (<b>the real mutual-exclusion point</b>: {@code overwrite=false}
+     * throws on conflict, which propagates to {@link #commitWithRetry}'s
+     * existing catch clause unchanged) → write the real final file (same-
+     * process shortcut: reuse the in-memory {@code content} directly
+     * instead of a literal temp-to-final object copy) → mark the entry
+     * complete.
+     */
+    private void commitViaLock(LockProvider lock, String fileName, String content) throws IOException {
+        String tablePath = tableLocation.raw();
+
+        String tempPath = ".tmp/" + UUID.randomUUID() + ".json";
+        if (!tableLocation.isRemote()) {
+            Files.createDirectories(tableLocation.localPath().resolve("_delta_log").resolve(".tmp"));
+        }
+        storage.createCommitFile(tempPath, content);
+
+        ExternalCommitEntry entry = new ExternalCommitEntry(tablePath, fileName, tempPath, false, null);
+        lock.putEntry(entry, false); // the real mutual-exclusion point
+
+        try {
+            storage.createCommitFile(fileName, content);
+        } catch (FileAlreadyExistsException | org.apache.hadoop.fs.FileAlreadyExistsException alreadyLanded) {
+            // Another process already completed this exact entry's copy
+            // (same tempPath, so necessarily the same content) -- safe,
+            // not a version conflict, matches the real algorithm's
+            // "FileAlreadyExistsException means someone else already
+            // copied these same contents" reasoning.
+        }
+        lock.putEntry(entry.asComplete(DEFAULT_LOCK_EXPIRY_SECONDS), true);
+    }
+
+    /**
+     * Mirrors real Delta's {@code fixDeltaLog}: given a previous writer's
+     * incomplete entry, finish what it started (the final file's content is
+     * recoverable from {@code entry.tempPath()}, written by that writer
+     * before it died or lost a race) and mark it complete, so this writer
+     * can safely build on top of it. Bounded retries, matching the real
+     * algorithm's shape.
+     */
+    private void recoverEntry(ExternalCommitEntry entry) {
+        IOException lastError = null;
+        for (int attempt = 0; attempt < MAX_RECOVERY_ATTEMPTS; attempt++) {
+            try {
+                try {
+                    String content = readAll(storage.openReader(entry.tempPath()));
+                    storage.createCommitFile(entry.fileName(), content);
+                } catch (FileAlreadyExistsException | org.apache.hadoop.fs.FileAlreadyExistsException alreadyThere) {
+                    // the final file already exists -- fine, fall through to mark complete
+                }
+                lockProvider.putEntry(entry.asComplete(DEFAULT_LOCK_EXPIRY_SECONDS), true);
+                return;
+            } catch (IOException e) {
+                lastError = e;
+            }
+        }
+        throw new java.io.UncheckedIOException(
+                "Failed to recover incomplete commit entry " + entry.fileName()
+                        + " after " + MAX_RECOVERY_ATTEMPTS + " attempts", lastError);
+    }
+
+    private static String readAll(java.io.BufferedReader reader) throws IOException {
+        try (reader) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+            return sb.toString();
+        }
     }
 
     /** Small randomized backoff so retrying writers don't lock-step collide on every attempt. */

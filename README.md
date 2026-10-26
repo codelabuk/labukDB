@@ -392,6 +392,27 @@ top of it: an actual remote file **delete** (Hadoop `FileSystem.delete`),
 confirmed with a real `FileSystem.exists()` check proving bytes are
 genuinely gone from the bucket, not just logically removed from the log.
 
+**Caveat, confirmed not assumed: a single remote writer is safe by
+default; concurrent remote writers need an opt-in lock.** A dedicated
+concurrent-writer stress test against real MinIO found that this
+deployment's object store does **not** reliably enforce the
+conditional-create guarantee the remote commit path depends on — under
+genuine concurrent writers without the lock, commits can silently collide
+and overwrite each other with no error raised
+(`CommitWriterConcurrentMinioIntegrationTest`, left failing on purpose as
+a standing proof). **Fixed via an opt-in `LockProvider`**
+(`CommitWriter.forLocation(location, lockProvider)`, one shipped
+implementation `DynamoDbLockProvider`) — live-verified: the same scenario
+that fails above passes cleanly with the lock engaged
+(`CommitWriterConcurrentMinioLockedIntegrationTest`, real MinIO +
+`amazon/dynamodb-local`). Scoped deliberately as a mitigation for
+non-compliant S3-compatible storage, not a universal requirement — real
+AWS S3, Azure ADLS, and GCS are documented as reliable here without any
+lock at all, so a genuine cloud deployment likely never needs to configure
+one. See `docs/labukdb-v2-architecture.md`'s OCC section for the full
+story, including the one real design bug found and fixed while building
+this (checking only version N-1 for a stuck entry doesn't work).
+
 ### Configuring a remote backend
 
 No config file today — the CLI and Flight server both read connector
@@ -498,18 +519,37 @@ push-based tailing/subscription yet.
 - **CREATE TABLE** (`TableCreator`) — done, local and remote, live-MinIO-
   verified. Library capability only — no Flight `DoAction` RPC or CLI
   subcommand yet. Delta only — no Iceberg equivalent.
-- **Iceberg append** (`IcebergTableWriter`, `DoPut`) — done, append to an
-  already-existing table only. Reuses `iceberg-core`'s own
-  `Table.newAppend().commit()`, which already retries internally under a
-  concurrent-writer conflict (confirmed against its real bytecode) — no
-  hand-built OCC loop needed, unlike `CommitWriter`'s. No Iceberg CREATE
-  TABLE, merge/upsert, compaction, or vacuum.
+- **Iceberg append** (`IcebergTableWriter`, `DoPut`) — single-writer safe,
+  **confirmed broken for genuine concurrent writers on real MinIO** via
+  path-based `HadoopTables` (no Iceberg CREATE TABLE, merge/upsert,
+  compaction, or vacuum either way). A real 8-separate-process stress test
+  found 6 of 8 concurrent appends silently lost — every writer reported
+  success, only 2 of 8 files survived. Root cause traced through
+  `iceberg-core`'s real source: `HadoopTableOperations.renameToFinal`'s
+  default `LockManager` is per-JVM-only (zero protection across real
+  processes), its `fs.exists(dst)` pre-check races with no real lock
+  behind it, and its final `fs.rename()` assumes atomicity that holds on
+  HDFS/local disk but not on S3A, where rename is copy-then-delete —
+  every racing writer's rename can "succeed" with no conflict ever
+  detected. Matches Iceberg's own documented guidance that `HadoopTables`/
+  `HadoopCatalog` are unsafe for concurrent S3 use; the documented fix is
+  a real catalog service (REST/Hive/Glue), which this project supports via
+  `IcebergTableWriter(Catalog, TableIdentifier)` but hasn't live-verified
+  for concurrency either. No lock-based mitigation built for this path
+  (unlike Delta's `LockProvider`) — full detail in `IcebergTableWriter`'s
+  own javadoc and `docs/labukdb-v2-architecture.md`.
 - **Not implemented:** CLI write subcommands (`ingest`/`compact`/`vacuum`/
   `create-table` — the CLI is `catalog`/`describe`/`query` only, for both
-  formats); Iceberg CREATE TABLE/merge/compaction/vacuum; remote
-  multi-writer OCC (Delta) has the right exception-handling in place but
-  hasn't been separately stress-tested under concurrent remote writers
-  the way local disk has.
+  formats); Iceberg CREATE TABLE/merge/compaction/vacuum; read-path
+  proactive recovery for the remote OCC lock below (see the Roadmap table).
+- **Remote multi-writer OCC (Delta) — fixed via an opt-in external lock.**
+  Confirmed broken against real MinIO without one (commits can silently
+  collide — see the caveat above), now fixed with
+  `CommitWriter.forLocation(location, lockProvider)` and a shipped
+  `DynamoDbLockProvider`, live-verified the same scenario now passes with
+  the lock engaged. Deliberately scoped as a mitigation for non-compliant
+  S3-compatible storage, not a universal requirement; see
+  `docs/labukdb-v2-architecture.md`.
 
 **Query/analytics support:** `GROUP BY` (`SUM`/`COUNT`/`MIN`/`MAX`/`AVG`)
 and `ORDER BY`/`LIMIT` are both reachable through a real `DoGet` round
@@ -602,8 +642,8 @@ dependencies:
 | Iceberg write support beyond append | `IcebergTableWriter` does append (`DoPut` + embedded library), reusing `iceberg-core`'s own OCC-retrying `Table.newAppend().commit()` — no Iceberg CREATE TABLE, merge/upsert, compaction, or vacuum yet |
 | CLI write subcommands | `ingest`/`compact`/`vacuum`/`create-table` — the write-path classes all exist as library capabilities, none are exposed via the CLI yet |
 | Flight `DoAction` for CREATE TABLE | `TableCreator` is a library capability only; needs its own request/response shape decision |
-| Remote multi-writer OCC stress-testing | Conflict-retry logic handles both local (NIO) and remote (Hadoop) exception types; not separately stress-tested under concurrent remote writers the way local disk is |
 | Orphan-file detection | `Vacuum` only acts on files an explicit `remove` action named — a file written but never committed (e.g. a crash mid-write) is never found, the same gap Iceberg's separate `DeleteOrphanFiles` covers |
+| Remote multi-writer OCC lock — read-path recovery | The shipped `LockProvider` fix (see below) only recovers a stuck entry when the *next writer* attempts a commit; a table abandoned mid-write and never written to again before the lock entry's TTL expires stays unrecovered. Real Delta's own design carries the identical limitation. |
 
 ### Core engine
 | Item | Notes |
@@ -619,7 +659,7 @@ dependencies:
 |---|---|
 | Iceberg read support | ✅ Done (`labukdb-format-iceberg`) — path-based and REST-catalog-based, local and remote (live-MinIO-verified for path-based), tested against a self-built fixture rather than a Spark/Trino-written table. Reachable via `--table`/`--sql`/Flight now too (auto-detected: `_delta_log/`/`metadata/` probing, or an `icebergrest://` reference), not just as a library call — see [USAGE.md](USAGE.md#delta-vs-iceberg) |
 | Iceberg write support | ✅ Append only (`IcebergTableWriter`, `DoPut` + embedded library) — no CREATE TABLE, merge/upsert, compaction, or vacuum. `iceberg-core`'s own commit protocol handles OCC retry internally, unlike Delta's hand-built one |
-| Iceberg catalog-service integration | ✅ REST catalog done (`IcebergRestConfiguration`, `icebergrest://` references) — `RESTCatalog` and its HTTP client (`httpclient5`) are already bundled/transitively resolved via `iceberg-core`, zero new dependency needed. **Implemented, not live-verified** — no real REST catalog server was available to test the network round-trip against; the format-agnostic `Catalog`-based read/write logic it feeds into is fully tested against a real `InMemoryCatalog` instead. Hive Metastore/Glue/Nessie remain unbuilt |
+| Iceberg catalog-service integration | ✅ REST catalog done (`IcebergRestConfiguration`, `icebergrest://` references) — `RESTCatalog` and its HTTP client (`httpclient5`) are already bundled/transitively resolved via `iceberg-core`, zero new dependency needed. **Live-verified** — real wire-protocol round trip against `tabulario/iceberg-rest` (the standard open-source reference REST catalog server): connect, create namespace/table, load back with correct schema/spec, drop (`IcebergRestCatalogLiveIntegrationTest`). The format-agnostic `Catalog`-based read/write logic it feeds into is also fully tested against a real `InMemoryCatalog`. Hive Metastore/Glue/Nessie remain unbuilt |
 | `TableFormat` wired into `cli`/`flight` | ✅ Done for Iceberg's query path specifically (`DetectedFormat` + `QueryPlanner.planNormalized`) — Delta's own query path still bypasses it (`SnapshotManager`/`QueryPlanner.plan`/`ScanPlan`/`AddFile`, deliberately left unchanged; `Snapshot` is built from real commit-log actions in a way nothing can fake for Iceberg, so this was a genuine second path, not a shared-everything refactor) |
 | Parquet-only tables (no transaction log) | Direct file listing with stats, no commit log |
 

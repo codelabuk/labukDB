@@ -96,16 +96,20 @@ location, and reading/writing that location still goes through this
 project's existing `TableLocation`-based connectors, same as everywhere
 else.
 
-**Implemented, not live-verified against a real REST catalog server** —
-no such server was available in this project's development environment
-to test the actual network round-trip against. The format-agnostic
-`Catalog`-based logic this feeds into (`IcebergTableFormat`/
-`IcebergTableWriter`'s `Catalog` constructors) is fully tested against a
-real `InMemoryCatalog` (a genuine Iceberg `Catalog` implementation, not a
-mock) — proving the actual read/write logic is correct for *any*
-catalog, `RESTCatalog` included, since they share one interface — same
-honesty standard this project already applies to native S3/ADLS
-("implemented, not yet verified against a real endpoint").
+**Live-verified against a real REST catalog server** —
+`tabulario/iceberg-rest` (the standard open-source reference
+implementation), run locally: connect, create a namespace/table, load it
+back with the correct schema and partition spec, drop it — a genuine HTTP
+round trip, not just an in-process `Catalog` call. Scoped to metadata/
+wire-protocol operations, not yet a full write-then-read data round trip
+(aligning `IcebergTableWriter`'s own JVM-side data writes with a REST
+server's warehouse path across host/container boundaries is its own
+separate constraint). The format-agnostic `Catalog`-based logic this feeds
+into (`IcebergTableFormat`/`IcebergTableWriter`'s `Catalog` constructors)
+is also fully tested against a real `InMemoryCatalog` (a genuine Iceberg
+`Catalog` implementation, not a mock) — proving the actual read/write
+logic is correct for *any* catalog, `RESTCatalog` included, since they
+share one interface.
 
 ---
 

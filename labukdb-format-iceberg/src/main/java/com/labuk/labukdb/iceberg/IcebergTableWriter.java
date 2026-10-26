@@ -34,6 +34,47 @@ import java.util.UUID;
  * already worked) — no CREATE TABLE, no merge/upsert, no compaction, no
  * vacuum. The table must already exist (via {@code HadoopTables.create}
  * or equivalent external Iceberg tooling).
+ *
+ * <h2>Path-based ({@link #IcebergTableWriter(TableLocation)}): confirmed
+ * broken under genuine concurrent writers on real MinIO — root-caused,
+ * not just documented as a risk.</h2>
+ * A real 8-separate-process stress test against real MinIO found 6 of 8
+ * concurrent appends silently lost — each writer reported success, but
+ * only 2 of the 8 files ended up visible in the final table (see {@code
+ * IcebergTableWriterConcurrentMinioIntegrationTest}). Root cause, traced
+ * through {@code iceberg-core}'s real source
+ * ({@code HadoopTableOperations.renameToFinal}), not assumed:
+ * <ol>
+ *   <li>It acquires a {@code LockManager} lock before committing — but
+ *       {@code HadoopTables}' default {@code LockManager} is {@code
+ *       InMemoryLockManager}, a plain {@code HashMap} living inside one
+ *       JVM's memory (confirmed via bytecode). Separate processes each get
+ *       their own private, empty lock table — this provides <i>zero</i>
+ *       real protection across genuinely independent writers.</li>
+ *   <li>It then checks {@code fs.exists(dst)} before committing — a
+ *       classic check-then-act race with no real lock behind it: multiple
+ *       writers can all see "doesn't exist yet" simultaneously.</li>
+ *   <li>It then calls {@code fs.rename(src, dst)}, with the library's own
+ *       comment stating <i>"this rename operation is the atomic commit
+ *       operation"</i> — true on HDFS/local disk (a metadata-only pointer
+ *       swap), false on S3A, where rename is copy-then-delete: two
+ *       separate network calls, no compare-and-swap, no rejection if the
+ *       destination was already written. Every racing writer's rename can
+ *       return {@code true} (success) with no conflict ever detected —
+ *       last writer to finish physically wins, silently, with no
+ *       exception for anyone to retry on.</li>
+ * </ol>
+ * This matches Iceberg's own documentation, which already calls {@code
+ * HadoopTables}/{@code HadoopCatalog} unsafe for concurrent use on
+ * S3-compatible storage — the real fix is a catalog service (REST, Hive
+ * Metastore, Glue) whose commit is backed by an actual database
+ * transaction, not an object-store rename. No lock-based mitigation has
+ * been built for this path (unlike {@code CommitWriter}'s {@code
+ * LockProvider}) — Delta's log format needs one because every reader
+ * depends on immutable numbered files; Iceberg's own documented answer is
+ * "use a real catalog instead," which this project already supports via
+ * {@link #IcebergTableWriter(Catalog, TableIdentifier)}, not yet
+ * live-verified for concurrency either.
  */
 public final class IcebergTableWriter {
 

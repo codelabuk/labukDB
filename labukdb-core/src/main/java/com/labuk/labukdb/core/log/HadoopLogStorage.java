@@ -41,34 +41,50 @@ import java.util.List;
  *
  * <h2>{@code createCommitFile} — atomicity per backend</h2>
  * Implemented via the standard {@code FileSystem.create(path, overwrite=false)}
- * contract, which throws {@link FileAlreadyExistsException} if the file is
- * already there. Whether that's genuinely race-free, not just
- * check-then-act, differs by backend — confirmed via Hadoop's own issue
- * tracker, not assumed:
+ * contract, which is <i>supposed</i> to throw {@link FileAlreadyExistsException}
+ * if the file is already there. <b>Confirmed, not assumed, that this
+ * guarantee does not reliably hold for every real backend under genuine
+ * concurrency</b> — see the MinIO finding below, which is the actual
+ * reason to distrust this primitive rather than theorize about it:
  * <ul>
- *   <li><b>S3 (native AWS):</b> atomic as of Hadoop 3.4.2+'s conditional
- *       PUT at stream close (<a href="https://issues.apache.org/jira/browse/HADOOP-19256">HADOOP-19256</a>,
- *       {@code fs.s3a.create.conditional.enabled}, on by default). This
- *       project pins Hadoop 3.4.3.</li>
- *   <li><b>MinIO:</b> same code path as S3. <b>Verified against a real
- *       cluster</b> ({@code quay.io/minio/minio:latest}, 2026-10-20) —
- *       create, read-back, a conflicting second create correctly threw
- *       {@link FileAlreadyExistsException}, and the original content
- *       survived untouched. Not a universal guarantee for every MinIO
- *       version/build — a different deployment should still be checked —
- *       but this specific, common image does honor the conditional-write
- *       header S3A relies on.</li>
+ *   <li><b>S3 (native AWS):</b> Hadoop 3.4.2+ added a conditional PUT at
+ *       stream close (<a href="https://issues.apache.org/jira/browse/HADOOP-19256">HADOOP-19256</a>,
+ *       {@code fs.s3a.create.conditional.enabled}, on by default; this
+ *       project pins Hadoop 3.4.3). Never exercised against a real AWS
+ *       endpoint from this codebase.</li>
+ *   <li><b>MinIO: confirmed NOT safe under real concurrency, on at least
+ *       one real deployment.</b> A single <i>sequential</i> conflict
+ *       (create, then a deliberately conflicting second create) does
+ *       throw {@link FileAlreadyExistsException} correctly — that much was
+ *       verified against a real cluster ({@code quay.io/minio/minio:latest},
+ *       2026-10-20) and still holds. But a dedicated concurrency test later
+ *       found the opposite result under genuine simultaneous writers: an
+ *       isolated diagnostic — 8 threads calling {@code fs.create(path,
+ *       overwrite=false)} on the identical key, at once, no retry logic
+ *       involved — got 8 "successes" and zero conflicts detected. This
+ *       deployment simply does not enforce the conditional-write header
+ *       under concurrency, even though it honors it sequentially. Matches
+ *       HADOOP-19256's own release notes, which warn conditional-write
+ *       support "may not be supported on third party stores" and "can't
+ *       be confirmed without testing" — this is exactly that case. See
+ *       {@code CommitWriterConcurrentMinioIntegrationTest}, which fails on
+ *       purpose as a standing proof of this gap, and
+ *       {@code docs/labukdb-v2-architecture.md}'s OCC table for the fix
+ *       this implies (an out-of-band lock, not a retry-loop change —
+ *       not yet designed).</li>
  *   <li><b>ADLS Gen2:</b> protected by Hadoop's create-without-overwrite-first
  *       pattern since Hadoop 3.3.0 (<a href="https://issues.apache.org/jira/browse/HADOOP-17215">HADOOP-17215</a>)
  *       — plausibly safe given ADLS's API has a real create-vs-overwrite
- *       distinction S3 lacked until 2024, but not proven against a real
- *       ADLS endpoint from this codebase.</li>
+ *       distinction S3 lacked until 2024, but given the MinIO finding
+ *       above, not safe to assume correct without the same kind of
+ *       concurrent-writer test; not proven against a real ADLS endpoint
+ *       from this codebase either way.</li>
  * </ul>
- * None of the three have been exercised against real cloud infrastructure
- * from this environment — what's tested here is the contract itself
- * (create-then-recreate-fails) against Hadoop's local filesystem
- * implementation, the same substitution {@code HadoopBackedSnapshotManagerTest}
- * already uses for the read path.
+ * The practical conclusion: this project's remote multi-writer OCC
+ * correctness guarantee currently depends on an assumption that's known to
+ * be false for at least one common real deployment. Single-writer remote
+ * use (the only case actually proven safe) is fine; concurrent remote
+ * writers are not, until a real external lock is built.
  */
 final class HadoopLogStorage implements LogStorage {
 

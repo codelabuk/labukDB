@@ -242,14 +242,72 @@ and it's not uniform:
 |---|---|---|
 | Local disk | `Files.createFile(path, CREATE_NEW)` | Done, trivially atomic |
 | S3 (native AWS) | `If-None-Match: *` conditional PUT, via Hadoop ≥3.4.2's S3A support ([HADOOP-19256](https://issues.apache.org/jira/browse/HADOOP-19256)) | **Implemented** (`log/HadoopLogStorage`, Hadoop bumped to 3.4.3) — verified only via local-filesystem substitution (`HadoopLogStorageTest`), **not a real AWS endpoint** |
-| MinIO | Same S3A code path | **Implemented and verified against a real cluster** (`quay.io/minio/minio:latest`) — create, read-back, conflicting second create correctly threw `FileAlreadyExistsException`, original content survived. Not a guarantee for every MinIO build, but this common image works. |
-| ADLS Gen2 | Create-without-overwrite-first, via `abfs` ([HADOOP-17215](https://issues.apache.org/jira/browse/HADOOP-17215), already in Hadoop 3.3.0+) | **Implemented**, same code path as S3/MinIO — **unverified against a real ADLS endpoint** |
+| MinIO | Same S3A code path | ⚠️ **Confirmed NOT atomic under real concurrency, on at least one real deployment.** A single *sequential* conflict (create, then a deliberately conflicting second create) does throw `FileAlreadyExistsException` correctly (`HadoopLogStorageMinioIntegrationTest`) — but that is not the same claim as "safe for concurrent writers," and it isn't one. An isolated diagnostic (8 threads calling `fs.create(path, overwrite=false)` on the *identical* key, simultaneously, no `CommitWriter` logic involved) found all 8 "succeeded" and zero conflicts were detected — see `CommitWriterConcurrentMinioIntegrationTest`, which fails on purpose as a standing proof of this gap. Matches a documented Hadoop caveat: [HADOOP-19256](https://issues.apache.org/jira/browse/HADOOP-19256)'s own release notes warn conditional-write support "may not be supported on third party stores" and "can't be confirmed without testing" — this is exactly that case, confirmed. |
+| ADLS Gen2 | Create-without-overwrite-first, via `abfs` ([HADOOP-17215](https://issues.apache.org/jira/browse/HADOOP-17215), already in Hadoop 3.3.0+) | **Implemented**, same code path as S3/MinIO — **unverified against a real ADLS endpoint**, and given the MinIO finding above, not safe to assume correct without the same kind of concurrent-writer test |
 
 Real Delta Lake OSS historically needed an external coordinator (a
 DynamoDB table) for S3 specifically, before S3 gained native conditional
-writes. This project would have hit the same problem if it had assumed
-otherwise without checking — which is exactly why this was researched
-before being implemented, not assumed.
+writes. **This project just rediscovered exactly why, the hard way, on a
+real third-party S3-compatible store.** Relying on
+`fs.s3a.create.conditional.enabled` alone is known to be insufficient for
+this project's actual multi-writer correctness requirement on at least one
+real deployment.
+
+**Update — the fix is now done: an opt-in `LockProvider` (`log/LockProvider.java`,
+one implementation `log/DynamoDbLockProvider.java`), engaged via
+`CommitWriter.forLocation(location, lockProvider)`.** `CommitWriter.forLocation(location)`
+(no lock) is unchanged and remains the default. Full write-path crash
+recovery, mirroring real Delta's own `io.delta.storage.BaseExternalLogStore`
+algorithm precisely (confirmed from its real source, not invented): a
+commit writes its content to a temp file first, claims an incomplete
+external lock entry (the real mutual-exclusion point), writes the final
+file, then marks the entry complete; the next writer recovers any stuck
+entry for the version it's about to attempt before proceeding — a design
+bug found and fixed during implementation, not assumed correct the first
+time (checking only version N-1 for a stuck entry doesn't work, since the
+stuck slot is N itself; see `CommitWriter.catchUpViaLock`'s javadoc for the
+full reasoning).
+
+**Scope, stated precisely — a mitigation for non-compliant S3-compatible
+object storage, not a universal multi-cloud requirement.** Real AWS S3
+(conditional writes since late 2024), real Google Cloud Storage
+(strongly-consistent generation-precondition creates for years, per
+Google's own docs), and real Azure Blob Storage/ADLS (`If-None-Match: *`, a
+long-standing native REST feature) are all documented as reliable without
+any external lock — the gap this fixes is specifically third-party
+S3-compatible re-implementations (this real MinIO deployment being the
+confirmed case), matching HADOOP-19256's own caveat about third-party
+stores, not S3 itself. (Documented, not independently re-verified the way
+the MinIO failure was — same honesty standard applied throughout.) A real
+AWS/Azure/GCP deployment should likely never need to configure a
+`LockProvider` at all; it exists for self-hosted/non-compliant storage.
+`DynamoDbLockProvider` was chosen as the one shipped implementation because
+it works identically against real AWS DynamoDB or a self-hostable
+`amazon/dynamodb-local` container (zero new Maven dependency — already
+transitively present via `hadoop-aws`'s bundled AWS SDK), so a MinIO-only
+deployment doesn't need an AWS account to get a real lock.
+
+**Verified empirically, matching the rigor that found the original bug:**
+a live 8-thread conditional-`PutItem` race against `amazon/dynamodb-local`
+produced exactly 1 success and 7 clean `ConditionalCheckFailedException`s —
+the real atomicity MinIO's own conditional-create lacks. The actual
+end-to-end proof — the same 8-concurrent-writer-against-real-MinIO scenario
+that fails without the lock — passes cleanly with it engaged
+(`CommitWriterConcurrentMinioLockedIntegrationTest`). A deterministic
+local-only test (`CommitWriterLockRecoveryTest`) exercises the crash-recovery
+branch directly, since the live-infra tests structurally can't trigger it
+(8 simultaneous non-crashing writers never leave a stuck entry behind). The
+original unlocked test (`CommitWriterConcurrentMinioIntegrationTest`) is
+left untouched, still failing on purpose, as the standing proof of the
+underlying storage-layer gap this feature mitigates.
+
+**Known, documented limitation, not solved:** write-path-only recovery (the
+next writer repairs a stuck prior entry before proceeding) — not read-path
+proactive recovery. A table abandoned mid-write and never written to again
+before the lock entry's TTL expires stays unrecovered; real Delta's own
+design carries the identical limitation. Also: every writer of a given
+table must agree on using the same `LockProvider` (same backing table), or
+none at all — one writer bypassing it defeats the scheme for that table.
 
 **Update — multi-writer OCC is now done, for local disk.** `CommitWriter.appendBatch`
 and `.replaceFiles` both retry under optimistic concurrency control when
@@ -361,6 +419,16 @@ top-N `ORDER BY ... LIMIT`, the same correctness bar
 **Deliberately not done here:** SQL-over-Flight (translating SQL text
 into the `FlightQueryRequest` JSON shape server-side) — a client still
 builds that JSON shape directly; this pass is CLI-only.
+
+**Update — `--sql` is now live-verified against a real MinIO-backed
+table too**, closing a real coverage gap: the MinIO-verified aggregation
+path was previously only exercised via Flight's `combineMode`, and the
+CLI's own SQL entry point had never actually been driven against a remote
+table directly — correctness was inferred from shared plumbing, not
+confirmed. `QueryCommandSqlMinioIntegrationTest` issues real `--sql`
+commands (`GROUP BY`+`COUNT`, `ORDER BY ... LIMIT`, `WHERE`) against a
+table built with real `TableCreator`/`CommitWriter` calls against live
+MinIO — all three pass.
 
 **Update — Iceberg reads are now wired into `cli`/`flight`, closing a
 real honesty gap.** Confirmed via grep before this change: zero
@@ -523,21 +591,34 @@ reusing the exact remote-config-merging logic `TableResolver`/
 caller-supplied `TableLocation` to work from.
 
 **Testing honesty, stated up front rather than discovered at
-verification time:** no real or fake Iceberg REST catalog server exists
-in this development environment. The format-agnostic `Catalog`-based
-core (both new constructors) is fully tested against a real
-`InMemoryCatalog` — a genuine `iceberg-core`-bundled `Catalog`
-implementation, not a mock — proving the actual read/write logic correct
-for *any* catalog, `RESTCatalog` included, since they share one
+verification time:** no real or fake Iceberg REST catalog server existed
+in this development environment when this was first written. The
+format-agnostic `Catalog`-based core (both new constructors) is fully
+tested against a real `InMemoryCatalog` — a genuine `iceberg-core`-bundled
+`Catalog` implementation, not a mock — proving the actual read/write logic
+correct for *any* catalog, `RESTCatalog` included, since they share one
 interface. `IcebergRestConfiguration`'s env-var → property-map mapping is
-unit-tested. The actual `RESTCatalog` network round-trip and the
-`icebergrest://` CLI/Flight routing are implemented and proven to *route
-correctly* (new tests assert the specific `ICEBERG_REST_URI`-required
-error a REST-catalog reference reaches, not some unrelated
-Delta/path-based error a misrouted request would produce instead) but
-not live-verified against a real server — same honesty standard this
-project already applies to native S3/ADLS ("implemented, not yet
-verified against a real endpoint").
+unit-tested. The `icebergrest://` CLI/Flight routing is proven to *route
+correctly* (tests assert the specific `ICEBERG_REST_URI`-required error a
+REST-catalog reference reaches, not some unrelated Delta/path-based error
+a misrouted request would produce instead).
+
+**Update — the actual `RESTCatalog` network round-trip is now
+live-verified too**, closing the one gap this section originally
+flagged. `tabulario/iceberg-rest` (the standard open-source reference
+Iceberg REST catalog server) was run locally and `IcebergRestConfiguration
+.connect()` proven to genuinely speak the protocol end to end: connect,
+create a namespace, create a table with a real schema and partition spec,
+load it back and confirm both survived a real HTTP round trip, then drop
+it (`IcebergRestCatalogLiveIntegrationTest`). Scoped deliberately to
+metadata/wire-protocol operations, not a full write-then-read data round
+trip — `IcebergTableWriter`'s data files are written directly by this
+project's own JVM, and aligning that with a REST server's warehouse path
+across this (Windows-host, Linux-container) development environment
+without materializing cloud credentials into the container turned out to
+be its own real constraint, not glossed over. The read/write logic itself
+was already proven correct for any `Catalog` via `InMemoryCatalog` above;
+what this adds is proof the wire protocol itself genuinely works.
 
 **Update — DECIMAL type support is now done, in the shared `decode/`/
 `encode/` codec both Delta and Iceberg already go through unchanged (not
@@ -603,6 +684,62 @@ file: write + full write-then-read round trip, null handling, and the
 re-run clean: 161/161 passing (146 pre-existing + 15 new), 0
 failures/errors, 5 skipped — unchanged from baseline, confirming zero
 regression.
+
+**Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
+confirmed broken on real MinIO, root-caused precisely, not just
+documented as a risk.** A real 8-separate-process stress test
+(`IcebergTableWriterConcurrentMinioIntegrationTest`) found 6 of 8
+concurrent appends silently lost — every writer reported success, only 2
+of the 8 files ended up visible in the final table.
+
+**Took three attempts to get a methodologically sound test, each failure
+itself a real, worthwhile finding:**
+1. First attempt used threads, not separate processes — a false negative.
+   Bytecode inspection of `iceberg-core` found `HadoopTables`' default
+   `LockManager` is `InMemoryLockManager`, a plain `HashMap` living inside
+   one JVM. Threads sharing one process share that lock and get perfectly
+   serialized by it — never exercising the real storage-layer risk at all.
+2. The process-based rewrite then deadlocked: `Process.waitFor()` was
+   called before draining each child's stdout pipe, and a worker's routine
+   SLF4J/log4j/Hadoop startup logging filled the OS pipe buffer before it
+   ever printed its one real result line — both sides blocked forever.
+   Fixed by redirecting each worker's output to a file instead of a pipe.
+3. The fixed version then crashed immediately: `ProcessBuilder` doesn't
+   inherit the parent JVM's own command-line flags (only its environment),
+   and this project's root `pom.xml` sets `--add-opens` for Arrow's
+   off-heap memory access via Surefire's `argLine` — a plain child `java`
+   invocation lacks it, so every worker died on Arrow's `MemoryUtil` init
+   before ever touching MinIO. Fixed by passing the flag explicitly.
+
+**Root cause, traced through `iceberg-core`'s real source
+(`HadoopTableOperations.renameToFinal`), not assumed:**
+1. It acquires a `LockManager` lock first — but as found above, the
+   default is per-JVM-only and provides zero protection across genuinely
+   separate processes.
+2. It then checks `fs.exists(dst)` — a classic check-then-act race with no
+   real lock behind it.
+3. It then calls `fs.rename(src, dst)`, with the library's own code
+   comment stating *"this rename operation is the atomic commit
+   operation"* — true on HDFS/local disk (a metadata-only pointer swap),
+   false on S3A, where rename is copy-then-delete: two separate network
+   calls, no compare-and-swap, no rejection if the destination was already
+   written. Every racing writer's rename can return `true` with no
+   conflict ever detected — last physical writer wins, silently, with no
+   exception for anyone to retry on. (`SnapshotProducer`'s own retry loop
+   only fires on an actual `CommitFailedException` — a writer that hits
+   this exact race never gets one.)
+
+This matches Iceberg's own documentation, which already calls
+`HadoopTables`/`HadoopCatalog` unsafe for concurrent use on S3-compatible
+storage. **No lock-based mitigation has been built for this path** (unlike
+`CommitWriter`'s `LockProvider`) — Delta's log format needs an external
+lock because every reader depends on immutable numbered files; Iceberg's
+own documented answer is "use a real catalog instead" (REST, Hive
+Metastore, Glue — whose commit is backed by an actual database
+transaction, not an object-store rename), which this project already
+supports via `IcebergTableWriter(Catalog, TableIdentifier)`, but that path
+is not yet live-verified for concurrency either. Full details in
+`IcebergTableWriter`'s own javadoc.
 
 ## Build order
 
@@ -733,7 +870,7 @@ v1 core is the current priority; these are sequenced, not shelved.
 |---|---|---|
 | `CommitWriter` (single-writer) + `encode/` | Build-order steps 1 | ✅ Done — tested against a fixture and a real table |
 | `WriteBuffer` | Build-order step 2 | ✅ Done — auto-flush, crash recovery, tested |
-| Remote atomic commits (S3/MinIO/ADLS) | `HadoopLogStorage.createCommitFile`, Hadoop bumped to 3.4.3 | ✅ Implemented; **MinIO real-infra verified**, S3/ADLS implemented-but-unverified |
+| Remote atomic commits (S3/MinIO/ADLS) | `HadoopLogStorage.createCommitFile`, Hadoop bumped to 3.4.3 | ✅ Implemented; **MinIO real-infra verified for a single sequential writer only** — ⚠️ confirmed NOT atomic under genuine concurrent writers on this real deployment, see the OCC table above. S3/ADLS implemented-but-unverified either way. |
 | `format/TableFormat` + `DeltaTableFormat` | Additive SPI prep | ✅ Done, tested standalone |
 | **Multi-format — `labukdb-format-iceberg`** | `IcebergTableFormat`, using `iceberg-core:1.12.0` (not hand-rolled) | ✅ **Done** — read-only, path-based (`HadoopTables`, no catalog service). Validated the `TableFormat` shape as intended: surfaced two real mismatches (`atVersion`'s Delta-sequential assumption vs. Iceberg's non-sequential `snapshotId`; `schemaString`'s Delta-JSON shape vs. Iceberg's typed `Schema`) — named, not silently papered over. Also empirically proved `decode/ParquetToArrowReader` is format-agnostic: reads an Iceberg-committed file with zero changes. Tested against a self-built fixture table (`iceberg-core`'s own create API), not a Spark/Trino-written one — same caveat `CheckpointReader` carries for Delta checkpoints. **Remote (MinIO) now live-verified too** — the constructor was always location-agnostic (`HadoopTables` resolves via Hadoop's own `FileSystem`), just never actually run against a live cluster before; Iceberg's own file paths are absolute, not relative like Delta's, confirmed from how the fixture-building code registers them. |
 | `flight/DoPut` | Ingest endpoint | ✅ Done — local and remote, real `pyarrow.flight` client (local) and real `FlightClient` against live MinIO (remote) both verified |
@@ -741,7 +878,8 @@ v1 core is the current priority; these are sequenced, not shelved.
 | Read scale-out | Self-describing Flight tickets (encode the scan directly in the ticket bytes instead of a `TicketRegistry` lookup), stateless server replicas behind a load balancer | Not started — cheap once started, no new distributed-systems machinery needed since snapshot resolution is already stateless against shared object storage |
 | CREATE TABLE | `TableCreator`, local + remote | ✅ **Done** — library capability only, not exposed over Flight/CLI yet |
 | Multi-writer OCC — local disk | Retry + conflict detection in `CommitWriter` | ✅ **Done** — real 10-thread + real-table concurrency tests, see "Concurrent writes" above |
-| Multi-writer OCC — remote (S3/MinIO/ADLS) | `commitWithRetry` now catches both NIO and Hadoop `FileAlreadyExistsException` classes | Conflict-retry logic in place; not separately stress-tested under concurrent remote writers the way local disk is |
+| Multi-writer OCC — remote, no lock (S3/MinIO/ADLS) | `commitWithRetry`'s plain create-if-absent path | 🔴 **Confirmed broken on at least one real MinIO deployment** — silent lost updates under genuine concurrency (`CommitWriterConcurrentMinioIntegrationTest`, left failing on purpose as a standing proof). This is the real-cloud-likely-fine, self-hosted-storage-risky case — see the lock row below. |
+| Multi-writer OCC — remote, with lock | New opt-in `LockProvider`/`DynamoDbLockProvider`, `CommitWriter.forLocation(location, lockProvider)` | ✅ **Done, live-verified** — same scenario that fails above now passes with the lock engaged (`CommitWriterConcurrentMinioLockedIntegrationTest`, real MinIO + `amazon/dynamodb-local`); crash-recovery proven by a deterministic local test (`CommitWriterLockRecoveryTest`). Scoped as a mitigation for non-compliant S3-compatible storage specifically, not a universal multi-cloud requirement — see "Concurrent writes" above. |
 | **Distributed ingestion fleet** | Router + sharded Ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer — IOx's Router/Ingester split | **Planned, not yet designed.** Genuinely the largest remaining piece — closer to a distributed-systems project than an extension of the single-node write path, and needs its own dedicated design pass once v1 core is real |
 | **Distributed query execution** | Splitting one query's work across multiple compute nodes (join/aggregate pushdown across a fleet, not just client-side fan-out over `FlightEndpoint`s) | **Planned, not yet designed.** Needs a real distributed query planner; revisit once `execution/` exists single-node and its limits are actually felt |
 
