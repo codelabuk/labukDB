@@ -41,17 +41,23 @@
       <scope>test</scope>
     </dependency>
     <!--
-      Test-scope only. hadoop-aws is optional in labukdb-core (so a
-      library consumer isn't forced into the AWS SDK), but
-      IcebergRemoteMinioIntegrationTest needs S3AFileSystem on the
-      classpath to actually reach MinIO. Same reasoning as
-      labukdb-flight's pom for its own MinIO-dependent test.
+      Compile-scope now, optional (matching labukdb-core's own pattern
+      for this exact dependency), not test-scope only anymore.
+      DynamoDbLockManager (main source) directly references
+      software.amazon.awssdk.services.dynamodb classes, transitively
+      bundled via hadoop-aws's own software.amazon.awssdk:bundle
+      dependency (confirmed zero new Maven dependency needed, same as
+      labukdb-core's DynamoDbLockProvider). optional=true still means
+      a plain library consumer of labukdb-format-iceberg isn't forced
+      into the AWS SDK unless they also need S3A/DynamoDB, same
+      reasoning labukdb-core already applies to this identical
+      dependency. IcebergRemoteMinioIntegrationTest's own need for
+      S3AFileSystem on the test classpath is satisfied the same way.
     -->
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-aws</artifactId>
-      <optional>false</optional>
-      <scope>test</scope>
+      <optional>true</optional>
     </dependency>
   </dependencies>
 

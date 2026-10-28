@@ -87,10 +87,19 @@ public final class IcebergTableWriter {
      * IcebergTableFormat}'s own {@code TableLocation} constructor uses —
      * an empty default {@code Configuration} is sufficient for local
      * Hadoop {@code FileSystem} access when the location isn't remote.
+     *
+     * <b>Confirmed broken for genuine concurrent writers on real MinIO
+     * without a real lock configured</b> — see the class javadoc below
+     * for the full root cause. {@link IcebergLockManagerConfig
+     * #applyIfConfigured} opts this table into a real, cross-process
+     * {@link DynamoDbLockManager} when {@code ICEBERG_LOCK_DYNAMODB_TABLE}
+     * is set; a no-op otherwise, so the default behavior (single-writer
+     * safe, confirmed-broken for concurrent writers) is unchanged.
      */
     public IcebergTableWriter(TableLocation location) {
         this.tableLocation = location;
         Configuration conf = location.isRemote() ? location.hadoopConf() : new Configuration();
+        IcebergLockManagerConfig.applyIfConfigured(conf);
         this.table = new HadoopTables(conf).load(location.raw());
     }
 

@@ -87,14 +87,28 @@ public final class DynamoDbLockConfiguration {
      * need any of these set.
      */
     public static Optional<DynamoDbLockConfiguration> fromEnvironment() {
-        String tableName = System.getenv("DYNAMODB_LOCK_TABLE");
+        return fromEnvironment("DYNAMODB_LOCK_TABLE", "DYNAMODB_LOCK_EXPIRY_SECONDS", 86_400);
+    }
+
+    /**
+     * Same connection env vars ({@code DYNAMODB_REGION}/{@code _ENDPOINT}/
+     * {@code _ACCESS_KEY}/{@code _SECRET_KEY}) as {@link #fromEnvironment()},
+     * but a caller-chosen table-name and expiry env var and default — so a
+     * second, independent lock consumer (e.g. Iceberg's {@code
+     * DynamoDbLockManager}) can reuse this same connection-building logic
+     * against its own, differently-shaped backing table without colliding
+     * with this class's original Delta-lock env var names.
+     */
+    public static Optional<DynamoDbLockConfiguration> fromEnvironment(
+            String tableNameEnvVar, String expirySecondsEnvVar, long defaultExpirySeconds) {
+        String tableName = System.getenv(tableNameEnvVar);
         if (tableName == null || tableName.isBlank()) {
             return Optional.empty();
         }
         String regionName = System.getenv("DYNAMODB_REGION");
         Region region = Region.of(regionName == null || regionName.isBlank() ? "us-east-1" : regionName);
-        String expiryRaw = System.getenv("DYNAMODB_LOCK_EXPIRY_SECONDS");
-        long expirySeconds = (expiryRaw == null || expiryRaw.isBlank()) ? 86_400 : Long.parseLong(expiryRaw.trim());
+        String expiryRaw = System.getenv(expirySecondsEnvVar);
+        long expirySeconds = (expiryRaw == null || expiryRaw.isBlank()) ? defaultExpirySeconds : Long.parseLong(expiryRaw.trim());
 
         return Optional.of(new DynamoDbLockConfiguration(tableName, region,
                 System.getenv("DYNAMODB_ENDPOINT"),
