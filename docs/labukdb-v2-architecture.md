@@ -885,6 +885,35 @@ v1 core is the current priority; these are sequenced, not shelved.
 
 ---
 
+## Known test flakiness — `FlightIntegrationTest`
+
+**A known, pre-existing flaky test — root cause still open, not Arrow's.**
+`FlightIntegrationTest` intermittently fails (~1-in-4 observed) with
+`IllegalStateException: Memory was leaked by query` during
+`allocator.close()` in teardown — confirmed not tied to any specific code
+path (it hits read-only tests as often as write ones, and has now also
+been observed once on `FlightIcebergIntegrationTest`, a brand-new test
+with no resource-handling difference from the already-stable
+`FlightAggregationIntegrationTest` it mirrors — passed cleanly on every
+other run, standalone and full-suite, reinforcing that this is suite-wide
+timing/load-dependent flakiness, not a defect in any one test). Earlier
+notes in this project cited Arrow's own
+[ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448) /
+[apache/arrow#21006](https://github.com/apache/arrow/issues/21006) (the
+same ticket — ARROW-4448 is its old JIRA id, #21006 its GitHub-migration
+id) as an explanation; that was wrong on closer reading. That issue was
+**resolved as fixed** (not dismissed as an unfixable flake) via
+[PR #3805](https://github.com/apache/arrow/pull/3805), targeting Arrow
+**0.13.0** in 2019. This project pins Arrow **16.1.0** — the fix already
+shipped many major versions before the version this project depends on,
+so it can't be the same recurring bug; the resemblance is only the
+generic leak-detector message, not the root cause. The actual cause here
+is genuinely unverified and still needs real investigation (e.g. a
+heap-dump/leak-detector run under the loop that reproduces it), not
+assumed to be either an Arrow bug or this project's own code.
+
+---
+
 *This document and its diagrams describe a plan, not current behavior.
 Update both the `.puml` source and this file together as the design
 changes — don't let them drift the way `ARCHITECTURE.md` briefly did
