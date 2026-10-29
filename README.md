@@ -211,7 +211,8 @@ object storage.
 | Iceberg read + REST catalog (local, MinIO) | ✅ Done, live-verified | REST catalog proven against a real `tabulario/iceberg-rest` server |
 | Iceberg write — append, no lock | 🔴 **Confirmed broken** under genuine concurrent writers on real MinIO | Single-writer safe. Root cause traced into `iceberg-core`'s own `HadoopTableOperations`, same class of bug as the Delta finding above. Also now warns on construction (`RemoteWriteSafetyWarning`) |
 | Iceberg write — append, with lock | ✅ Done, live-verified | Opt-in `DynamoDbLockManager` via Iceberg's own `LockManager` extension point; same failing scenario passes with it engaged |
-| Iceberg CREATE TABLE / MERGE / compaction / vacuum | ❌ Not built | |
+| Iceberg CREATE TABLE | ✅ Done | `IcebergTableCreator`, path-based and catalog-based; identity-only partitioning |
+| Iceberg MERGE / compaction / vacuum | ❌ Not built | |
 | Type support | 🟡 Most primitives, DECIMAL (Decimal128), `LIST<float/double/int/long/string>` (read + write) | Not yet: nested `LIST<LIST<...>>`, MAP, STRUCT |
 | Checkpoints | 🟡 Parsing tested against a self-built fixture | Not yet proven against a real Spark-produced checkpoint — highest-risk, least-verified code in the project |
 | Real AWS S3 / Azure ADLS (not MinIO) | 🟡 Implemented, not independently verified | MinIO is the only remote backend actually stress-tested live |
@@ -323,9 +324,9 @@ Full backlog (every item, every status) lives in
 
 | Area | Next up |
 |---|---|
-| Write path | Iceberg CREATE TABLE/merge/compaction/vacuum; CLI write subcommands (`ingest`/`compact`/`vacuum`/`create-table`); Flight `DoAction` for CREATE TABLE; orphan-file detection in `Vacuum`; read-path proactive recovery for the remote OCC lock |
+| Write path | Iceberg merge/compaction/vacuum (CREATE TABLE done); CLI write subcommands (`ingest`/`compact`/`vacuum`/`create-table`); Flight `DoAction` for CREATE TABLE; orphan-file detection in `Vacuum`; read-path proactive recovery for the remote OCC lock |
 | Core engine | Nested `LIST<LIST<...>>`/MAP/STRUCT; checkpoint writing (reads only today); row-data LRU cache; SQL-over-Flight; `DoExchange` streaming/tailing |
-| Multi-format | A lock-based mitigation for Iceberg's confirmed-broken remote OCC (mirroring Delta's `LockProvider`), or wiring a real catalog service instead of `HadoopTables`; Hive Metastore/Glue/Nessie catalogs; Parquet-only (no-log) tables |
+| Multi-format | Hive Metastore/Glue/Nessie catalogs; Parquet-only (no-log) tables |
 | AI / LLM | MCP tool wrapper; catalog semantic descriptions; case-insensitive filters |
 | Observability | Grafana as a Flight client; Prometheus metrics; InfluxDB → Delta pipeline |
 | Infrastructure | Distributed Flight/read scale-out; distributed ingestion fleet (planned, not designed — the largest remaining piece); distributed query execution (planned, not designed); auth; Docker/Helm |

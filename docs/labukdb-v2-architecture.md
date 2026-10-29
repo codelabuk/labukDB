@@ -733,6 +733,77 @@ Remaining, explicitly out of scope for this pass: nested `LIST<LIST<...>>`
 (list of lists), MAP, STRUCT — a different problem shape (arbitrary field
 nesting vs. one repeated element), not started.
 
+**Update — Iceberg CREATE TABLE is now done, closing the most visible
+asymmetry between the two formats: Delta already had `TableCreator`,
+`TableMerger`, `Compactor`, and `Vacuum`; Iceberg had none of the four.**
+This is the first of them — starting point chosen deliberately, since
+merge/compaction/vacuum all assume a table already exists.
+
+New `ArrowToIcebergSchema` (Arrow `Schema` → `org.apache.iceberg.Schema`)
+mirrors `core.encode.ArrowToDeltaSchema`'s exact supported-type set —
+Int32, Int64, Float, Double, Bool, Utf8, Timestamp, Decimal, and
+`List<primitive>` — on the theory that a column this can't express
+couldn't be written by `ArrowToParquetWriter` either, the same reasoning
+`ArrowToDeltaSchema`'s own javadoc already uses.
+
+**A real design mistake found and fixed before it shipped, not
+assumed correct from memory:** the first version built every
+`Types.NestedField`/`Types.ListType` with a placeholder field ID
+(`0`) and planned to fix them up afterward via
+`TypeUtil.assignFreshIds` — a pattern recalled as "the standard way,"
+but never actually run. It failed immediately: `org.apache.iceberg
+.Schema`'s own constructor eagerly builds and validates an id→name
+index *at construction time*, before any after-the-fact reassignment
+ever gets a chance to run — `new Schema(fields)` with duplicate
+placeholder IDs throws `IllegalArgumentException: Multiple entries
+with same key` before `assignFreshIds` is ever reached. Fixed by
+threading one running `AtomicInteger` counter through the whole
+recursive build instead, assigning each field's real, already-unique
+ID *before* it's used — including a `List` field's separate element
+ID — so the schema is valid the moment it's constructed, no second
+pass needed.
+
+New `IcebergTableCreator`, matching `IcebergTableWriter`'s own two
+constructor shapes exactly, so a table created either way is
+immediately usable by the existing, unmodified writer/reader: a
+path-based overload (via `HadoopTables.create`) and a catalog-based
+overload (via `Catalog.createTable`, proven against a real
+`InMemoryCatalog`, the same honesty-preserving precedent the REST
+catalog work established — any `Catalog` implementation shares one
+interface). Partitioning is identity-transform only, matching the
+Hive-style "exact value, no transform" partitioning `core.log
+.TableCreator`/`CommitWriter` already use — Iceberg's richer
+bucket/truncate/time-transform partitioning is a deliberate, separate,
+later decision, not required for write-lifecycle parity with Delta.
+
+**A second real, pre-existing gap found by actually exercising the new
+code, not written defensively in advance:** `IcebergTableFormat
+.normalize` unconditionally called `scan.snapshot().snapshotId()` —
+fine for every existing test, since all of them appended at least one
+file before ever calling `.latest()`. A freshly created table with zero
+commits has no current snapshot at all (Iceberg's own convention,
+genuinely different from Delta, where version 0 — metadata + protocol,
+no data — always exists right after creation), so `scan.snapshot()`
+returns `null` and the old code threw a bare `NullPointerException`
+the instant `IcebergTableCreatorTest` tried to read back a freshly
+created, never-appended-to table. Fixed by returning an empty
+`NormalizedSnapshot` (version `-1`, mirroring Iceberg's own
+"no current snapshot" sentinel) before ever calling `scan.planFiles()`,
+rather than catching the NPE after the fact.
+
+Verified with new `ArrowToIcebergSchemaTest` (every supported type,
+plus a dedicated check that a `List` field's element gets a field ID
+distinct from every top-level field's) and `IcebergTableCreatorTest`
+(the real proof: create → append → read back, for both the path-based
+and catalog-based constructors, an unpartitioned-table case, and a
+table-already-exists rejection). Full regression: 179 (core) + 32
+(format-iceberg, +9) + 12 (cli) = 223 tests, 0 failures/errors, 27
+skipped.
+
+Remaining, explicitly out of scope for this pass: Iceberg
+merge/upsert, compaction, and vacuum — each a separate, later piece of
+write-lifecycle parity, not started.
+
 **Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
 confirmed broken on real MinIO, root-caused precisely, not just
 documented as a risk.** A real 8-separate-process stress test
@@ -870,10 +941,13 @@ foundation under it is proven:
     location; `--table`/`--sql`/Flight all reach Iceberg tables now, not
     just a direct Java call to `IcebergTableFormat`. Delta's own query
     path is completely unchanged.
-13. ✅ **Iceberg writes (append-only).** Done, see above — new
-    `IcebergTableWriter`, reachable via `DoPut` and the embedded library.
-    No Iceberg CREATE TABLE, merge/upsert, compaction, or vacuum yet; no
-    CLI write subcommands for either format.
+13. ✅ **Iceberg writes (append-only), plus CREATE TABLE.** Done, see
+    above — new `IcebergTableWriter`, reachable via `DoPut` and the
+    embedded library. **Update — `IcebergTableCreator` is now done too**,
+    both path-based and catalog-based, closing the write-lifecycle gap
+    with Delta's own `TableCreator`; see its own entry further down for
+    detail. Iceberg merge/upsert, compaction, and vacuum remain unbuilt;
+    no CLI write subcommands for either format.
 14. ✅ **Iceberg REST catalog integration.** Done, see above — new
     `IcebergRestConfiguration`/`IcebergRestLocation`, `icebergrest://`
     table references reachable via `--table`/`--sql`/Flight (reads and

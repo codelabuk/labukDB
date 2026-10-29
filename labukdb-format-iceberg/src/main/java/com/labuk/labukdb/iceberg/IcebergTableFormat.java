@@ -110,6 +110,19 @@ public final class IcebergTableFormat implements TableFormat {
         Snapshot snapshot = scan.snapshot();
         List<DataFileRef> files = new ArrayList<>();
 
+        if (snapshot == null) {
+            // A freshly created table (new IcebergTableCreator, never
+            // appended to) has no current snapshot at all -- Iceberg's own
+            // convention, genuinely different from Delta, where version 0
+            // (metadata + protocol, no data) always exists right after
+            // creation. scan.planFiles() would itself fail here, so this
+            // must be checked before ever calling it, not caught after.
+            // -1 mirrors Iceberg's own "no current snapshot" convention
+            // (TableMetadata's currentSnapshotId == -1) rather than
+            // inventing a different sentinel.
+            return new NormalizedSnapshot(-1L, table.schema().toString(), partitionColumnNames(), files);
+        }
+
         try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
             for (FileScanTask task : tasks) {
                 files.add(toDataFileRef(task.file()));
