@@ -5,6 +5,7 @@ import com.labuk.labukdb.core.encode.ArrowToParquetWriter;
 import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.log.action.RemoveFile;
 import com.labuk.labukdb.core.log.action.SingleAction;
+import com.labuk.labukdb.core.storage.RemoteWriteSafetyWarning;
 import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.vector.VectorSchemaRoot;
 
@@ -68,6 +69,7 @@ public final class CommitWriter {
         this.storage = LogStorage.forLocation(location);
         this.snapshotManager = SnapshotManager.forLocation(location);
         this.lockProvider = lockProvider;
+        RemoteWriteSafetyWarning.warnIfUnsafe(location, lockProvider != null, "Delta");
     }
 
     /**

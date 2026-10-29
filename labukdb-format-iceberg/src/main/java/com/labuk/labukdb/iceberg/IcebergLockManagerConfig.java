@@ -21,10 +21,13 @@ final class IcebergLockManagerConfig {
     private IcebergLockManagerConfig() {
     }
 
-    static void applyIfConfigured(Configuration conf) {
+    /** @return whether a real lock was actually engaged (env var was set) */
+    static boolean applyIfConfigured(Configuration conf) {
         String table = System.getenv(DynamoDbLockManager.TABLE_NAME_ENV_VAR);
         if (table != null && !table.isBlank()) {
             conf.set("iceberg.tables.hadoop.lock-impl", DynamoDbLockManager.class.getName());
+            return true;
         }
+        return false;
     }
 }

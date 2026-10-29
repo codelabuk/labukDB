@@ -1,6 +1,7 @@
 package com.labuk.labukdb.iceberg;
 
 import com.labuk.labukdb.core.encode.ArrowToParquetWriter;
+import com.labuk.labukdb.core.storage.RemoteWriteSafetyWarning;
 import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.hadoop.conf.Configuration;
@@ -99,7 +100,8 @@ public final class IcebergTableWriter {
     public IcebergTableWriter(TableLocation location) {
         this.tableLocation = location;
         Configuration conf = location.isRemote() ? location.hadoopConf() : new Configuration();
-        IcebergLockManagerConfig.applyIfConfigured(conf);
+        boolean lockConfigured = IcebergLockManagerConfig.applyIfConfigured(conf);
+        RemoteWriteSafetyWarning.warnIfUnsafe(location, lockConfigured, "Iceberg");
         this.table = new HadoopTables(conf).load(location.raw());
     }
 
