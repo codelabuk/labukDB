@@ -685,6 +685,54 @@ re-run clean: 161/161 passing (146 pre-existing + 15 new), 0
 failures/errors, 5 skipped — unchanged from baseline, confirming zero
 regression.
 
+**Update — `LIST<primitive>` write support is now done, closing a gap
+this project had carried and documented honestly rather than papered
+over.** Read support (`decode/NestedTypeDecoder`, five element types —
+float, double, int32, int64, string) existed first, built for one
+specific driver: *consuming* a pre-existing Delta table a Spark
+ML/MLflow job already wrote with an `ARRAY<FLOAT>` embedding column.
+Nothing in this engine's own write path ever needed to *originate* a
+list column, so the symmetric write side was never built —
+`ArrowToParquetWriter`'s own javadoc said so plainly. Status-tracking
+conversation shorthand had drifted into "nested types: not started,"
+which direct inspection of the actual code corrected — read was already
+done and tested; only write was the real gap.
+
+New write-side code, mirroring `NestedTypeDecoder`'s scope exactly (same
+five element types, same 3-level encoding convention): `ArrowToParquetWriter
+.buildListType`/`toListElementParquetType` (schema) and `appendListCell`/
+`appendListElement` (value encode). Built via raw `GroupType`/`OriginalType`
+construction, deliberately not the newer `Types.list(...)`/
+`LogicalTypeAnnotation`-based builder, so the written file matches
+exactly what `NestedTypeDecoder.isListType` checks for — the same
+old-style `OriginalType.LIST` annotation `MessageTypeParser` already
+produces for `NestedTypeDecoderTest`'s own hand-rolled fixture. A null
+list element is represented by omitting that repeated group's `element`
+field entirely, reusing the identical convention the read side already
+expects.
+
+`ArrowToDeltaSchema` needed a real shape change, not just a new case:
+Delta's array type is a nested JSON object
+(`{"type":"array","elementType":<type>,"containsNull":<bool>}`), not a
+plain type-name string the way every other supported type is —
+confirmed against the Delta Sharing protocol spec and delta-rs's own
+schema handling, not assumed. `toDeltaTypeNode` now returns a `JsonNode`
+(a `TextNode` for primitives, unchanged; an `ObjectNode` for `List`)
+rather than a bare `String`, since the field's `"type"` value can
+legitimately be either shape.
+
+Verified with three new `ArrowToParquetWriterTest` cases (float-list
+round trip, an empty-but-not-null list, a string-list round trip) and a
+new `ArrowToDeltaSchemaTest` (previously untested directly) proving the
+array-vs-string JSON shape and that `containsNull` reflects the
+*element* field's nullability, not the list field's. Full regression:
+179 (core) + 23 (format-iceberg) + 12 (cli) = 214 tests, 0
+failures/errors, 27 skipped — unchanged from baseline.
+
+Remaining, explicitly out of scope for this pass: nested `LIST<LIST<...>>`
+(list of lists), MAP, STRUCT — a different problem shape (arbitrary field
+nesting vs. one repeated element), not started.
+
 **Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
 confirmed broken on real MinIO, root-caused precisely, not just
 documented as a risk.** A real 8-separate-process stress test
@@ -731,15 +779,34 @@ itself a real, worthwhile finding:**
 
 This matches Iceberg's own documentation, which already calls
 `HadoopTables`/`HadoopCatalog` unsafe for concurrent use on S3-compatible
-storage. **No lock-based mitigation has been built for this path** (unlike
-`CommitWriter`'s `LockProvider`) — Delta's log format needs an external
-lock because every reader depends on immutable numbered files; Iceberg's
-own documented answer is "use a real catalog instead" (REST, Hive
-Metastore, Glue — whose commit is backed by an actual database
+storage. Iceberg's own documented answer is "use a real catalog instead"
+(REST, Hive Metastore, Glue — whose commit is backed by an actual database
 transaction, not an object-store rename), which this project already
 supports via `IcebergTableWriter(Catalog, TableIdentifier)`, but that path
-is not yet live-verified for concurrency either. Full details in
-`IcebergTableWriter`'s own javadoc.
+is not yet live-verified for concurrency either.
+
+**Update — a lock-based mitigation has since been built for this path**,
+smaller than Delta's `LockProvider` since Iceberg already has the
+extension point Delta's log format doesn't: `org.apache.iceberg.LockManager`
+is a tiny, already-pluggable interface (`acquire`/`release`/`initialize`),
+activated by one Hadoop `Configuration` property
+(`iceberg.tables.hadoop.lock-impl`, confirmed via `javap -constants` on
+`HadoopTables`) — no change to Iceberg's own commit code needed. The new
+`DynamoDbLockManager` implements it with a lease-based acquire/release
+(`attribute_not_exists(lockKey) OR expiresAt < :now`), reusing the same
+`DynamoDbClient` plumbing as Delta's lock. The exact same 8-separate-
+process scenario above, re-run with the lock engaged
+(`IcebergTableWriterConcurrentMinioLockedIntegrationTest`), lands all 8
+commits — live-verified against real MinIO + `amazon/dynamodb-local`.
+Full details in `DynamoDbLockManager`'s own javadoc.
+
+**Also added — a proportionate warning when a remote writer has no lock
+configured** (`RemoteWriteSafetyWarning`, used by both `CommitWriter` and
+`IcebergTableWriter`): the engine can't detect an actual concurrent
+writer, only risky configuration, so it logs a strong warning for an
+explicit custom S3 endpoint (MinIO-shaped) and a lighter note for any
+other remote location, and stays silent for local tables or once a lock
+is engaged.
 
 ## Build order
 

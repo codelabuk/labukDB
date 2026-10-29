@@ -205,13 +205,14 @@ object storage.
 |---|---|---|
 | Delta read (local, MinIO) | ✅ Done, live-verified | Remote fully `TableLocation`-dispatched |
 | Delta write — append/MERGE/compact/vacuum/create (local, MinIO) | ✅ Done, live-verified | Including `Vacuum`'s real remote delete, confirmed via a live `FileSystem.exists()` check |
-| Delta multi-writer OCC, remote, no lock | 🔴 **Confirmed broken** on at least one real MinIO deployment | Silent lost updates under genuine concurrency — root-caused in `docs/labukdb-v2-architecture.md`'s "Concurrent writes" section |
+| Delta multi-writer OCC, remote, no lock | 🔴 **Confirmed broken** on at least one real MinIO deployment | Silent lost updates under genuine concurrency — root-caused in `docs/labukdb-v2-architecture.md`'s "Concurrent writes" section. Constructing this configuration now logs a proportionate warning (`RemoteWriteSafetyWarning`) |
 | Delta multi-writer OCC, remote, with lock | ✅ Done, live-verified | Opt-in `LockProvider`/`DynamoDbLockProvider`; same failing scenario passes with it engaged. Scoped as a mitigation for non-compliant S3-compatible storage, not a universal requirement |
 | Delta CLI `--sql` (local, MinIO) | ✅ Done, live-verified | `GROUP BY`, `ORDER BY`/`LIMIT`, `WHERE` |
 | Iceberg read + REST catalog (local, MinIO) | ✅ Done, live-verified | REST catalog proven against a real `tabulario/iceberg-rest` server |
-| Iceberg write — append only | 🔴 **Confirmed broken** under genuine concurrent writers on real MinIO | Single-writer safe. Root cause traced into `iceberg-core`'s own `HadoopTableOperations` — same class of bug as the Delta finding above, no lock-based fix built yet; full detail in `docs/labukdb-v2-architecture.md` |
+| Iceberg write — append, no lock | 🔴 **Confirmed broken** under genuine concurrent writers on real MinIO | Single-writer safe. Root cause traced into `iceberg-core`'s own `HadoopTableOperations`, same class of bug as the Delta finding above. Also now warns on construction (`RemoteWriteSafetyWarning`) |
+| Iceberg write — append, with lock | ✅ Done, live-verified | Opt-in `DynamoDbLockManager` via Iceberg's own `LockManager` extension point; same failing scenario passes with it engaged |
 | Iceberg CREATE TABLE / MERGE / compaction / vacuum | ❌ Not built | |
-| Type support | 🟡 Most primitives, DECIMAL (Decimal128) | Not yet: nested `LIST<LIST<...>>`, MAP, STRUCT |
+| Type support | 🟡 Most primitives, DECIMAL (Decimal128), `LIST<float/double/int/long/string>` (read + write) | Not yet: nested `LIST<LIST<...>>`, MAP, STRUCT |
 | Checkpoints | 🟡 Parsing tested against a self-built fixture | Not yet proven against a real Spark-produced checkpoint — highest-risk, least-verified code in the project |
 | Real AWS S3 / Azure ADLS (not MinIO) | 🟡 Implemented, not independently verified | MinIO is the only remote backend actually stress-tested live |
 | Flight surface | 🟡 `GetFlightInfo`/`DoGet`/`DoPut`/`ListFlights` done | `DoAction`/`DoExchange` unimplemented — no CREATE TABLE RPC, no push-based tailing |

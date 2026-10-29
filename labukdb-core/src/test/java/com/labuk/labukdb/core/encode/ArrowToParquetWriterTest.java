@@ -7,6 +7,9 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.impl.UnionListWriter;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
@@ -109,6 +112,121 @@ class ArrowToParquetWriterTest {
                     () -> new ArrowToParquetWriter().write(file, batch));
             assertTrue(thrown.getMessage().contains("39"), thrown.getMessage());
             batch.close();
+        }
+    }
+
+    /**
+     * The write-side mirror of {@code NestedTypeDecoderTest} — same
+     * embedding-vector use case, reversed: builds an Arrow
+     * {@code ListVector<Float4>} directly (no hand-rolled Parquet
+     * {@code Group} fixture needed, unlike the decode-side test, since
+     * this writer is itself what now produces the Parquet structure) and
+     * proves {@link ArrowToParquetWriter} and {@code NestedTypeDecoder}
+     * agree on the exact same file, the same two-halves-agree proof
+     * {@code writeThenRead_decimalColumn_roundTripsExactly} already gives
+     * for DECIMAL.
+     */
+    private VectorSchemaRoot buildFloatListBatch(BufferAllocator allocator, float[][] rows) {
+        Field elementField = new Field("element",
+                FieldType.nullable(new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE)), null);
+        Field listField = new Field("embedding", FieldType.nullable(new ArrowType.List()), List.of(elementField));
+        VectorSchemaRoot root = VectorSchemaRoot.create(new Schema(List.of(listField)), allocator);
+        root.allocateNew();
+
+        ListVector listVector = (ListVector) root.getVector("embedding");
+        UnionListWriter writer = listVector.getWriter();
+        for (int i = 0; i < rows.length; i++) {
+            writer.setPosition(i);
+            writer.startList();
+            for (float v : rows[i]) {
+                writer.float4().writeFloat4(v);
+            }
+            writer.endList();
+        }
+        writer.setValueCount(rows.length);
+        root.setRowCount(rows.length);
+        return root;
+    }
+
+    @Test
+    void writeThenRead_floatListColumn_roundTripsExactly(@TempDir File tempDir) throws Exception {
+        File file = new File(tempDir, "embeddings.parquet");
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = buildFloatListBatch(allocator,
+                     new float[][] {{0.1f, 0.2f, 0.3f}, {0.4f, 0.5f}})) {
+
+            new ArrowToParquetWriter().write(file, batch);
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                assertEquals(2, result.getRowCount());
+                ListVector embedding = (ListVector) result.getVector("embedding");
+
+                List<?> row0 = (List<?>) embedding.getObject(0);
+                assertEquals(3, row0.size());
+                assertEquals(0.1f, ((Number) row0.get(0)).floatValue(), 0.0001f);
+                assertEquals(0.3f, ((Number) row0.get(2)).floatValue(), 0.0001f);
+
+                List<?> row1 = (List<?>) embedding.getObject(1);
+                assertEquals(2, row1.size());
+                assertEquals(0.5f, ((Number) row1.get(1)).floatValue(), 0.0001f);
+            }
+        }
+    }
+
+    @Test
+    void writeThenRead_emptyListElement_roundTripsAsEmptyNotNull(@TempDir File tempDir) throws Exception {
+        File file = new File(tempDir, "empty-list.parquet");
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = buildFloatListBatch(allocator, new float[][] {{}, {1.0f}})) {
+
+            new ArrowToParquetWriter().write(file, batch);
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                ListVector embedding = (ListVector) result.getVector("embedding");
+                assertFalse(embedding.isNull(0), "an empty list is not the same as a null list");
+                assertEquals(0, ((List<?>) embedding.getObject(0)).size());
+                assertEquals(1, ((List<?>) embedding.getObject(1)).size());
+            }
+        }
+    }
+
+    @Test
+    void writeThenRead_stringListColumn_roundTripsExactly(@TempDir File tempDir) throws Exception {
+        Field elementField = new Field("element", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field listField = new Field("tags", FieldType.nullable(new ArrowType.List()), List.of(elementField));
+        File file = new File(tempDir, "tags.parquet");
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(listField)), allocator);
+            batch.allocateNew();
+            ListVector tags = (ListVector) batch.getVector("tags");
+            UnionListWriter writer = tags.getWriter();
+            writer.setPosition(0);
+            writer.startList();
+            writeVarChar(writer, tags, "alpha");
+            writeVarChar(writer, tags, "beta");
+            writer.endList();
+            writer.setValueCount(1);
+            batch.setRowCount(1);
+
+            new ArrowToParquetWriter().write(file, batch);
+            batch.close();
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                ListVector resultTags = (ListVector) result.getVector("tags");
+                List<?> row0 = (List<?>) resultTags.getObject(0);
+                assertEquals(2, row0.size());
+                assertEquals("alpha", row0.get(0).toString());
+                assertEquals("beta", row0.get(1).toString());
+            }
+        }
+    }
+
+    private void writeVarChar(UnionListWriter writer, ListVector vector, String value) {
+        byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try (org.apache.arrow.memory.ArrowBuf buf = vector.getAllocator().buffer(bytes.length)) {
+            buf.writeBytes(bytes);
+            writer.varChar().writeVarChar(0, bytes.length, buf);
         }
     }
 }

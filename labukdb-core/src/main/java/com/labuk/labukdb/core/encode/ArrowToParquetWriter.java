@@ -12,6 +12,7 @@ import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.TimeStampMicroVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.complex.ListVector;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.hadoop.conf.Configuration;
@@ -23,9 +24,13 @@ import org.apache.parquet.hadoop.example.GroupWriteSupport;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.hadoop.util.HadoopOutputFile;
 import org.apache.parquet.io.api.Binary;
+import org.apache.parquet.schema.GroupType;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.schema.OriginalType;
+import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
+import org.apache.parquet.schema.Type.Repetition;
 import org.apache.parquet.schema.Types;
 
 import java.io.File;
@@ -52,9 +57,27 @@ import java.nio.charset.StandardCharsets;
  * own javadoc for why). Deliberately <b>not</b> INT96 — that's
  * Spark's legacy encoding, which this engine only ever needed to decode
  * for compatibility, never a format a new writer should intentionally
- * produce — and not nested {@code LIST<...>} yet, matching this project's
- * own history where decode gained that support well after flat primitives.
- * Every field is written {@code optional} (nullable), regardless of the
+ * produce.
+ *
+ * <b>{@code LIST<primitive>}</b> — the write-side mirror of {@code
+ * decode.NestedTypeDecoder}, same five element types (float, double,
+ * int32, int64, string) and the identical 3-level encoding convention
+ * ({@code optional group <name> (LIST) { repeated group list { optional
+ * <elem> element; } } }) that decoder already reads — built directly via
+ * raw {@link GroupType}/{@link OriginalType} rather than {@code
+ * Types.list(...)}'s newer {@code LogicalTypeAnnotation}-based builder,
+ * so the written file matches exactly what {@code NestedTypeDecoder
+ * .isListType} checks for ({@code OriginalType.LIST}), the same thing
+ * {@code MessageTypeParser} produces for the old-style {@code (LIST)}
+ * schema-string annotation {@code NestedTypeDecoderTest}'s own fixture
+ * already uses. List elements are always written {@code optional}
+ * (nullable) regardless of the Arrow child field's own nullability — a
+ * null element is represented by omitting that repeated group's {@code
+ * element} field entirely, the same convention {@code NestedTypeDecoder
+ * #appendList} already reads back via {@code getFieldRepetitionCount
+ * == 0}. Not yet supported: nested LIST (list of lists), MAP, STRUCT.
+ *
+ * Every other field is written {@code optional} (nullable), regardless of the
  * Arrow field's own nullability, so a null value can always be represented
  * by simply not appending that field to the row's {@link Group} — the
  * same convention {@code RowAppender} already reads back correctly via
@@ -144,8 +167,55 @@ public final class ArrowToParquetWriter {
             BigDecimal value = ((DecimalVector) vector).getObject(row);
             byte[] bytes = DecimalCodec.toFixedLengthBytes(value, decimalType.getScale());
             group.append(name, Binary.fromConstantByteArray(bytes));
+        } else if (type instanceof ArrowType.List) {
+            appendListCell(group, name, (ListVector) vector, row);
         } else {
             throw unsupported(name, type);
+        }
+    }
+
+    /**
+     * {@code group.addGroup(name)} once for the outer LIST-annotated group,
+     * then {@code .addGroup("list")} once per element — exactly the pattern
+     * {@code NestedTypeDecoderTest}'s own hand-rolled write fixture already
+     * uses, since repeated fields are added by calling {@code addGroup}
+     * with the same field name once per occurrence.
+     */
+    private void appendListCell(Group group, String name, ListVector vector, int row) {
+        Group listGroup = group.addGroup(name);
+        FieldVector dataVector = vector.getDataVector();
+        ArrowType elementType = dataVector.getField().getType();
+        int start = vector.getElementStartIndex(row);
+        int end = vector.getElementEndIndex(row);
+        for (int i = start; i < end; i++) {
+            Group entry = listGroup.addGroup("list");
+            if (!dataVector.isNull(i)) {
+                appendListElement(entry, elementType, dataVector, i);
+            }
+            // null element -> omit "element" entirely, matches NestedTypeDecoder#appendList's read convention
+        }
+    }
+
+    private void appendListElement(Group entry, ArrowType elementType, FieldVector dataVector, int index) {
+        if (elementType instanceof ArrowType.FloatingPoint fp) {
+            switch (fp.getPrecision()) {
+                case SINGLE -> entry.append("element", ((Float4Vector) dataVector).get(index));
+                case DOUBLE -> entry.append("element", ((Float8Vector) dataVector).get(index));
+                default -> throw unsupportedListElement(elementType);
+            }
+        } else if (elementType instanceof ArrowType.Int intType) {
+            if (intType.getBitWidth() == 32) {
+                entry.append("element", ((IntVector) dataVector).get(index));
+            } else if (intType.getBitWidth() == 64) {
+                entry.append("element", ((BigIntVector) dataVector).get(index));
+            } else {
+                throw unsupportedListElement(elementType);
+            }
+        } else if (elementType instanceof ArrowType.Utf8) {
+            byte[] bytes = ((VarCharVector) dataVector).get(index);
+            entry.append("element", new String(bytes, StandardCharsets.UTF_8));
+        } else {
+            throw unsupportedListElement(elementType);
         }
     }
 
@@ -185,6 +255,8 @@ public final class ArrowToParquetWriter {
                         .length(DecimalCodec.FIXED_LEN_BYTES)
                         .as(LogicalTypeAnnotation.decimalType(decimalType.getScale(), decimalType.getPrecision()))
                         .named(name);
+            } else if (type instanceof ArrowType.List) {
+                builder.addField(buildListType(name, field));
             } else {
                 throw unsupported(name, type);
             }
@@ -192,8 +264,48 @@ public final class ArrowToParquetWriter {
         return builder.named("labukdb_write");
     }
 
+    /**
+     * Raw {@link GroupType}/{@link OriginalType} construction, deliberately
+     * not {@code Types.list(...)}'s fluent builder — see this class's own
+     * javadoc for why matching {@code OriginalType.LIST} exactly matters.
+     */
+    private GroupType buildListType(String name, Field field) {
+        Field elementField = field.getChildren().get(0);
+        PrimitiveType elementType = toListElementParquetType(elementField);
+        GroupType repeated = new GroupType(Repetition.REPEATED, "list", elementType);
+        return new GroupType(Repetition.OPTIONAL, name, OriginalType.LIST, repeated);
+    }
+
+    private PrimitiveType toListElementParquetType(Field elementField) {
+        ArrowType elementType = elementField.getType();
+        if (elementType instanceof ArrowType.FloatingPoint fp) {
+            return switch (fp.getPrecision()) {
+                case SINGLE -> Types.optional(PrimitiveTypeName.FLOAT).named("element");
+                case DOUBLE -> Types.optional(PrimitiveTypeName.DOUBLE).named("element");
+                default -> throw unsupportedListElement(elementType);
+            };
+        }
+        if (elementType instanceof ArrowType.Int intType) {
+            if (intType.getBitWidth() == 32) {
+                return Types.optional(PrimitiveTypeName.INT32).named("element");
+            } else if (intType.getBitWidth() == 64) {
+                return Types.optional(PrimitiveTypeName.INT64).named("element");
+            }
+            throw unsupportedListElement(elementType);
+        }
+        if (elementType instanceof ArrowType.Utf8) {
+            return Types.optional(PrimitiveTypeName.BINARY).as(LogicalTypeAnnotation.stringType()).named("element");
+        }
+        throw unsupportedListElement(elementType);
+    }
+
     private static UnsupportedOperationException unsupported(String column, ArrowType type) {
         return new UnsupportedOperationException(
                 "Arrow type not supported for encoding yet, column '" + column + "': " + type);
+    }
+
+    private static UnsupportedOperationException unsupportedListElement(ArrowType elementType) {
+        return new UnsupportedOperationException(
+                "List element type not supported for encoding yet: " + elementType);
     }
 }
