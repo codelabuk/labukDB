@@ -78,6 +78,7 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [TableLocation] as TL
     [MinioConfiguration] as MC
     [AdlsConfiguration]  as AC
+    [RemoteWriteSafetyWarning\n(logs on construction of any\nremote, no-lock writer -- strong\nfor an explicit custom S3 endpoint\n(MinIO-shaped), light otherwise;\ncan't detect an actual concurrent\nwriter, only risky configuration)] as RWSW #D9F2C4
   }
 
   package "format/ — TableFormat SPI (wired into cli/flight\nfor Iceberg's query path; Delta's own\npath still bypasses it, see note)" #D9F2C4 {
@@ -108,6 +109,8 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [Compactor\n(bin-pack small files,\nOPTIMIZE-style commit,\ndataChange=false)] as COMP #D9F2C4
     [Vacuum\n(remove orphaned files\npast retention window)] as VAC #D9F2C4
     [TableMerger\n(upsert/MERGE by key —\nthe foundation a CDC source\nlike Debezium needs,\ndataChange=true)] as TMRG #D9F2C4
+    [TableCreator\n(version 0: protocol + metaData\nactions only, no add actions;\nlocal + remote)] as TCR #D9F2C4
+    [LockProvider\n(interface) /\nDynamoDbLockProvider\n(opt-in cross-process lock --\nmitigates MinIO's non-compliant\nconditional-create under\nconcurrency)] as DDBL #D9F2C4
 
     note right of CW
       Atomic create-if-absent commit,
@@ -115,19 +118,20 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
       · local disk — trivial (CREATE_NEW)
       · MinIO — verified against a
         real cluster (quay.io/minio/minio)
-      · S3 (native AWS) — implemented,
-        not yet verified against a
-        real AWS endpoint
-      · ADLS Gen2 — implemented,
-        not yet verified against a
-        real ADLS endpoint
+      · S3 (native AWS) / ADLS Gen2 —
+        implemented, not yet verified
+        against a real endpoint
       Multi-writer OCC done for local
-      disk (appendBatch retries
-      unconditionally; replaceFiles/
-      TableMerger re-check their file
-      set on every attempt). Remote
-      OCC not started — CommitWriter
-      itself is still local-disk only.
+      disk unconditionally. Remote,
+      no lock: CONFIRMED BROKEN on at
+      least one real MinIO deployment
+      under genuine concurrency --
+      standing proof test, left failing
+      on purpose (RemoteWriteSafetyWarning
+      now logs on construction of this
+      configuration). Remote, with lock:
+      done, live-verified (opt-in
+      DynamoDbLockProvider, below).
     end note
   }
 
@@ -145,13 +149,15 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [RowGroupPruner] as RGP
     [GroupPredicateEvaluator] as GPE
     [PartitionValueAppender] as PVA
-    [NestedTypeDecoder] as NTD
+    [NestedTypeDecoder\n(LIST<primitive> read --\nread+write both done now)] as NTD
     [Int96TimestampCodec] as ITC
     [ParquetFooterCache] as PFC
+    [DecimalCodec\n(Decimal128, precision<=38;\nshared by decode + encode)] as DCC #D9F2C4
   }
 
   package "encode/ — Arrow → Parquet" #D9F2C4 {
-    [ArrowToParquetWriter\n(mirror of ParquetToArrowReader)] as ATPW #D9F2C4
+    [ArrowToParquetWriter\n(mirror of ParquetToArrowReader;\nnow also DECIMAL +\nLIST<primitive> write)] as ATPW #D9F2C4
+    [ArrowToDeltaSchema\n(Arrow Schema -> Delta schemaString;\nList's "type" value is a nested\nJSON array object, not a plain\ntype-name string like every\nother supported type)] as ADS #D9F2C4
   }
 
   package "execution/ — query operators (wired into flight/ and cli/)" #D9F2C4 {
@@ -193,8 +199,27 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
 package "labukdb-format-iceberg  (optional for core embedders;\nrequired by cli/flight below)" #D9F2C4 {
   [IcebergTableFormat\n(implements TableFormat,\ndelegates manifest parsing\nto iceberg-core — read-only;\npath-based or Catalog-based)] as ITF #D9F2C4
   [IcebergTableWriter\n(append-only, to an existing table;\niceberg-core's own Table.newAppend()\nretries OCC conflicts internally --\nno hand-built retry loop needed,\nunlike CommitWriter's; path-based\nor Catalog-based)] as ITW #D9F2C4
+
+  note bottom of ITW
+    Path-based (HadoopTables), no lock:
+    CONFIRMED BROKEN under genuine
+    concurrent writers on real MinIO --
+    root cause traced into
+    HadoopTableOperations.renameToFinal
+    (non-atomic copy+delete rename on
+    S3A). Standing proof test, left
+    failing on purpose. With lock:
+    done, live-verified (opt-in
+    DynamoDbLockManager below, via
+    Iceberg's own LockManager
+    extension point).
+  end note
   [IcebergRestConfiguration\n(ICEBERG_REST_* env vars -> RESTCatalog,\none catalog connection per process;\nRESTCatalog + httpclient5 already\nbundled in iceberg-core, zero new dep)] as IRC #D9F2C4
   [IcebergRestLocation\n(icebergrest://ns.table --\nchecked BEFORE any TableLocation\nis built, since isRemoteUri's regex\nwould otherwise misroute it to Hadoop FS)] as IRL #D9F2C4
+  [DynamoDbLockManager\n(implements Iceberg's own\nLockManager interface -- a lease-\nbased acquire/release, fixing the\nsame confirmed-broken no-lock gap\nas Delta's DynamoDbLockProvider)] as IDDBL #D9F2C4
+  [IcebergLockManagerConfig\n(opt-in: sets Configuration's\n"lock-impl" property when\nICEBERG_LOCK_DYNAMODB_TABLE is set)] as ILMC #D9F2C4
+  [IcebergTableCreator\n(path-based via HadoopTables.create,\nor catalog-based via\nCatalog.createTable;\nidentity-only partitioning)] as ITCR #D9F2C4
+  [ArrowToIcebergSchema\n(Arrow Schema -> org.apache.iceberg.Schema;\nsame supported-type set as\nArrowToDeltaSchema)] as AIS #D9F2C4
 }
 
 ' ─── labukdb-flight ───────────────────────────────────────
@@ -231,10 +256,19 @@ COMP --> CW  : rewrite + commit bin-packed files\n(dataChange=false)
 TMRG --> PTAR : decode existing partition files
 TMRG --> CW  : insert/update/delete by key,\ncommit via replaceFiles\n(dataChange=true)
 VAC  --> DT  : delete files past retired-and-expired
+TCR  --> ADS : build schemaString
+TCR  --> DT  : write version 0\n(protocol + metaData, no add actions)
+CW  ..> DDBL : optional, via\nforLocation(location, lockProvider)
+CW  ..> RWSW : construction --\nwarns if remote + no lock
 
 ITF --> IT : read via iceberg-core
 ITW --> IT  : commit via iceberg-core\n(Table.newAppend, internal OCC retry)
 ITW --> ATPW : write new data file\n(existing, unmodified encoder)
+ITW ..> ILMC : construction --\napplyIfConfigured(conf)
+ILMC ..> IDDBL : sets Configuration's\n"lock-impl" property
+ITW ..> RWSW : construction --\nwarns if remote + no lock
+ITCR --> AIS : build org.apache.iceberg.Schema
+ITCR ..> ITW : table immediately usable\nby existing, unmodified writer
 IRC ..> ITF : Catalog passed to\nnew (Catalog, TableIdentifier) ctor
 IRC ..> ITW : Catalog passed to\nnew (Catalog, TableIdentifier) ctor
 TF  <|.. DTF
@@ -256,6 +290,8 @@ PTAR --> PVA
 PTAR --> NTD
 PTAR --> ITC
 PTAR --> PFC
+PTAR --> DCC
+ATPW --> DCC
 AOP  --> PTAR : consumes already-decoded,\nalready-filtered Arrow batches\n(decode/'s own fused residual filter,\nno separate FilterOperator)
 SOP  --> AOP
 
@@ -271,6 +307,7 @@ WB ..> PTAR : read-your-writes\n(not-yet-flushed rows,\nchecked alongside commit
 
 TL --> MC
 TL --> AC
+RWSW ..> TL : reads isRemote()/\nhadoopConf() -- never\nconstructed for a\nlocal location
 
 DFP --> IRL  : every query/DoPut, first --\nicebergrest:// reference?\n(checked before DF/TableLocation)
 DFP --> IRC  : REST-detected -- connect\n(ICEBERG_REST_* env vars)
