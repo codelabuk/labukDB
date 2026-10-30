@@ -213,7 +213,8 @@ object storage.
 | Iceberg write — append, with lock | ✅ Done, live-verified | Opt-in `DynamoDbLockManager` via Iceberg's own `LockManager` extension point; same failing scenario passes with it engaged |
 | Iceberg CREATE TABLE | ✅ Done | `IcebergTableCreator`, path-based and catalog-based; identity-only partitioning |
 | Iceberg MERGE/upsert | ✅ Done | `IcebergTableMerger`, path-based and catalog-based; reuses Delta's exact merge semantics via shared `PartitionRowMerger` |
-| Iceberg compaction / vacuum | ❌ Not built | |
+| Iceberg compaction | ✅ Done | `IcebergCompactor`, path-based and catalog-based; commits via `Table.newRewrite()`, Iceberg's dedicated non-data-changing commit type |
+| Iceberg vacuum | ❌ Not built | |
 | Type support | 🟡 Most primitives, DECIMAL (Decimal128), `LIST<float/double/int/long/string>` (read + write) | Not yet: nested `LIST<LIST<...>>`, MAP, STRUCT |
 | Checkpoints | 🟡 Parsing tested against a self-built fixture | Not yet proven against a real Spark-produced checkpoint — highest-risk, least-verified code in the project |
 | Real AWS S3 / Azure ADLS (not MinIO) | 🟡 Implemented, not independently verified | MinIO is the only remote backend actually stress-tested live |
@@ -325,7 +326,7 @@ Full backlog (every item, every status) lives in
 
 | Area | Next up |
 |---|---|
-| Write path | Iceberg compaction/vacuum (CREATE TABLE + MERGE done); CLI write subcommands (`ingest`/`compact`/`vacuum`/`create-table`); Flight `DoAction` for CREATE TABLE; orphan-file detection in `Vacuum`; read-path proactive recovery for the remote OCC lock |
+| Write path | Iceberg vacuum (CREATE TABLE + MERGE + compaction done); CLI write subcommands (`ingest`/`compact`/`vacuum`/`create-table`); Flight `DoAction` for CREATE TABLE; orphan-file detection in `Vacuum`; read-path proactive recovery for the remote OCC lock |
 | Core engine | Nested `LIST<LIST<...>>`/MAP/STRUCT; checkpoint writing (reads only today); row-data LRU cache; SQL-over-Flight; `DoExchange` streaming/tailing |
 | Multi-format | Hive Metastore/Glue/Nessie catalogs; Parquet-only (no-log) tables |
 | AI / LLM | MCP tool wrapper; catalog semantic descriptions; case-insensitive filters |

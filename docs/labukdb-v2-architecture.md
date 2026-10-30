@@ -861,6 +861,49 @@ tests, 0 failures/errors, 27 skipped.
 Remaining, explicitly out of scope for this pass: Iceberg compaction
 and vacuum — the next two pieces of write-lifecycle parity.
 
+**Update — Iceberg compaction is now done**, the third piece of
+write-lifecycle parity. Simpler than the merger: bin-packing doesn't
+need `PartitionRowMerger.merge`'s key-based algorithm at all, only its
+`combineFiles` read-side half (raw combine, no upsert semantics).
+
+**A real design decision this surfaced, not something to get wrong by
+reflex:** the natural instinct, having just built `IcebergTableMerger`
+on `Table.newOverwrite()`, would be to reuse the same commit API here —
+wrong. Confirmed via `javap` on `iceberg-api`: Iceberg has a dedicated
+`Table.newRewrite()` → `RewriteFiles` commit type specifically for "this
+doesn't change logical data, only its physical layout," distinct from
+`OverwriteFiles` (real row-value changes). This is the same
+`dataChange=false` vs. `true` distinction Delta's own `Compactor`/
+`TableMerger` draw via `CommitWriter#replaceFiles`'s flag — using
+`OverwriteFiles` here would have made an incremental/CDC-style reader
+reprocess a pure bin-packing commit as if real data had changed, the
+exact mistake Delta's own `Compactor` javadoc calls out by name.
+
+Also extracted two small helpers the merger had built as private
+methods, once a second real caller needed the identical logic:
+`IcebergTableFormat.filesInPartition` (a fresh `table.newScan()`
+filtered by partition, widened from a one-off private method) and
+`IcebergDataFileWriter.locationOf` (resolving a `DataFile.path()`
+string back to a `TableLocation` for reading). `IcebergTableMerger`
+itself was refactored to call these shared versions instead of its own
+copies — verified against its existing 8 tests first, before writing
+`IcebergCompactor` on top of them.
+
+No retry loop, deliberately, matching Delta's `Compactor`'s own stated
+reasoning: a bin-pack introduces no new concurrency risk (old files'
+bytes stay on disk until `Vacuum` removes them), so a missed concurrent
+change just isn't compacted this round, not a correctness problem.
+
+Verified with two new `IcebergCompactorTest` cases mirroring
+`CompactorTest`'s exact shapes (merge 3 active files in one partition
+into 1, confirming the original files still physically exist after;
+fewer-than-2-files is a no-op). Full regression: 179 (core) + 42
+(format-iceberg, +2) + 12 (cli) = 233 tests, 0 failures/errors, 27
+skipped.
+
+Remaining, explicitly out of scope: Iceberg vacuum — the last piece of
+write-lifecycle parity with Delta.
+
 **Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
 confirmed broken on real MinIO, root-caused precisely, not just
 documented as a risk.** A real 8-separate-process stress test
@@ -1007,8 +1050,10 @@ foundation under it is proven:
     shared `PartitionRowMerger` that both Delta's and Iceberg's mergers
     delegate to, so they share the exact same upsert/MERGE semantics
     instead of risking two independently-evolving copies; see its own
-    entry further down. Iceberg compaction and vacuum remain unbuilt;
-    no CLI write subcommands for either format.
+    entry further down. **Update — `IcebergCompactor` is now done too**,
+    via `Table.newRewrite()` (a dedicated non-data-changing commit type,
+    not `newOverwrite()`); see its own entry further down. Iceberg
+    vacuum remains unbuilt; no CLI write subcommands for either format.
 14. ✅ **Iceberg REST catalog integration.** Done, see above — new
     `IcebergRestConfiguration`/`IcebergRestLocation`, `icebergrest://`
     table references reachable via `--table`/`--sql`/Flight (reads and

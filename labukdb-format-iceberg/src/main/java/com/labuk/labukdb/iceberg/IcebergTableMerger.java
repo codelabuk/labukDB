@@ -8,17 +8,14 @@ import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.OverwriteFiles;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.hadoop.HadoopTables;
-import org.apache.iceberg.io.CloseableIterable;
 
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -97,10 +94,10 @@ public final class IcebergTableMerger {
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
             table.refresh();
-            List<DataFile> filesInPartition = filesInPartition(table, partitionValues);
+            List<DataFile> filesInPartition = IcebergTableFormat.filesInPartition(table, partitionValues);
 
             List<TableLocation> fileLocations = filesInPartition.stream()
-                    .map(file -> dataFileLocation(file.path().toString(), tableLocation))
+                    .map(file -> IcebergDataFileWriter.locationOf(file.path().toString(), tableLocation))
                     .toList();
             VectorSchemaRoot combined = PartitionRowMerger.combineFiles(fileLocations, allocator);
             VectorSchemaRoot merged;
@@ -149,39 +146,9 @@ public final class IcebergTableMerger {
      */
     private boolean stillFresh(Table table, Map<String, String> partitionValues, List<DataFile> expected) throws IOException {
         table.refresh();
-        List<DataFile> current = filesInPartition(table, partitionValues);
+        List<DataFile> current = IcebergTableFormat.filesInPartition(table, partitionValues);
         Set<String> currentPaths = current.stream().map(f -> f.path().toString()).collect(Collectors.toSet());
         Set<String> expectedPaths = expected.stream().map(f -> f.path().toString()).collect(Collectors.toSet());
         return currentPaths.equals(expectedPaths);
-    }
-
-    /**
-     * A file's own spec (not the table's current one — partition spec can
-     * evolve, same reasoning {@link IcebergTableFormat#toDataFileRef}
-     * already applies), partition-path-parsed via {@link
-     * IcebergTableFormat#parsePartitionPath}, matched against {@code
-     * partitionValues} exactly the way {@code TableMerger} matches {@code
-     * AddFile.getPartitionValues()}.
-     */
-    private List<DataFile> filesInPartition(Table table, Map<String, String> partitionValues) throws IOException {
-        List<DataFile> result = new ArrayList<>();
-        try (CloseableIterable<org.apache.iceberg.FileScanTask> tasks = table.newScan().planFiles()) {
-            for (org.apache.iceberg.FileScanTask task : tasks) {
-                DataFile file = task.file();
-                PartitionSpec spec = table.specs().get(file.specId());
-                String partitionPath = spec.partitionToPath(file.partition());
-                if (IcebergTableFormat.parsePartitionPath(partitionPath).equals(partitionValues)) {
-                    result.add(file);
-                }
-            }
-        }
-        return result;
-    }
-
-    private TableLocation dataFileLocation(String path, TableLocation tableLocation) {
-        if (TableLocation.isRemoteUri(path)) {
-            return TableLocation.forRemote(path, tableLocation.hadoopConf());
-        }
-        return TableLocation.forLocal(java.nio.file.Path.of(path));
     }
 }

@@ -171,6 +171,29 @@ public final class IcebergTableFormat implements TableFormat {
         return values;
     }
 
+    /**
+     * Every {@code DataFile} currently in {@code table} whose partition
+     * values (resolved against its own spec — see {@link #toDataFileRef}'s
+     * identical reasoning) equal {@code partitionValues}. Package-private,
+     * shared by {@link IcebergTableMerger} and {@link IcebergCompactor} —
+     * Iceberg has no log-level partition index to query directly the way
+     * Delta's {@code AddFile} list provides, so both need this same scan.
+     */
+    static List<DataFile> filesInPartition(Table table, Map<String, String> partitionValues) throws java.io.IOException {
+        List<DataFile> result = new ArrayList<>();
+        try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
+            for (FileScanTask task : tasks) {
+                DataFile file = task.file();
+                PartitionSpec spec = table.specs().get(file.specId());
+                String partitionPath = spec.partitionToPath(file.partition());
+                if (parsePartitionPath(partitionPath).equals(partitionValues)) {
+                    result.add(file);
+                }
+            }
+        }
+        return result;
+    }
+
     private List<String> partitionColumnNames() {
         List<String> names = new ArrayList<>();
         for (var field : table.spec().fields()) {

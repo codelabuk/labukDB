@@ -65,6 +65,22 @@ final class IcebergDataFileWriter {
      * already parses back out. Empty string for an unpartitioned table's
      * spec (no fields) — Iceberg's own convention for "no partition."
      */
+    /**
+     * Resolves a {@code DataFile.path()} string (always either a plain
+     * local path or an {@code s3a://...} URI, per this project's own
+     * write convention) back to a {@link TableLocation} for reading —
+     * shared by {@link IcebergTableMerger} and {@link IcebergCompactor},
+     * both of which need to re-read a table's existing data files by
+     * their already-absolute Iceberg-reported path, unlike Delta's
+     * relative {@code AddFile} paths resolved via {@code location.resolve}.
+     */
+    static TableLocation locationOf(String path, TableLocation tableLocation) {
+        if (TableLocation.isRemoteUri(path)) {
+            return TableLocation.forRemote(path, tableLocation.hadoopConf());
+        }
+        return TableLocation.forLocal(java.nio.file.Path.of(path));
+    }
+
     private static String buildPartitionPath(Table table, Map<String, String> partitionValues) {
         StringBuilder path = new StringBuilder();
         for (PartitionField field : table.spec().fields()) {
