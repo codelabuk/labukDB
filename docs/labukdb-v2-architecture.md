@@ -804,6 +804,63 @@ Remaining, explicitly out of scope for this pass: Iceberg
 merge/upsert, compaction, and vacuum — each a separate, later piece of
 write-lifecycle parity, not started.
 
+**Update — Iceberg MERGE/upsert is now done**, the second piece of
+write-lifecycle parity after CREATE TABLE. Rather than risk a second,
+independently-evolving copy of `core.log.TableMerger`'s nontrivial
+business rules (delete-then-update-then-insert, last-applied-wins,
+"update with no matching key is still an upsert"), the format-agnostic
+half of that algorithm was extracted into a new shared `PartitionRowMerger`
+(`combineFiles` + `merge`), and `TableMerger` itself was refactored to
+delegate to it — verified zero behavior change by re-running its full
+existing test suite before writing a single line of the new Iceberg
+side. The small Iceberg-specific "write a new data file + build the
+matching `DataFile`" step, needed by both `IcebergTableWriter.appendBatch`
+and the new merger, got the same treatment: extracted into
+`IcebergDataFileWriter`, with `IcebergTableWriter` refactored to use it
+(again verified against its existing tests first).
+
+New `IcebergTableMerger` matches `IcebergTableWriter`'s two entry-point
+shapes (path-based via `HadoopTables`, catalog-based via `Catalog`).
+What's genuinely different from Delta's version, by necessity, not
+oversight:
+- Commits via `Table.newOverwrite()` (delete the partition's current
+  files, add one new merged file) — Iceberg's real atomic-replace
+  primitive, confirmed via `javap` on `iceberg-api`
+  (`OverwriteFiles.deleteFile`/`addFile`/`commit`), not a hand-rolled
+  equivalent.
+- "Files currently in this partition" comes from a fresh
+  `table.newScan().planFiles()` filtered by the same partition-path
+  parsing `IcebergTableFormat.parsePartitionPath` already uses for
+  reads (widened from `private` to package-private to reuse it) — Iceberg
+  has no log-level partition index to query directly the way Delta's
+  `AddFile` list provides.
+- The same staleness risk Delta's `TableMerger.stillFresh()` exists
+  for — a concurrent writer adding a new file to this exact partition,
+  which a plain "did my deleted files survive" check wouldn't catch —
+  gets the identical hand-rolled check here, deliberately, rather than
+  leaning on `OverwriteFiles.validateNoConflictingData()`: that API's
+  exact conflict semantics for this precise scenario weren't
+  independently verified, so this mirrors Delta's own verified-correct
+  approach instead of trusting an unverified one.
+- Path-based merges go through the identical confirmed-broken-without-
+  a-lock gap `IcebergTableWriter` already has (`OverwriteFiles` commits
+  through the same `HadoopTableOperations.renameToFinal` rename-based
+  path) — `IcebergLockManagerConfig`/`RemoteWriteSafetyWarning` both
+  apply to the new merger exactly as they already do to the writer.
+
+Verified with eight new `IcebergTableMergerTest` cases mirroring
+`TableMergerTest`'s shapes exactly (insert-only, update-by-key,
+delete-by-key, delete-every-row, mixed insert/update/delete across
+multiple pre-existing files, missing-key-column rejection, a
+catalog-based variant) plus the one that actually matters most: a
+concurrent plain append racing a merge in the same partition — passed
+on the first real run, confirming the freshness check does its job.
+Full regression: 179 (core) + 40 (format-iceberg, +8) + 12 (cli) = 231
+tests, 0 failures/errors, 27 skipped.
+
+Remaining, explicitly out of scope for this pass: Iceberg compaction
+and vacuum — the next two pieces of write-lifecycle parity.
+
 **Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
 confirmed broken on real MinIO, root-caused precisely, not just
 documented as a risk.** A real 8-separate-process stress test
@@ -946,7 +1003,11 @@ foundation under it is proven:
     embedded library. **Update — `IcebergTableCreator` is now done too**,
     both path-based and catalog-based, closing the write-lifecycle gap
     with Delta's own `TableCreator`; see its own entry further down for
-    detail. Iceberg merge/upsert, compaction, and vacuum remain unbuilt;
+    detail. **Update — `IcebergTableMerger` is now done too**, via a new
+    shared `PartitionRowMerger` that both Delta's and Iceberg's mergers
+    delegate to, so they share the exact same upsert/MERGE semantics
+    instead of risking two independently-evolving copies; see its own
+    entry further down. Iceberg compaction and vacuum remain unbuilt;
     no CLI write subcommands for either format.
 14. ✅ **Iceberg REST catalog integration.** Done, see above — new
     `IcebergRestConfiguration`/`IcebergRestLocation`, `icebergrest://`

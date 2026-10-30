@@ -109,6 +109,7 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [Compactor\n(bin-pack small files,\nOPTIMIZE-style commit,\ndataChange=false)] as COMP #D9F2C4
     [Vacuum\n(remove orphaned files\npast retention window)] as VAC #D9F2C4
     [TableMerger\n(upsert/MERGE by key —\nthe foundation a CDC source\nlike Debezium needs,\ndataChange=true)] as TMRG #D9F2C4
+    [PartitionRowMerger\n(format-agnostic merge-by-key\nalgorithm, extracted so Iceberg's\nown merger reuses the exact same\nsemantics instead of a second,\nindependently-evolving copy)] as PRM #D9F2C4
     [TableCreator\n(version 0: protocol + metaData\nactions only, no add actions;\nlocal + remote)] as TCR #D9F2C4
     [LockProvider\n(interface) /\nDynamoDbLockProvider\n(opt-in cross-process lock --\nmitigates MinIO's non-compliant\nconditional-create under\nconcurrency)] as DDBL #D9F2C4
 
@@ -220,6 +221,8 @@ package "labukdb-format-iceberg  (optional for core embedders;\nrequired by cli/
   [IcebergLockManagerConfig\n(opt-in: sets Configuration's\n"lock-impl" property when\nICEBERG_LOCK_DYNAMODB_TABLE is set)] as ILMC #D9F2C4
   [IcebergTableCreator\n(path-based via HadoopTables.create,\nor catalog-based via\nCatalog.createTable;\nidentity-only partitioning)] as ITCR #D9F2C4
   [ArrowToIcebergSchema\n(Arrow Schema -> org.apache.iceberg.Schema;\nsame supported-type set as\nArrowToDeltaSchema)] as AIS #D9F2C4
+  [IcebergDataFileWriter\n(write a new Parquet file + build\nthe matching DataFile -- shared by\nappendBatch and IcebergTableMerger)] as IDFW #D9F2C4
+  [IcebergTableMerger\n(upsert/MERGE by key; commits via\nTable.newOverwrite(), Iceberg's real\natomic delete+add primitive; reuses\nPartitionRowMerger from core;\npath-based or Catalog-based)] as ITMRG #D9F2C4
 }
 
 ' ─── labukdb-flight ───────────────────────────────────────
@@ -253,8 +256,9 @@ HLS --> LOG
 DTF  --> SM  : read path (unchanged)
 CW   --> DT  : atomic commit (add/remove actions)
 COMP --> CW  : rewrite + commit bin-packed files\n(dataChange=false)
-TMRG --> PTAR : decode existing partition files
+TMRG --> PRM : combineFiles() + merge()
 TMRG --> CW  : insert/update/delete by key,\ncommit via replaceFiles\n(dataChange=true)
+PRM  --> PTAR : combineFiles() decodes\nexisting partition files
 VAC  --> DT  : delete files past retired-and-expired
 TCR  --> ADS : build schemaString
 TCR  --> DT  : write version 0\n(protocol + metaData, no add actions)
@@ -269,6 +273,9 @@ ILMC ..> IDDBL : sets Configuration's\n"lock-impl" property
 ITW ..> RWSW : construction --\nwarns if remote + no lock
 ITCR --> AIS : build org.apache.iceberg.Schema
 ITCR ..> ITW : table immediately usable\nby existing, unmodified writer
+ITW   ..> IDFW : appendBatch() delegates\nwrite+build-DataFile step
+ITMRG ..> IDFW : write new merged file\n+ build DataFile
+ITMRG --> PRM  : reuses core's exact\nsame merge-by-key semantics\n(combineFiles() + merge())
 IRC ..> ITF : Catalog passed to\nnew (Catalog, TableIdentifier) ctor
 IRC ..> ITW : Catalog passed to\nnew (Catalog, TableIdentifier) ctor
 TF  <|.. DTF

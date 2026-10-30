@@ -1,22 +1,17 @@
 package com.labuk.labukdb.iceberg;
 
-import com.labuk.labukdb.core.encode.ArrowToParquetWriter;
 import com.labuk.labukdb.core.storage.RemoteWriteSafetyWarning;
 import com.labuk.labukdb.core.storage.TableLocation;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.DataFile;
-import org.apache.iceberg.DataFiles;
-import org.apache.iceberg.PartitionField;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.hadoop.HadoopTables;
 
 import java.io.IOException;
-import java.nio.file.Files;
 import java.util.Map;
-import java.util.UUID;
 
 /**
  * Appends a batch to an <b>already-existing</b> Iceberg table — the
@@ -81,7 +76,6 @@ public final class IcebergTableWriter {
 
     private final Table table;
     private final TableLocation tableLocation;
-    private final ArrowToParquetWriter parquetWriter = new ArrowToParquetWriter();
 
     /**
      * Local or remote (S3/MinIO/ADLS), same dispatch {@link
@@ -133,59 +127,7 @@ public final class IcebergTableWriter {
      * against the spec it was written under, not the table's latest one.
      */
     public void appendBatch(VectorSchemaRoot batch, Map<String, String> partitionValues) throws IOException {
-        String partitionPath = buildPartitionPath(partitionValues);
-        String fileName = "part-" + UUID.randomUUID() + ".snappy.parquet";
-        String relativePath = partitionPath.isEmpty() ? fileName : partitionPath + "/" + fileName;
-
-        TableLocation dataFileLocation = tableLocation.resolve(relativePath);
-        if (!dataFileLocation.isRemote()) {
-            Files.createDirectories(dataFileLocation.localPath().getParent());
-        }
-        parquetWriter.write(dataFileLocation, batch);
-
-        DataFile dataFile = DataFiles.builder(table.spec())
-                .withPath(dataFileLocation.raw())
-                .withFileSizeInBytes(fileSize(dataFileLocation))
-                .withRecordCount(batch.getRowCount())
-                .withPartitionPath(partitionPath)
-                .build();
-
+        DataFile dataFile = IcebergDataFileWriter.write(table, tableLocation, partitionValues, batch);
         table.newAppend().appendFile(dataFile).commit();
-    }
-
-    private long fileSize(TableLocation location) throws IOException {
-        if (!location.isRemote()) {
-            return location.localPath().toFile().length();
-        }
-        return location.hadoopPath().getFileSystem(location.hadoopConf())
-                .getFileStatus(location.hadoopPath()).getLen();
-    }
-
-    /**
-     * {@code "col1=val1/col2=val2"}, ordered by the table's actual
-     * partition-spec field order (not the caller's map order) — the
-     * exact convention {@link IcebergTableFormat#parsePartitionPath}
-     * already parses back out, and the same Hive-style layout {@code
-     * DataFiles.Builder#withPartitionPath} already accepts (proven
-     * against both local and remote fixtures in {@code
-     * IcebergTableFormatTest}/{@code IcebergRemoteMinioIntegrationTest}).
-     * Empty string for an unpartitioned table's spec (no fields) —
-     * Iceberg's own convention for "no partition."
-     */
-    private String buildPartitionPath(Map<String, String> partitionValues) {
-        StringBuilder path = new StringBuilder();
-        for (PartitionField field : table.spec().fields()) {
-            String value = partitionValues.get(field.name());
-            if (value == null) {
-                throw new IllegalArgumentException(
-                        "Missing value for partition column '" + field.name() + "'; table partition columns are "
-                                + table.spec().fields());
-            }
-            if (path.length() > 0) {
-                path.append('/');
-            }
-            path.append(field.name()).append('=').append(value);
-        }
-        return path.toString();
     }
 }

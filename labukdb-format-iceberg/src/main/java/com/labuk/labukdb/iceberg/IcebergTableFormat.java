@@ -152,8 +152,12 @@ public final class IcebergTableFormat implements TableFormat {
                 null); // Iceberg's column-level stats aren't in AddFile.stats' JSON shape; not mapped here yet.
     }
 
-    /** {@code "col1=val1/col2=val2"} -> {col1: val1, col2: val2}; "" (unpartitioned) -> empty map. */
-    private static Map<String, String> parsePartitionPath(String partitionPath) {
+    /**
+     * {@code "col1=val1/col2=val2"} -> {col1: val1, col2: val2}; "" (unpartitioned) -> empty map.
+     * Package-private (not {@code private}) so {@link IcebergTableMerger} can reuse the
+     * identical partition-path parsing to filter a scan's files by partition.
+     */
+    static Map<String, String> parsePartitionPath(String partitionPath) {
         Map<String, String> values = new LinkedHashMap<>();
         if (partitionPath == null || partitionPath.isEmpty()) {
             return values;
