@@ -904,6 +904,61 @@ skipped.
 Remaining, explicitly out of scope: Iceberg vacuum — the last piece of
 write-lifecycle parity with Delta.
 
+**Update — Iceberg vacuum is now done, closing Iceberg write-lifecycle
+parity with Delta completely (CREATE TABLE, MERGE, compaction, vacuum —
+all four).** Unlike the previous three pieces, this one is *much*
+thinner than its Delta counterpart: Delta's `Vacuum` hand-rolls
+everything (scan commit history for stale `remove` actions, check each
+against the live set itself), because Delta's flat JSON log has no
+native equivalent. Iceberg ships this as a first-class,
+`iceberg-core`-level operation — `Table.expireSnapshots()`, not a
+Spark-only action — so `IcebergVacuum` is a thin wrapper supplying this
+project's own file-deletion primitive and capturing what was deleted,
+not a reimplementation of the cleanup logic itself.
+
+**Two real things confirmed the hard way, both initially wrong
+guesses, neither assumed correct from memory:**
+
+1. `deleteWith(Consumer<String>)` was assumed to be a side-channel
+   notification layered on top of Iceberg's own default deletion.
+   Confirmed via Iceberg's actual source and javadoc that it's the
+   opposite: supplying it *replaces* the default delete mechanism
+   entirely. Fixed by having the consumer both perform the real
+   deletion (local `Files.deleteIfExists`/remote Hadoop `FileSystem
+   .delete` — the same two-branch logic `Vacuum.deleteDataFile` already
+   uses) and record the path, rather than just recording and expecting
+   Iceberg to delete the bytes on its own.
+2. A first real test run deleted only manifest/manifest-list (`.avro`)
+   files, not the genuinely-orphaned Parquet data files — the initial
+   guess was a wrong cleanup-level default. Fetched `RemoveSnapshots`'
+   real 1.12.0 source to check: `cleanupLevel` already defaults to
+   `ALL` (kept explicit anyway, so this class's contract doesn't
+   silently change if a future Iceberg version ever changes that
+   default). The *actual* cause, traced through `IncrementalFileCleanup`'s
+   real source: a removed data file only becomes physically deletable
+   once the snapshot that *recorded its removal* (the compaction) is
+   itself expired — not when the snapshot that originally added the
+   file expires. The test's compaction snapshot was still the retained
+   "current" one, so its own delete-bookkeeping for the two source
+   files never aged out. Fixed by adding one more commit after the
+   compaction in the test, so the compaction snapshot itself becomes
+   eligible for expiry under `retainLast(1)` — the same ordering any
+   real caller needs: a table needs at least one commit after a
+   compaction/merge before that operation's removed files are
+   reclaimable, a real operational detail this class's own javadoc now
+   documents rather than leaving undiscovered.
+
+Verified with two new `IcebergVacuumTest` cases: the real-compaction
+scenario above (both orphaned files physically deleted, the two files
+the current snapshot actually needs survive, the live table itself
+unaffected), and a within-retention no-op. Full regression: 179 (core)
++ 44 (format-iceberg, +2) + 12 (cli) = 235 tests, 0 failures/errors, 27
+skipped.
+
+Iceberg write-lifecycle parity with Delta is now complete. Remaining
+work on the multi-format side shifts to catalog maturity (Hive
+Metastore/Glue/Nessie) and the SQL engine, not write-lifecycle gaps.
+
 **Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
 confirmed broken on real MinIO, root-caused precisely, not just
 documented as a risk.** A real 8-separate-process stress test
@@ -1052,8 +1107,11 @@ foundation under it is proven:
     instead of risking two independently-evolving copies; see its own
     entry further down. **Update — `IcebergCompactor` is now done too**,
     via `Table.newRewrite()` (a dedicated non-data-changing commit type,
-    not `newOverwrite()`); see its own entry further down. Iceberg
-    vacuum remains unbuilt; no CLI write subcommands for either format.
+    not `newOverwrite()`); see its own entry further down. **Update —
+    `IcebergVacuum` is now done too**, a thin wrapper over Iceberg's own
+    native `Table.expireSnapshots()`; see its own entry further down.
+    Iceberg write-lifecycle parity with Delta is now complete. No CLI
+    write subcommands for either format.
 14. ✅ **Iceberg REST catalog integration.** Done, see above — new
     `IcebergRestConfiguration`/`IcebergRestLocation`, `icebergrest://`
     table references reachable via `--table`/`--sql`/Flight (reads and

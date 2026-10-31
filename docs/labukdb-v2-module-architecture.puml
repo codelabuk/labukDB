@@ -224,6 +224,7 @@ package "labukdb-format-iceberg  (optional for core embedders;\nrequired by cli/
   [IcebergDataFileWriter\n(write a new Parquet file + build\nthe matching DataFile -- shared by\nappendBatch and IcebergTableMerger)] as IDFW #D9F2C4
   [IcebergTableMerger\n(upsert/MERGE by key; commits via\nTable.newOverwrite(), Iceberg's real\natomic delete+add primitive; reuses\nPartitionRowMerger from core;\npath-based or Catalog-based)] as ITMRG #D9F2C4
   [IcebergCompactor\n(bin-pack small files; commits via\nTable.newRewrite() -- Iceberg's real\nnon-data-changing commit type, not\nnewOverwrite(); path-based or\nCatalog-based)] as ICOMP #D9F2C4
+  [IcebergVacuum\n(thin wrapper over Iceberg's own\nnative Table.expireSnapshots() --\nDelta's Vacuum hand-rolls this,\nIceberg ships it; path-based or\nCatalog-based)] as IVAC #D9F2C4
 }
 
 ' ─── labukdb-flight ───────────────────────────────────────
@@ -279,6 +280,7 @@ ITMRG ..> IDFW : write new merged file\n+ build DataFile
 ITMRG --> PRM  : reuses core's exact\nsame merge-by-key semantics\n(combineFiles() + merge())
 ICOMP ..> IDFW : write new merged file\n+ build DataFile
 ICOMP --> PRM  : combineFiles() only --\nno merge-by-key needed
+IVAC  ..> IDFW : locationOf() -- resolve an\nexpired DataFile's path for deletion
 IRC ..> ITF : Catalog passed to\nnew (Catalog, TableIdentifier) ctor
 IRC ..> ITW : Catalog passed to\nnew (Catalog, TableIdentifier) ctor
 TF  <|.. DTF
