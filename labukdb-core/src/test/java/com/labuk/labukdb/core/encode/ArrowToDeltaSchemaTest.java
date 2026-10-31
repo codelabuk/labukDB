@@ -64,4 +64,41 @@ class ArrowToDeltaSchemaTest {
         assertEquals(false, typeNode.get("containsNull").asBoolean(),
                 "containsNull must reflect the element field's own nullability, not the list field's");
     }
+
+    @Test
+    void structField_encodesAsStructObject_sameShapeAsTopLevelSchema() throws Exception {
+        Field nameField = new Field("name", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field ageField = new Field("age", FieldType.notNullable(new ArrowType.Int(32, true)), null);
+        Field personField = new Field("person", FieldType.nullable(ArrowType.Struct.INSTANCE),
+                List.of(nameField, ageField));
+
+        String json = ArrowToDeltaSchema.toSchemaString(new Schema(List.of(personField)));
+        JsonNode typeNode = MAPPER.readTree(json).get("fields").get(0).get("type");
+
+        assertTrue(typeNode.isObject(), "a Struct field's type must be a nested object, not a string");
+        assertEquals("struct", typeNode.get("type").asText());
+        JsonNode nestedFields = typeNode.get("fields");
+        assertEquals(2, nestedFields.size());
+        assertEquals("name", nestedFields.get(0).get("name").asText());
+        assertEquals("string", nestedFields.get(0).get("type").asText());
+        assertEquals("age", nestedFields.get(1).get("name").asText());
+        assertEquals(false, nestedFields.get(1).get("nullable").asBoolean());
+    }
+
+    @Test
+    void mapField_encodesWithKeyTypeValueTypeValueContainsNull() throws Exception {
+        Field keyField = new Field("key", FieldType.notNullable(ArrowType.Utf8.INSTANCE), null);
+        Field valueField = new Field("value", FieldType.nullable(new ArrowType.Int(32, true)), null);
+        Field entriesField = new Field("entries", FieldType.notNullable(ArrowType.Struct.INSTANCE),
+                List.of(keyField, valueField));
+        Field mapField = new Field("attrs", FieldType.nullable(new ArrowType.Map(false)), List.of(entriesField));
+
+        String json = ArrowToDeltaSchema.toSchemaString(new Schema(List.of(mapField)));
+        JsonNode typeNode = MAPPER.readTree(json).get("fields").get(0).get("type");
+
+        assertEquals("map", typeNode.get("type").asText());
+        assertEquals("string", typeNode.get("keyType").asText());
+        assertEquals("integer", typeNode.get("valueType").asText());
+        assertTrue(typeNode.get("valueContainsNull").asBoolean());
+    }
 }

@@ -731,7 +731,9 @@ failures/errors, 27 skipped — unchanged from baseline.
 
 Remaining, explicitly out of scope for this pass: nested `LIST<LIST<...>>`
 (list of lists), MAP, STRUCT — a different problem shape (arbitrary field
-nesting vs. one repeated element), not started.
+nesting vs. one repeated element), not started. (**Closed later** — see
+the "Nested `LIST<LIST<...>>`/MAP/STRUCT support" update near the end of
+this document.)
 
 **Update — Iceberg CREATE TABLE is now done, closing the most visible
 asymmetry between the two formats: Delta already had `TableCreator`,
@@ -1250,6 +1252,107 @@ v1 core is the current priority; these are sequenced, not shelved.
 | Multi-writer OCC — remote, with lock | New opt-in `LockProvider`/`DynamoDbLockProvider`, `CommitWriter.forLocation(location, lockProvider)` | ✅ **Done, live-verified** — same scenario that fails above now passes with the lock engaged (`CommitWriterConcurrentMinioLockedIntegrationTest`, real MinIO + `amazon/dynamodb-local`); crash-recovery proven by a deterministic local test (`CommitWriterLockRecoveryTest`). Scoped as a mitigation for non-compliant S3-compatible storage specifically, not a universal multi-cloud requirement — see "Concurrent writes" above. |
 | **Distributed ingestion fleet** | Router + sharded Ingesters + a durable distributed WAL (not local-disk-per-node) + a catalog service tracking which node owns which table's live buffer — IOx's Router/Ingester split | **Planned, not yet designed.** Genuinely the largest remaining piece — closer to a distributed-systems project than an extension of the single-node write path, and needs its own dedicated design pass once v1 core is real |
 | **Distributed query execution** | Splitting one query's work across multiple compute nodes (join/aggregate pushdown across a fleet, not just client-side fan-out over `FlightEndpoint`s) | **Planned, not yet designed.** Needs a real distributed query planner; revisit once `execution/` exists single-node and its limits are actually felt |
+
+---
+
+## Update — Nested `LIST<LIST<...>>`/MAP/STRUCT support
+
+**Closes the last type-system gap shared by both Delta and Iceberg.**
+Everything else in the write-lifecycle already had parity between the two
+formats; this deepens the single remaining shared gap — the type system
+only ever supported `LIST<primitive>` — into a fully recursive one.
+
+Confirmed via `javap` disassembly of the real jars on this machine (not
+assumed), two facts shaped the whole design:
+
+- **Arrow 16.1.0 models `Map` as `List<Struct<key, value>>`.** `MapVector
+  extends ListVector`; its one child is a non-nullable `StructVector`
+  named `"entries"` (constants `MapVector.KEY_NAME`/`VALUE_NAME`/
+  `DATA_VECTOR_NAME`), whose two children are `"key"` (always
+  non-nullable) and `"value"`. `ListVector.initializeChildrenFromFields`
+  is completely type-agnostic in its bytecode — a list element that is
+  itself another list/struct/map needed zero new Arrow-side plumbing.
+- **Parquet-mr 1.13.1's `MAP` shape**, confirmed via `ConversionPatterns`
+  bytecode: `optional group <name> (MAP) { repeated group key_value {
+  required <keyType> key; optional <valueType> value; } }` — `key` is
+  forced `REQUIRED` by `BaseMapBuilder.KeyBuilder`'s own constructor, not
+  just convention. A plain `STRUCT` carries no `OriginalType` annotation
+  at all, so `decode.NestedTypeDecoder.isStructType` checks for that
+  exactly (`getOriginalType() == null`), not "not list and not map" — an
+  unrecognized annotation (e.g. the legacy `MAP_KEY_VALUE`, deliberately
+  never read, same read/write symmetry the existing `LIST` support
+  already relied on) still fails loudly instead of being silently
+  misread as a struct.
+
+**Read side (`decode/NestedTypeDecoder`)**: `toArrowField` became fully
+recursive (list element / map key+value / struct fields, any depth).
+`appendList` was replaced by `appendValue`, which dispatches on the real
+vector subtype — checking `MapVector` *before* `ListVector`, since Arrow
+models the former as a subclass of the latter — then recurses through
+writer-based helpers (`writeList`/`writeMap`/`writeStruct`) built on
+Arrow's own complex-writer API (`UnionListWriter`/`UnionMapWriter`/
+`NullableStructWriter`). Two positioning idioms had to be threaded
+through: a "no-name slot" form for list elements and map key/value
+(`.float4()`, `.list()`, `.struct()`, `.map(boolean)` — no name arg), and
+a "named field" form for struct fields (same accessors, each taking the
+field name). The cast from `FieldVector` to the right vector subtype
+moved from `ParquetToArrowReader` into this class — the reader no longer
+needs to know there are three different nested vector kinds.
+
+**Write side (`encode/ArrowToParquetWriter`)**: `buildListType`/
+`toListElementParquetType` collapsed into one recursive `toParquetType(
+name, field, repetition)` covering every supported Arrow type, built via
+raw `GroupType`/`OriginalType` construction (not the fluent `Types.list(
+...)`/`Types.map(...)` builders) for the same reason the original `LIST`
+code chose that — the written bytes must match exactly what
+`NestedTypeDecoder`'s shape checks look for. `appendListElement`
+collapsed into a shared `appendNestedValue`, reused by list elements, map
+entries (`MapVector` is structurally `LIST<Struct<key,value>>`, so it
+walks the same `[start,end)` element range), and struct fields (same row
+index as the parent, no range lookup — a struct doesn't change
+cardinality).
+
+**Delta (`encode/ArrowToDeltaSchema`)**: `Struct` → `{"type":"struct",
+"fields":[...]}`, the *exact* shape as the top-level schema itself
+(genuinely self-similar — extracted into one shared `buildStructNode`
+helper); `Map` → `{"type":"map","keyType":...,"valueType":...,
+"valueContainsNull":...}`. Both confirmed against the real Delta
+protocol's "Schema Serialization Format" section and `delta-rs`'s own
+schema serde test fixtures, not assumed.
+
+**Iceberg (`format-iceberg/ArrowToIcebergSchema`)**: the existing single-
+`AtomicInteger`-threaded field-ID recursion generalized with no new
+machinery — `Struct` → `Types.StructType.of(...)`, each child grabbing
+its own ID through the same `toNestedField` already used for top-level
+fields; `Map` → `Types.MapType.ofOptional`/`ofRequired(keyId, valueId,
+keyType, valueType)`, mirroring the existing list-element id-grab-then-
+recurse ordering.
+
+**Deliberate scope boundary**: the four leaf primitive kinds nested
+positions can bottom out in (float, double, int32, int64, string) are
+unchanged from what `LIST<primitive>` already supported — decimal/
+timestamp/boolean leaves inside a nested position are a separate,
+unverified expansion, not wired in this pass, to avoid a half-fixed state
+where schema-building would accept a shape the value-appender couldn't
+actually write.
+
+Verified with: four new round-trip tests in `ArrowToParquetWriterTest`
+(`LIST<LIST<int>>`, `STRUCT<name,age>`, `MAP<string,int>`, and
+`STRUCT<tags: LIST<string>>` proving real composability) that write via
+`ArrowToParquetWriter` and read back via `ParquetToArrowReader` in the
+same test; two new hand-rolled `MessageTypeParser`-fixture tests in
+`NestedTypeDecoderTest` proving the read side independently against
+Spark-shaped files our own writer never touched; two new
+`ArrowToDeltaSchemaTest` cases (JSON shape); two new
+`ArrowToIcebergSchemaTest` cases (including a field-ID-uniqueness check
+across struct/map children — the same class of bug already hit once for
+`List`'s element ID in commit `608974a`). Every Arrow writer-API call
+guessed from `javap` disassembly (no sources jar existed on this machine
+to confirm usage examples) worked correctly on the first real test run
+except one test's own assertion bug (caught and fixed, not a
+decoder/writer defect). Full regression: 190 (core) + 49 (format-iceberg)
++ 12 (cli) = 251 tests, 0 failures/errors, 33 skipped — unchanged from
+baseline, confirming zero regression.
 
 ---
 

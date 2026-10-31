@@ -178,13 +178,13 @@ public final class ParquetToArrowReader {
                 if (physicalColumns.contains(column)) {
                     Type parquetType = projectedSchema.getType(column);
                     if (!parquetType.isPrimitive() && NestedTypeDecoder.isSupported(parquetType)) {
-                        // Nested type (e.g. LIST<float> for embedding vectors)
+                        // Nested type (LIST/MAP/STRUCT, any depth) -- the cast to the
+                        // right vector subtype lives inside NestedTypeDecoder itself.
                         final Type capturedType = parquetType;
-                        final org.apache.arrow.vector.complex.ListVector listVector =
-                                (org.apache.arrow.vector.complex.ListVector) vector;
+                        final FieldVector capturedVector = vector;
                         final String capturedColumn = column;
                         appenders.add((row, destIndex) ->
-                                NestedTypeDecoder.appendList(row, capturedColumn, capturedType, listVector, destIndex));
+                                NestedTypeDecoder.appendValue(row, capturedColumn, capturedType, capturedVector, destIndex));
                     } else {
                         PrimitiveType primitiveType = parquetType.asPrimitiveType();
                         PrimitiveType.PrimitiveTypeName typeName = primitiveType.getPrimitiveTypeName();

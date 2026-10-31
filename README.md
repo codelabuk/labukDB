@@ -215,7 +215,7 @@ object storage.
 | Iceberg MERGE/upsert | ✅ Done | `IcebergTableMerger`, path-based and catalog-based; reuses Delta's exact merge semantics via shared `PartitionRowMerger` |
 | Iceberg compaction | ✅ Done | `IcebergCompactor`, path-based and catalog-based; commits via `Table.newRewrite()`, Iceberg's dedicated non-data-changing commit type |
 | Iceberg vacuum | ✅ Done | `IcebergVacuum`, path-based and catalog-based; thin wrapper over Iceberg's own native `Table.expireSnapshots()` — Delta's `Vacuum` had to hand-roll this, Iceberg ships it |
-| Type support | 🟡 Most primitives, DECIMAL (Decimal128), `LIST<float/double/int/long/string>` (read + write) | Not yet: nested `LIST<LIST<...>>`, MAP, STRUCT |
+| Type support | ✅ Done, incl. nested `LIST<LIST<...>>`/MAP/STRUCT of any depth (read + write) | Most primitives, DECIMAL (Decimal128), and the four leaf primitive kinds (float/double/int32/int64/string) at any nesting depth across List/Map/Struct — `Types.StructType`/`Types.MapType` on the Iceberg side, self-similar nested JSON on the Delta side. Decimal/timestamp/boolean leaves inside nested positions are a separate, not-yet-wired expansion |
 | Checkpoints | 🟡 Parsing tested against a self-built fixture | Not yet proven against a real Spark-produced checkpoint — highest-risk, least-verified code in the project |
 | Real AWS S3 / Azure ADLS (not MinIO) | 🟡 Implemented, not independently verified | MinIO is the only remote backend actually stress-tested live |
 | Flight surface | 🟡 `GetFlightInfo`/`DoGet`/`DoPut`/`ListFlights` done | `DoAction`/`DoExchange` unimplemented — no CREATE TABLE RPC, no push-based tailing |
@@ -327,7 +327,7 @@ Full backlog (every item, every status) lives in
 | Area | Next up |
 |---|---|
 | Write path | Iceberg write-lifecycle parity with Delta is now complete (CREATE TABLE + MERGE + compaction + vacuum); CLI write subcommands (`ingest`/`compact`/`vacuum`/`create-table`); Flight `DoAction` for CREATE TABLE; orphan-file detection in `Vacuum`; read-path proactive recovery for the remote OCC lock |
-| Core engine | Nested `LIST<LIST<...>>`/MAP/STRUCT; checkpoint writing (reads only today); row-data LRU cache; SQL-over-Flight; `DoExchange` streaming/tailing |
+| Core engine | Nested `LIST<LIST<...>>`/MAP/STRUCT is now done; checkpoint writing (reads only today); row-data LRU cache; SQL-over-Flight; `DoExchange` streaming/tailing |
 | Multi-format | Hive Metastore/Glue/Nessie catalogs; Parquet-only (no-log) tables |
 | AI / LLM | MCP tool wrapper; catalog semantic descriptions; case-insensitive filters |
 | Observability | Grafana as a Flight client; Prometheus metrics; InfluxDB → Delta pipeline |

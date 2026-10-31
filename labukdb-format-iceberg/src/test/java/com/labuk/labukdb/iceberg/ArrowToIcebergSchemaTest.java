@@ -103,6 +103,50 @@ class ArrowToIcebergSchemaTest {
     }
 
     @Test
+    void structField_mapsToStructTypeWithDistinctFieldIdsPerChild() {
+        Field nameField = field("name", ArrowType.Utf8.INSTANCE, true);
+        Field ageField = field("age", new ArrowType.Int(32, true), false);
+        Field personField = new Field("person", FieldType.nullable(ArrowType.Struct.INSTANCE),
+                List.of(nameField, ageField));
+
+        org.apache.iceberg.Schema result = ArrowToIcebergSchema.toIcebergSchema(new Schema(List.of(personField)));
+
+        Type personType = result.findType("person");
+        assertInstanceOf(Types.StructType.class, personType);
+        Types.StructType structType = (Types.StructType) personType;
+        assertEquals(Types.StringType.get(), structType.fieldType("name"));
+        assertEquals(Types.IntegerType.get(), structType.fieldType("age"));
+        assertFalse(structType.field("age").isOptional());
+
+        int outerId = result.findField("person").fieldId();
+        int nameId = structType.field("name").fieldId();
+        int ageId = structType.field("age").fieldId();
+        assertEquals(3, java.util.Set.of(outerId, nameId, ageId).size(), "struct and its two fields must all get distinct IDs");
+    }
+
+    @Test
+    void mapField_mapsToMapTypeWithDistinctKeyAndValueFieldIds() {
+        Field keyField = field("key", ArrowType.Utf8.INSTANCE, false);
+        Field valueField = field("value", new ArrowType.Int(32, true), true);
+        Field entriesField = new Field("entries", FieldType.notNullable(ArrowType.Struct.INSTANCE),
+                List.of(keyField, valueField));
+        Field mapField = new Field("attrs", FieldType.nullable(new ArrowType.Map(false)), List.of(entriesField));
+
+        org.apache.iceberg.Schema result = ArrowToIcebergSchema.toIcebergSchema(new Schema(List.of(mapField)));
+
+        Type attrsType = result.findType("attrs");
+        assertInstanceOf(Types.MapType.class, attrsType);
+        Types.MapType mapType = (Types.MapType) attrsType;
+        assertEquals(Types.StringType.get(), mapType.keyType());
+        assertEquals(Types.IntegerType.get(), mapType.valueType());
+        assertTrue(mapType.isValueOptional());
+
+        int outerId = result.findField("attrs").fieldId();
+        assertEquals(3, java.util.Set.of(outerId, mapType.keyId(), mapType.valueId()).size(),
+                "map field, key, and value must all get distinct IDs");
+    }
+
+    @Test
     void unsupportedArrowType_throwsRatherThanGuessing() {
         Field unsupportedField = field("blob", new ArrowType.Binary(), true);
         Schema arrowSchema = new Schema(List.of(unsupportedField));

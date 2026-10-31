@@ -159,10 +159,12 @@ between engine and client.
 **Type support:** INT32, INT64, FLOAT, DOUBLE, BOOLEAN, BINARY (UTF-8),
 INT96 (Spark's default legacy timestamp encoding — see
 `Int96TimestampCodec`, including its timezone caveat), DECIMAL
-(Decimal128 only, precision ≤38 — see `DecimalCodec`), and flat
-`LIST<float/double/int/long/string>` via `NestedTypeDecoder` (vector
-embeddings, numeric/string arrays), read and write. Not supported:
-nested `LIST<LIST<...>>`, MAP, STRUCT.
+(Decimal128 only, precision ≤38 — see `DecimalCodec`), and `LIST`/`MAP`/
+`STRUCT` of any nesting depth via `NestedTypeDecoder` (vector embeddings,
+numeric/string arrays, and arbitrary struct/map shapes), read and write.
+The leaf primitive kinds a nested position bottoms out in are float,
+double, int32, int64, and string — decimal/timestamp/boolean leaves
+inside a nested position are not yet wired.
 
 **`PartitionValueAppender`** reconstructs partition columns as constants,
 since they exist only in folder names, not in the files.

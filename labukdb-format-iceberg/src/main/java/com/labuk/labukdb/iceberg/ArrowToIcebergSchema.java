@@ -15,12 +15,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Iceberg counterpart of {@code core.encode.ArrowToDeltaSchema}, same
  * supported-type set deliberately: Int32, Int64, Float, Double, Bool,
  * Utf8, Timestamp, Decimal (precision ≤38 — Iceberg's own {@code
- * DecimalType} enforces this itself), and {@code List<primitive>} (the
- * exact set {@code core.encode.ArrowToParquetWriter} can actually
- * physically write — a column this can't express couldn't be written
- * either, the same reasoning {@code ArrowToDeltaSchema}'s own javadoc
- * states). Anything else throws rather than silently guessing an Iceberg
- * type.
+ * DecimalType} enforces this itself), {@code List}, {@code Struct}
+ * (→ {@code Types.StructType}), and {@code Map} (→ {@code Types.MapType})
+ * of any nesting depth — the exact set {@code core.encode.
+ * ArrowToParquetWriter} can actually physically write — a column this
+ * can't express couldn't be written either, the same reasoning {@code
+ * ArrowToDeltaSchema}'s own javadoc states. Anything else throws rather
+ * than silently guessing an Iceberg type.
  *
  * <b>Field IDs: one running counter threaded through the whole recursive
  * build, assigned before use</b> — Iceberg requires globally unique field
@@ -97,6 +98,25 @@ final class ArrowToIcebergSchema {
             return elementField.isNullable()
                     ? Types.ListType.ofOptional(elementId, elementType)
                     : Types.ListType.ofRequired(elementId, elementType);
+        }
+        if (type instanceof ArrowType.Map) {
+            Field entriesField = field.getChildren().get(0);
+            Field keyField = entriesField.getChildren().get(0);
+            Field valueField = entriesField.getChildren().get(1);
+            int keyId = nextId.incrementAndGet();
+            Type keyType = toIcebergType(keyField, nextId);
+            int valueId = nextId.incrementAndGet();
+            Type valueType = toIcebergType(valueField, nextId);
+            return valueField.isNullable()
+                    ? Types.MapType.ofOptional(keyId, valueId, keyType, valueType)
+                    : Types.MapType.ofRequired(keyId, valueId, keyType, valueType);
+        }
+        if (type instanceof ArrowType.Struct) {
+            List<Types.NestedField> children = new ArrayList<>();
+            for (Field childField : field.getChildren()) {
+                children.add(toNestedField(childField, nextId));
+            }
+            return Types.StructType.of(children);
         }
         throw unsupported(field, type);
     }

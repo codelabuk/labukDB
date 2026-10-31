@@ -157,4 +157,128 @@ class NestedTypeDecoderTest {
             assertNotNull(root.getVector("embedding"));
         }
     }
+
+    // --- STRUCT: a hand-rolled fixture matching what Spark actually writes
+    // for a column with no OriginalType annotation at all. ---
+
+    private static final String STRUCT_SCHEMA_STRING = """
+            message person_table {
+              required binary id (UTF8);
+              optional group person {
+                optional binary name (UTF8);
+                optional int32 age;
+              }
+            }
+            """;
+
+    private File writePersonFile(Path dir) throws Exception {
+        MessageType schema = MessageTypeParser.parseMessageType(STRUCT_SCHEMA_STRING);
+        File file = dir.resolve("people.snappy.parquet").toFile();
+
+        Configuration conf = new Configuration();
+        GroupWriteSupport.setSchema(schema, conf);
+        org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(file.getAbsolutePath());
+
+        try (ParquetWriter<Group> writer = ExampleParquetWriter.builder(hadoopPath)
+                .withConf(conf).withType(schema).withCompressionCodec(CompressionCodecName.SNAPPY).build()) {
+            SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+
+            Group row1 = factory.newGroup().append("id", "row-1");
+            Group person1 = row1.addGroup("person");
+            person1.append("name", "Ada");
+            person1.append("age", 30);
+            writer.write(row1);
+
+            // Row 2: the struct itself is present but its "age" field is null.
+            Group row2 = factory.newGroup().append("id", "row-2");
+            Group person2 = row2.addGroup("person");
+            person2.append("name", "Grace");
+            writer.write(row2);
+        }
+        return file;
+    }
+
+    @Test
+    void readsStructColumn_asArrowStructVector(@TempDir Path tempDir) throws Exception {
+        File file = writePersonFile(tempDir);
+
+        try (VectorSchemaRoot root = new ParquetToArrowReader()
+                .read(file, allocator, null, null, Map.of())) {
+
+            assertEquals(2, root.getRowCount());
+            org.apache.arrow.vector.complex.StructVector person =
+                    (org.apache.arrow.vector.complex.StructVector) root.getVector("person");
+            assertNotNull(person);
+
+            Map<?, ?> row0 = (Map<?, ?>) person.getObject(0);
+            assertEquals("Ada", row0.get("name").toString());
+            assertEquals(30, ((Number) row0.get("age")).intValue());
+
+            Map<?, ?> row1 = (Map<?, ?>) person.getObject(1);
+            assertEquals("Grace", row1.get("name").toString());
+            assertNull(row1.get("age"), "a null struct field must decode as null, not a default value");
+        }
+    }
+
+    // --- MAP: the real 3-level "key_value"/"key"/"value" convention
+    // confirmed (via javap on parquet-column-1.13.1.jar) to be what both
+    // the legacy OriginalType.MAP annotation path and the modern
+    // LogicalTypeAnnotation-based Types.map(...) builder produce. ---
+
+    private static final String MAP_SCHEMA_STRING = """
+            message attrs_table {
+              required binary id (UTF8);
+              optional group attrs (MAP) {
+                repeated group key_value {
+                  required binary key (UTF8);
+                  optional int32 value;
+                }
+              }
+            }
+            """;
+
+    private File writeAttrsFile(Path dir) throws Exception {
+        MessageType schema = MessageTypeParser.parseMessageType(MAP_SCHEMA_STRING);
+        File file = dir.resolve("attrs.snappy.parquet").toFile();
+
+        Configuration conf = new Configuration();
+        GroupWriteSupport.setSchema(schema, conf);
+        org.apache.hadoop.fs.Path hadoopPath = new org.apache.hadoop.fs.Path(file.getAbsolutePath());
+
+        try (ParquetWriter<Group> writer = ExampleParquetWriter.builder(hadoopPath)
+                .withConf(conf).withType(schema).withCompressionCodec(CompressionCodecName.SNAPPY).build()) {
+            SimpleGroupFactory factory = new SimpleGroupFactory(schema);
+
+            Group row1 = factory.newGroup().append("id", "row-1");
+            Group attrs1 = row1.addGroup("attrs");
+            Group entry1 = attrs1.addGroup("key_value");
+            entry1.append("key", "height");
+            entry1.append("value", 180);
+            Group entry2 = attrs1.addGroup("key_value");
+            entry2.append("key", "weight");
+            entry2.append("value", 75);
+            writer.write(row1);
+        }
+        return file;
+    }
+
+    @Test
+    void readsMapColumn_asArrowMapVector(@TempDir Path tempDir) throws Exception {
+        File file = writeAttrsFile(tempDir);
+
+        try (VectorSchemaRoot root = new ParquetToArrowReader()
+                .read(file, allocator, null, null, Map.of())) {
+
+            assertEquals(1, root.getRowCount());
+            org.apache.arrow.vector.complex.MapVector attrs =
+                    (org.apache.arrow.vector.complex.MapVector) root.getVector("attrs");
+            assertNotNull(attrs);
+
+            List<?> entries = (List<?>) attrs.getObject(0);
+            assertEquals(2, entries.size());
+            Map<?, ?> firstEntry = (Map<?, ?>) entries.get(0);
+            assertEquals("height", firstEntry.get("key").toString());
+            assertEquals(180, ((Number) firstEntry.get("value")).intValue());
+        }
+    }
 }

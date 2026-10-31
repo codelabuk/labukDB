@@ -8,7 +8,12 @@ import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.complex.ListVector;
+import org.apache.arrow.vector.complex.MapVector;
+import org.apache.arrow.vector.complex.StructVector;
+import org.apache.arrow.vector.complex.impl.NullableStructWriter;
 import org.apache.arrow.vector.complex.impl.UnionListWriter;
+import org.apache.arrow.vector.complex.impl.UnionMapWriter;
+import org.apache.arrow.vector.complex.writer.BaseWriter;
 import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
@@ -227,6 +232,205 @@ class ArrowToParquetWriterTest {
         try (org.apache.arrow.memory.ArrowBuf buf = vector.getAllocator().buffer(bytes.length)) {
             buf.writeBytes(bytes);
             writer.varChar().writeVarChar(0, bytes.length, buf);
+        }
+    }
+
+    private void writeVarCharNoName(BaseWriter.ListWriter writer, BufferAllocator allocator, String value) {
+        byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try (org.apache.arrow.memory.ArrowBuf buf = allocator.buffer(bytes.length)) {
+            buf.writeBytes(bytes);
+            writer.varChar().writeVarChar(0, bytes.length, buf);
+        }
+    }
+
+    private void writeVarCharNamed(NullableStructWriter writer, BufferAllocator allocator, String fieldName, String value) {
+        byte[] bytes = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        try (org.apache.arrow.memory.ArrowBuf buf = allocator.buffer(bytes.length)) {
+            buf.writeBytes(bytes);
+            writer.varChar(fieldName).writeVarChar(0, bytes.length, buf);
+        }
+    }
+
+    /**
+     * {@code LIST<LIST<int>>} -- proves list nesting of any depth needs no
+     * new Parquet-side machinery, just the recursive writer dispatch (see
+     * {@code ArrowToParquetWriter}/{@code NestedTypeDecoder}'s own javadoc).
+     */
+    @Test
+    void writeThenRead_listOfListColumn_roundTripsExactly(@TempDir File tempDir) throws Exception {
+        Field grandchildField = new Field("element", FieldType.nullable(new ArrowType.Int(32, true)), null);
+        Field innerListField = new Field("element", FieldType.nullable(new ArrowType.List()), List.of(grandchildField));
+        Field outerListField = new Field("matrix", FieldType.nullable(new ArrowType.List()), List.of(innerListField));
+        File file = new File(tempDir, "matrix.parquet");
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(outerListField)), allocator);
+            batch.allocateNew();
+            ListVector matrix = (ListVector) batch.getVector("matrix");
+            UnionListWriter writer = matrix.getWriter();
+
+            // Row 0: [[1,2,3],[4,5]] -- two inner lists of different lengths.
+            // Row 1: [[6]] -- a single inner list.
+            int[][][] rows = {{{1, 2, 3}, {4, 5}}, {{6}}};
+            for (int row = 0; row < rows.length; row++) {
+                writer.setPosition(row);
+                writer.startList();
+                for (int[] innerList : rows[row]) {
+                    BaseWriter.ListWriter innerWriter = writer.list();
+                    innerWriter.startList();
+                    for (int value : innerList) {
+                        innerWriter.integer().writeInt(value);
+                    }
+                    innerWriter.endList();
+                }
+                writer.endList();
+            }
+            writer.setValueCount(rows.length);
+            batch.setRowCount(rows.length);
+
+            new ArrowToParquetWriter().write(file, batch);
+            batch.close();
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                ListVector resultMatrix = (ListVector) result.getVector("matrix");
+                List<?> row0 = (List<?>) resultMatrix.getObject(0);
+                assertEquals(2, row0.size(), "row 0 should have two inner lists");
+                assertEquals(3, ((List<?>) row0.get(0)).size());
+                assertEquals(1, ((Number) ((List<?>) row0.get(0)).get(0)).intValue());
+                assertEquals(3, ((Number) ((List<?>) row0.get(0)).get(2)).intValue());
+                assertEquals(2, ((List<?>) row0.get(1)).size());
+                assertEquals(5, ((Number) ((List<?>) row0.get(1)).get(1)).intValue());
+
+                List<?> row1 = (List<?>) resultMatrix.getObject(1);
+                assertEquals(1, row1.size(), "row 1 should have one inner list");
+                assertEquals(6, ((Number) ((List<?>) row1.get(0)).get(0)).intValue());
+            }
+        }
+    }
+
+    /** {@code STRUCT<name: string, age: int>}. */
+    @Test
+    void writeThenRead_structColumn_roundTripsExactly(@TempDir File tempDir) throws Exception {
+        Field nameField = new Field("name", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field ageField = new Field("age", FieldType.nullable(new ArrowType.Int(32, true)), null);
+        Field personField = new Field("person", FieldType.nullable(ArrowType.Struct.INSTANCE),
+                List.of(nameField, ageField));
+        File file = new File(tempDir, "person.parquet");
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(personField)), allocator);
+            batch.allocateNew();
+            StructVector person = (StructVector) batch.getVector("person");
+            NullableStructWriter writer = person.getWriter();
+
+            writer.setPosition(0);
+            writer.start();
+            writeVarCharNamed(writer, allocator, "name", "Ada");
+            writer.integer("age").writeInt(30);
+            writer.end();
+
+            writer.setPosition(1);
+            writer.start();
+            writeVarCharNamed(writer, allocator, "name", "Grace");
+            writer.integer("age").writeInt(85);
+            writer.end();
+
+            writer.setValueCount(2);
+            batch.setRowCount(2);
+
+            new ArrowToParquetWriter().write(file, batch);
+            batch.close();
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                StructVector resultPerson = (StructVector) result.getVector("person");
+                assertEquals("Ada", ((java.util.Map<?, ?>) resultPerson.getObject(0)).get("name").toString());
+                assertEquals(30, ((Number) ((java.util.Map<?, ?>) resultPerson.getObject(0)).get("age")).intValue());
+                assertEquals("Grace", ((java.util.Map<?, ?>) resultPerson.getObject(1)).get("name").toString());
+            }
+        }
+    }
+
+    /** {@code MAP<string, int>}. */
+    @Test
+    void writeThenRead_mapColumn_roundTripsExactly(@TempDir File tempDir) throws Exception {
+        Field keyField = new Field("key", FieldType.notNullable(ArrowType.Utf8.INSTANCE), null);
+        Field valueField = new Field("value", FieldType.nullable(new ArrowType.Int(32, true)), null);
+        Field entriesField = new Field("entries", FieldType.notNullable(ArrowType.Struct.INSTANCE),
+                List.of(keyField, valueField));
+        Field mapField = new Field("attrs", FieldType.nullable(new ArrowType.Map(false)), List.of(entriesField));
+        File file = new File(tempDir, "attrs.parquet");
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(mapField)), allocator);
+            batch.allocateNew();
+            MapVector attrs = (MapVector) batch.getVector("attrs");
+            UnionMapWriter writer = attrs.getWriter();
+
+            writer.setPosition(0);
+            writer.startMap();
+            writer.startEntry();
+            writeVarCharNoName(writer.key(), allocator, "height");
+            writer.value().integer().writeInt(180);
+            writer.endEntry();
+            writer.startEntry();
+            writeVarCharNoName(writer.key(), allocator, "weight");
+            writer.value().integer().writeInt(75);
+            writer.endEntry();
+            writer.endMap();
+
+            writer.setValueCount(1);
+            batch.setRowCount(1);
+
+            new ArrowToParquetWriter().write(file, batch);
+            batch.close();
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                MapVector resultAttrs = (MapVector) result.getVector("attrs");
+                List<?> entries = (List<?>) resultAttrs.getObject(0);
+                assertEquals(2, entries.size());
+                java.util.Map<?, ?> firstEntry = (java.util.Map<?, ?>) entries.get(0);
+                assertEquals("height", firstEntry.get("key").toString());
+                assertEquals(180, ((Number) firstEntry.get("value")).intValue());
+            }
+        }
+    }
+
+    /** {@code STRUCT<tags: LIST<string>>} -- proves a struct field can itself be a nested complex type. */
+    @Test
+    void writeThenRead_structContainingListField_roundTripsExactly(@TempDir File tempDir) throws Exception {
+        Field elementField = new Field("element", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field tagsField = new Field("tags", FieldType.nullable(new ArrowType.List()), List.of(elementField));
+        Field profileField = new Field("profile", FieldType.nullable(ArrowType.Struct.INSTANCE), List.of(tagsField));
+        File file = new File(tempDir, "profile.parquet");
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(profileField)), allocator);
+            batch.allocateNew();
+            StructVector profile = (StructVector) batch.getVector("profile");
+            NullableStructWriter writer = profile.getWriter();
+
+            writer.setPosition(0);
+            writer.start();
+            BaseWriter.ListWriter tagsWriter = writer.list("tags");
+            tagsWriter.startList();
+            writeVarCharNoName(tagsWriter, allocator, "alpha");
+            writeVarCharNoName(tagsWriter, allocator, "beta");
+            tagsWriter.endList();
+            writer.end();
+
+            writer.setValueCount(1);
+            batch.setRowCount(1);
+
+            new ArrowToParquetWriter().write(file, batch);
+            batch.close();
+
+            try (VectorSchemaRoot result = new ParquetToArrowReader().read(file, allocator, null, null)) {
+                StructVector resultProfile = (StructVector) result.getVector("profile");
+                java.util.Map<?, ?> row0 = (java.util.Map<?, ?>) resultProfile.getObject(0);
+                List<?> tags = (List<?>) row0.get("tags");
+                assertEquals(2, tags.size());
+                assertEquals("alpha", tags.get(0).toString());
+            }
         }
     }
 }
