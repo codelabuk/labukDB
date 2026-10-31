@@ -1356,6 +1356,79 @@ baseline, confirming zero regression.
 
 ---
 
+## Update — Closing the three remaining MinIO verification gaps
+
+**All three lower-risk, previously-open verification gaps are now closed.**
+Core write-lifecycle/concurrency correctness was already proven; this
+pass exercised already-built remote-capable code through new tests —
+zero production code changes.
+
+**Nested types over MinIO** (`NestedTypeMinioIntegrationTest`, new):
+`STRUCT<name,age>` and `MAP<string,int>` round-trip correctly through
+`ArrowToParquetWriter`/`ParquetToArrowReader` against real MinIO, the
+same `TableLocation.forRemote` path every other remote test already
+uses. Not re-proven: list-of-list / struct-containing-list on MinIO —
+MinIO's one known real gap is commit-log atomicity, not raw byte I/O,
+which is already generic across every Arrow type.
+
+**Iceberg SQL/aggregation execution over MinIO** (`QueryCommandIcebergMinioIntegrationTest`,
+new): confirmed by direct code trace before writing the test —
+`QueryCommand`'s Delta-vs-Iceberg and local-vs-remote dispatch
+(`TableResolver`/`DetectedFormat`) are orthogonal axes, so Iceberg+MinIO
+*should* already work through the CLI; it had simply never been
+exercised. `SELECT level, COUNT(amount) AS cnt FROM ... GROUP BY level`
+against a two-partition, MinIO-backed Iceberg table combines correctly
+across files, first try.
+
+**REST catalog + MinIO, full data round trip** (`IcebergRestCatalogMinioLiveIntegrationTest`,
+new) — the one item `IcebergRestCatalogLiveIntegrationTest`'s own
+javadoc had flagged as blocked ("running the reference REST server with
+an S3-backed warehouse ... hit a real constraint"). Turned out solvable,
+not architectural, once actually tried against this project's real
+MinIO instance (a hosted service reachable over HTTPS at a real domain,
+not a local Docker container — learned mid-session, which itself
+simplified the setup: no new Docker network needed, just one new
+`tabulario/iceberg-rest` container pointed at the existing instance via
+the standard `CATALOG_S3_*`/`AWS_*` env vars, with `CATALOG_WAREHOUSE=
+s3a://...` instead of `s3://` so the locations it returns resolve
+against this project's own `MinioConfiguration`). Two further real,
+live-only blockers surfaced and were fixed, neither visible from reading
+the code beforehand:
+
+1. **Container DNS resolving the MinIO hostname to its own loopback.**
+   The REST container's DNS resolution of the real MinIO hostname
+   returned `127.0.0.1` — the *container's* loopback, not the host's —
+   because that hostname is locally reverse-proxied on the host machine
+   (resolves to `127.0.0.1` there too) and Docker's container DNS
+   inherited that same answer. Fixed with `--add-host <hostname>:host-gateway`
+   on `docker run`, Docker's own mechanism for routing a specific
+   hostname to the host machine's real address from inside a container.
+2. **TLS certificate the container's default Java trust store doesn't
+   recognize.** The MinIO hostname is fronted by an `mkcert`-issued local
+   development certificate (confirmed via `openssl x509 -issuer`: `O=mkcert
+   development CA`) — trusted by the host machine, unknown to a fresh
+   container's JRE. Fixed by `docker cp`-ing the leaf certificate into
+   the container and importing it directly into the JVM's `cacerts`
+   (`keytool -importcert`, run as root — the container's default
+   non-root user lacked write access to the keystore file, a detail
+   `keytool` itself printed a misleadingly successful-looking message
+   for and only surfaced as a real failure on verification), then
+   restarting the container so its JVM re-reads the updated truststore.
+
+With both fixed, `IcebergTableWriter`/`IcebergTableFormat`'s existing
+`Catalog`-based constructors (no new production code — both already
+derive their `TableLocation` from the loaded `Table`'s own `location()`
+via `TableLocation.fromStringWithEnvironmentConfig`) proved a genuine
+create-table-via-REST → write-via-MinIO → commit → read-back round trip,
+with the data surviving intact.
+
+Full regression: 192 (core) + 50 (format-iceberg) + 13 (cli) = 255
+tests, 0 failures/errors, 37 skipped (up from 251/33 — the 4 new
+live-infra tests skip cleanly without their env vars set, so CI is
+unaffected) — zero regressions.
+
+---
+
 ## Known test flakiness — `FlightIntegrationTest`
 
 **A known, pre-existing flaky test — root cause still open, not Arrow's.**
