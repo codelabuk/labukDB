@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.dynamodb.model.DescribeTableRequest;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.ResourceInUseException;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 import software.amazon.awssdk.services.dynamodb.model.TableStatus;
@@ -88,11 +89,21 @@ public final class DynamoDbLockManager implements LockManager {
                 return;
             }
         } catch (ResourceNotFoundException notYetCreated) {
-            client.createTable(r -> r.tableName(tableName)
-                    .billingMode(BillingMode.PAY_PER_REQUEST)
-                    .keySchema(KeySchemaElement.builder().attributeName(ATTR_LOCK_KEY).keyType(KeyType.HASH).build())
-                    .attributeDefinitions(AttributeDefinition.builder()
-                            .attributeName(ATTR_LOCK_KEY).attributeType(ScalarAttributeType.S).build()));
+            try {
+                client.createTable(r -> r.tableName(tableName)
+                        .billingMode(BillingMode.PAY_PER_REQUEST)
+                        .keySchema(KeySchemaElement.builder().attributeName(ATTR_LOCK_KEY).keyType(KeyType.HASH).build())
+                        .attributeDefinitions(AttributeDefinition.builder()
+                                .attributeName(ATTR_LOCK_KEY).attributeType(ScalarAttributeType.S).build()));
+            } catch (ResourceInUseException raceLost) {
+                // A real race, found the hard way under genuine 8-separate-
+                // process contention against a brand-new table name, not
+                // assumed: another process's describeTable also saw
+                // ResourceNotFoundException and won the create race first.
+                // Harmless -- the table is being (or already was) created
+                // either way; fall through to the poll-until-ACTIVE loop
+                // below exactly as if this process had created it itself.
+            }
         }
 
         for (int attempt = 0; attempt < 25; attempt++) {

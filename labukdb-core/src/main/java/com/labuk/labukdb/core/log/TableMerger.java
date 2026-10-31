@@ -83,12 +83,32 @@ public final class TableMerger {
     public long merge(TableLocation location, Map<String, String> partitionValues, List<String> keyColumns,
                        VectorSchemaRoot inserts, VectorSchemaRoot updates, VectorSchemaRoot deletes,
                        BufferAllocator allocator) throws IOException {
+        return merge(location, null, partitionValues, keyColumns, inserts, updates, deletes, allocator);
+    }
+
+    /**
+     * Same as {@link #merge(TableLocation, Map, List, VectorSchemaRoot, VectorSchemaRoot, VectorSchemaRoot, BufferAllocator)},
+     * but every commit is mediated through {@code lockProvider} — a real,
+     * previously-missing gap closed here: {@link CommitWriter#forLocation(TableLocation, LockProvider)}
+     * already lets a plain {@code appendBatch} opt into the DynamoDB-backed
+     * mitigation for non-compliant object storage's conditional-create, but
+     * this class (and {@link Compactor}) had no way to pass a lock through
+     * at all — {@code merge}'s own {@code replaceFiles} commit was always
+     * exposed to the same confirmed-broken race {@code appendBatch} already
+     * has a fix for, with no way to opt in. {@code lockProvider == null}
+     * keeps the existing no-lock behavior exactly as before.
+     */
+    public long merge(TableLocation location, LockProvider lockProvider, Map<String, String> partitionValues, List<String> keyColumns,
+                       VectorSchemaRoot inserts, VectorSchemaRoot updates, VectorSchemaRoot deletes,
+                       BufferAllocator allocator) throws IOException {
         if (keyColumns.isEmpty()) {
             throw new IllegalArgumentException("merge() requires at least one key column");
         }
 
         SnapshotManager snapshotManager = SnapshotManager.forLocation(location);
-        CommitWriter commitWriter = CommitWriter.forLocation(location);
+        CommitWriter commitWriter = lockProvider == null
+                ? CommitWriter.forLocation(location)
+                : CommitWriter.forLocation(location, lockProvider);
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {
             Snapshot snapshot = snapshotManager.latest();

@@ -134,4 +134,53 @@ class DynamoDbLockProviderTest {
         assertEquals(1, successCount.get(), "exactly one writer should win the conditional put");
         assertEquals(threadCount - 1, conflictCount.get(), "every other writer should get a clean conflict");
     }
+
+    /**
+     * Exercises a real regression against a genuinely brand-new table
+     * name, built via the raw {@code (client, tableName)} constructor +
+     * package-private {@code ensureTableExists()} directly — using
+     * {@code fromConfiguration} here would reuse the shared {@code
+     * DYNAMODB_LOCK_TABLE} name every other test's own {@code
+     * @BeforeEach} already created, which would never actually reach the
+     * {@code ResourceNotFoundException} branch at all.
+     *
+     * Found the hard way via {@code
+     * IcebergTableMergerConcurrentMinioLockedIntegrationTest}'s real
+     * 8-separate-process run (a different class, {@code
+     * DynamoDbLockManager}, but the identical unprotected {@code
+     * createTable} call): the first process to see {@code
+     * ResourceNotFoundException} calls {@code createTable}, and every
+     * other process racing the same check does too, so DynamoDB throws
+     * {@code ResourceInUseException} for every loser. Fixed by catching
+     * that exception and falling through to the poll-until-ACTIVE loop
+     * regardless of which process actually created the table.
+     */
+    @Test
+    void ensureTableExists_concurrentInstancesAgainstBrandNewTable_noneThrow() throws Exception {
+        Optional<DynamoDbLockConfiguration> config = DynamoDbLockConfiguration.fromEnvironment();
+        assumeTrue(config.isPresent(), "DYNAMODB_LOCK_TABLE not set — skipping live DynamoDB lock test");
+
+        String freshTableName = "labukdb-lock-race-test-" + UUID.randomUUID();
+        var client = config.get().buildClient();
+
+        int instanceCount = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(instanceCount);
+        CountDownLatch startGate = new CountDownLatch(1);
+        List<Future<Void>> futures = new ArrayList<>();
+
+        for (int i = 0; i < instanceCount; i++) {
+            futures.add(pool.submit(() -> {
+                startGate.await();
+                new DynamoDbLockProvider(client, freshTableName).ensureTableExists();
+                return null;
+            }));
+        }
+
+        startGate.countDown();
+        for (Future<Void> f : futures) {
+            assertDoesNotThrow(() -> f.get(60, TimeUnit.SECONDS));
+        }
+        pool.shutdown();
+        client.close();
+    }
 }

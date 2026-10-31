@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.dynamodb.model.GetItemResponse;
 import software.amazon.awssdk.services.dynamodb.model.KeySchemaElement;
 import software.amazon.awssdk.services.dynamodb.model.KeyType;
 import software.amazon.awssdk.services.dynamodb.model.PutItemRequest;
+import software.amazon.awssdk.services.dynamodb.model.ResourceInUseException;
 import software.amazon.awssdk.services.dynamodb.model.ResourceNotFoundException;
 import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 import software.amazon.awssdk.services.dynamodb.model.TableDescription;
@@ -71,22 +72,38 @@ public final class DynamoDbLockProvider implements LockProvider {
                 return;
             }
         } catch (ResourceNotFoundException notYetCreated) {
-            client.createTable(r -> r.tableName(tableName)
-                    .billingMode(BillingMode.PAY_PER_REQUEST)
-                    .keySchema(
-                            KeySchemaElement.builder().attributeName(ATTR_TABLE_PATH).keyType(KeyType.HASH).build(),
-                            KeySchemaElement.builder().attributeName(ATTR_FILE_NAME).keyType(KeyType.RANGE).build())
-                    .attributeDefinitions(
-                            AttributeDefinition.builder().attributeName(ATTR_TABLE_PATH).attributeType(ScalarAttributeType.S).build(),
-                            AttributeDefinition.builder().attributeName(ATTR_FILE_NAME).attributeType(ScalarAttributeType.S).build()));
             try {
-                client.updateTimeToLive(UpdateTimeToLiveRequest.builder()
-                        .tableName(tableName)
-                        .timeToLiveSpecification(TimeToLiveSpecification.builder()
-                                .enabled(true).attributeName(ATTR_EXPIRE_TIME).build())
-                        .build());
-            } catch (RuntimeException ttlNotSupported) {
-                // Best-effort only -- some local/emulated backends accept but don't enforce TTL.
+                client.createTable(r -> r.tableName(tableName)
+                        .billingMode(BillingMode.PAY_PER_REQUEST)
+                        .keySchema(
+                                KeySchemaElement.builder().attributeName(ATTR_TABLE_PATH).keyType(KeyType.HASH).build(),
+                                KeySchemaElement.builder().attributeName(ATTR_FILE_NAME).keyType(KeyType.RANGE).build())
+                        .attributeDefinitions(
+                                AttributeDefinition.builder().attributeName(ATTR_TABLE_PATH).attributeType(ScalarAttributeType.S).build(),
+                                AttributeDefinition.builder().attributeName(ATTR_FILE_NAME).attributeType(ScalarAttributeType.S).build()));
+                try {
+                    client.updateTimeToLive(UpdateTimeToLiveRequest.builder()
+                            .tableName(tableName)
+                            .timeToLiveSpecification(TimeToLiveSpecification.builder()
+                                    .enabled(true).attributeName(ATTR_EXPIRE_TIME).build())
+                            .build());
+                } catch (RuntimeException ttlNotSupported) {
+                    // Best-effort only -- some local/emulated backends accept but don't enforce TTL.
+                }
+            } catch (ResourceInUseException raceLost) {
+                // A real race, found the hard way under genuine separate-
+                // process contention against a brand-new table name (via
+                // DynamoDbLockManager's identical table-bootstrap logic,
+                // not this class's own test -- but the exact same
+                // unprotected createTable call exists here too), not
+                // assumed: another process's describeTable also saw
+                // ResourceNotFoundException and won the create race
+                // first. Harmless -- the table is being (or already was)
+                // created either way; fall through to the poll-until-
+                // ACTIVE loop below exactly as if this process had
+                // created it itself. TTL enablement is skipped on this
+                // path (the winner already requested it), matching this
+                // method's own existing best-effort TTL philosophy.
             }
         }
 

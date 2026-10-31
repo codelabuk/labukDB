@@ -959,6 +959,69 @@ Iceberg write-lifecycle parity with Delta is now complete. Remaining
 work on the multi-format side shifts to catalog maturity (Hive
 Metastore/Glue/Nessie) and the SQL engine, not write-lifecycle gaps.
 
+**Update — real-MinIO live verification for the new write-lifecycle
+ops, both formats, surfaced three genuine bugs, all found by actually
+running real infrastructure rather than assuming the existing lock fix
+generalized cleanly.**
+
+1. **Delta's `TableMerger`/`Compactor` had no lock-support path at
+   all**, found by direct inspection before writing a single test: both
+   hardcoded `CommitWriter.forLocation(location)` with no way to pass a
+   `LockProvider`, unlike plain `appendBatch`. So MERGE and compaction
+   on Delta against non-compliant storage were *always* exposed to the
+   confirmed-broken race, with no way to opt into the fix that already
+   existed for plain writes. Fixed with new `merge(location,
+   lockProvider, ...)`/`compact(location, lockProvider, ...)` overloads,
+   backward-compatible (existing no-lock overloads unchanged, delegate
+   with `lockProvider = null`). `Vacuum` needed no equivalent fix — it
+   only deletes already-orphaned bytes, never writes a new commit, so
+   it has no OCC exposure to begin with.
+
+2. **Delta's MERGE confirmed broken without a lock, more severely than
+   plain append** — a real 8-concurrent-writer test
+   (`TableMergerConcurrentMinioIntegrationTest`) found 7 of 8 inserts
+   silently lost, zero exceptions. Worse than plain append's partial
+   loss: MERGE's commit unit (`replaceFiles`) replaces the *entire*
+   partition in one shot, so the race's last-writer-wins behavior wipes
+   out every other writer's row, not just some. Confirmed fixed with
+   the new lock overload engaged (`TableMergerConcurrentMinioLockedIntegrationTest`,
+   all 8 land). **Iceberg's `IcebergTableMerger` has the identical
+   issue** — a real 8-separate-process test (threads would be falsely
+   serialized by `HadoopTables`' static `LockManager`, same reasoning
+   as the existing writer test) found 4 of 8 inserts lost via its
+   `Table.newOverwrite()` commit; confirmed fixed with the lock engaged.
+
+3. **A real, shared race in both `DynamoDbLockProvider` (Delta) and
+   `DynamoDbLockManager` (Iceberg)'s own lock-table bootstrap**, found
+   via the Iceberg locked-merge test's first real run: 8 separate
+   processes, each initializing its own lock client for the first time
+   against a brand-new table name, all see `ResourceNotFoundException`
+   from `describeTable` and all race to call `createTable` — DynamoDB
+   throws `ResourceInUseException` for every loser, previously
+   uncaught, killing 6 of 8 workers outright (not a data-loss bug, a
+   startup crash). Masked until now because every prior test shared one
+   lock-provider instance across threads, so `ensureTableExists()` only
+   ever ran once. Fixed in both classes by catching `ResourceInUseException`
+   and falling through to the existing poll-until-`ACTIVE` loop
+   regardless of which process actually won the create race. Guarded
+   with a new, cheap unit-level regression test for Delta's version
+   (genuinely fresh `DynamoDbLockProvider` instances racing a brand-new
+   table name, not the shared-instance shape every other test here
+   uses) — Iceberg's `DynamoDbLockManager` has no equivalent cheap unit
+   guard (no clean way to inject a custom table name without adding
+   test-only surface to production code), but the fix is identical and
+   already proven by the real 8-process integration test.
+
+Also newly live-verified end-to-end against real MinIO (previously
+local-disk-only): `IcebergTableCreator` → `IcebergTableWriter.appendBatch`
+→ `IcebergTableMerger` → `IcebergCompactor` → `IcebergVacuum`, one
+continuous lifecycle, one test, each step's real effect checked against
+the live remote table (`IcebergWriteLifecycleRemoteMinioIntegrationTest`).
+
+Full regression after this round: 182 (core, +3) + 47 (format-iceberg,
++3) + 12 (cli) = 241 tests, 0 failures/errors, 33 skipped (env-gated,
+correctly skipping without live infra).
+
 **Update — Iceberg's path-based (`HadoopTables`) multi-writer OCC is
 confirmed broken on real MinIO, root-caused precisely, not just
 documented as a risk.** A real 8-separate-process stress test

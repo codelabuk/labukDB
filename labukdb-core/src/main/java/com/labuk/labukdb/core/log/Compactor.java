@@ -49,6 +49,25 @@ public final class Compactor {
 
     /** Local or remote (S3/MinIO/ADLS), via {@link TableLocation} — same semantics as the {@code Path} overload. */
     public long compact(TableLocation location, Map<String, String> partitionValues, BufferAllocator allocator) throws IOException {
+        return compact(location, null, partitionValues, allocator);
+    }
+
+    /**
+     * Same as {@link #compact(TableLocation, Map, BufferAllocator)}, but
+     * every commit is mediated through {@code lockProvider} — closes the
+     * same previously-missing gap {@link TableMerger}'s own matching
+     * overload does: this class's {@code replaceFiles} commit was always
+     * exposed to the confirmed-broken no-lock race on non-compliant object
+     * storage, with no way to opt into the fix {@code appendBatch} already
+     * has. {@code lockProvider == null} keeps the existing no-lock
+     * behavior exactly as before.
+     *
+     * @return the new table version, or -1 if fewer than 2 active files
+     *         matched {@code partitionValues} — nothing meaningful to
+     *         compact, not an error.
+     */
+    public long compact(TableLocation location, LockProvider lockProvider, Map<String, String> partitionValues,
+                         BufferAllocator allocator) throws IOException {
         SnapshotManager snapshotManager = SnapshotManager.forLocation(location);
         Snapshot snapshot = snapshotManager.latest();
 
@@ -73,7 +92,9 @@ public final class Compactor {
                 }
             }
 
-            CommitWriter commitWriter = CommitWriter.forLocation(location);
+            CommitWriter commitWriter = lockProvider == null
+                    ? CommitWriter.forLocation(location)
+                    : CommitWriter.forLocation(location, lockProvider);
             // Bin-packing doesn't change the table's logical data, only
             // which physical file holds it — dataChange=false, same as
             // real Delta's OPTIMIZE, so change-data-feed-style readers can
