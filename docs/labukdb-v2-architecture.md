@@ -1605,6 +1605,44 @@ in the new folder's own README rather than silently left unmentioned.
 
 ---
 
+## Update — SQL engine architecture: Phase 2 (early-termination for `LIMIT` without `ORDER BY`/`GROUP BY`)
+
+Phase 1 deliberately left one named inefficiency in place:
+`ResolvedScan.needsCombine()` treated a bare `Limit` node the same as a
+`Sort`/`Aggregate` node, forcing even `SELECT amount FROM logs WHERE
+level = 'ERROR' LIMIT 3` through `CombinedQueryExecutor` — decoding and
+concatenating *every* surviving file before truncating to 3, despite
+"any 3 matching rows" having no ordering requirement to justify that.
+The flag-based `--table`/`--limit` path already had the right idiom for
+this (`scanAndPrintPerFile`'s `remaining <= 0 { break; }`); Phase 2 just
+gives the `--sql` path's `LogicalPlanExecutor`-driven dispatch the same
+capability.
+
+**Not a new `OptimizerRule`** — nothing about the `LogicalPlan` tree
+shape needed rewriting; the information ("is there a `Sort`/`Aggregate`
+between this `Limit` and the `TableScan`?") was already present from
+Phase 1. This is a dispatch-strategy refinement: `ResolvedScan
+.needsCombine()` narrowed to mean only "`Sort` or `Aggregate` present,"
+plus a new `hasLimitOnly()` routing to a new `QueryCommand
+.scanAndPrintUpToLimit` — package-private deliberately, so a test can
+call it directly.
+
+**Verified with a real mechanism proof, not just output-counting**: a
+new test builds a two-file `FileScan` list where the second file's
+`TableLocation` points at a path that doesn't exist on disk at all, then
+asserts `scanAndPrintUpToLimit` with a limit satisfied entirely by file
+one completes without throwing — which only happens if the second file
+is genuinely never opened. Also manually verified (same discipline as
+Phase 1's own manual pass) against the real local Delta table and both
+real MinIO tables (Delta and Iceberg) — correct row counts, and the
+Iceberg case correctly picked up a different partition first than Delta
+did, the expected non-deterministic-but-valid behavior for `LIMIT`
+without `ORDER BY`. Full regression: 211 (core) + 50 (format-iceberg) +
+17 (cli) + 22 (flight, untouched) = 300 tests, 0 failures/errors, 40
+skipped — zero regressions.
+
+---
+
 ## Known test flakiness — `FlightIntegrationTest`
 
 **A known, pre-existing flaky test — root cause still open, not Arrow's.**

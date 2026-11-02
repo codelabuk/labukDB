@@ -160,6 +160,37 @@ class QueryCommandSqlIntegrationTest {
         assertTrue(output.contains("2 row(s)"), output);
     }
 
+    /**
+     * SQL engine Phase 2: a bare {@code LIMIT} with no {@code ORDER BY}/
+     * {@code GROUP BY} means "any N matching rows" — correctness-only
+     * proof here (exactly 3 rows, all real values); the actual early-
+     * termination mechanism itself is proven separately in
+     * {@code QueryCommandScanAndPrintUpToLimitTest}. Deliberately not
+     * asserting WHICH 3 survive — that depends on file-iteration order,
+     * which this feature makes no claim about (unlike {@code ORDER BY}).
+     */
+    @Test
+    void sqlLimitWithoutOrderBy_returnsExactlyNRealRows(@TempDir Path tableRoot) throws Exception {
+        buildTwoPartitionFixture(tableRoot); // ERROR: amounts 1..5. INFO: amounts 100..104.
+        TableCatalog.atDefaultLocation().register("logs", tableRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql", "SELECT amount FROM logs LIMIT 3"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("3 row(s)"), output);
+        List<Long> knownValues = List.of(1L, 2L, 3L, 4L, 5L, 100L, 101L, 102L, 103L, 104L);
+        List<String> dataLines = output.lines()
+                .dropWhile(line -> !line.startsWith("---"))
+                .skip(1)
+                .takeWhile(line -> !line.isBlank())
+                .toList();
+        assertEquals(3, dataLines.size(), output);
+        for (String line : dataLines) {
+            assertTrue(knownValues.contains(Long.parseLong(line.trim())),
+                    "printed value must be one of the real amounts: " + output);
+        }
+    }
+
     @Test
     void sqlOrderByLimit_withNoGroupBy_returnsGlobalTopN(@TempDir Path tableRoot) throws Exception {
         buildTwoPartitionFixture(tableRoot); // amounts 1..5 and 100..104 across two files

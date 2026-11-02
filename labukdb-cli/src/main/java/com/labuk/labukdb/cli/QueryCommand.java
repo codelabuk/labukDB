@@ -184,6 +184,11 @@ final class QueryCommand {
                     System.out.println();
                     System.out.println(result.getRowCount() + " row(s)");
                 }
+            } else if (resolved.hasLimitOnly()) {
+                // SQL engine Phase 2: no ORDER BY/GROUP BY, so "any N matching
+                // rows" can stop as soon as N are found -- never opens a later
+                // file once satisfied, unlike CombinedQueryExecutor.
+                scanAndPrintUpToLimit(resolved.files(), resolved.columns(), resolved.limit().limit(), allocator);
             } else {
                 scanAndPrintAllFiles(resolved.files(), resolved.columns(), allocator);
             }
@@ -220,6 +225,46 @@ final class QueryCommand {
                 }
                 printRows(root, root.getRowCount());
                 totalRows += root.getRowCount();
+            }
+        }
+
+        System.out.println();
+        System.out.println(totalRows + " row(s)");
+    }
+
+    /**
+     * SQL engine Phase 2: a bare {@code LIMIT} with no {@code ORDER BY}/
+     * {@code GROUP BY} means "any N matching rows" — stops as soon as
+     * {@code limit} rows are collected, the same {@code remaining <= 0}
+     * early-stop idiom {@link #scanAndPrintPerFile} (the flag-based
+     * {@code --table}/{@code --limit} path) already uses, ported to this
+     * path's {@code FileScan}-list signature. Package-private, not
+     * {@code private}, specifically so a test can call it directly with a
+     * hand-built {@code FileScan} list to prove a later file is genuinely
+     * never opened once satisfied — the same package-private-for-testing
+     * convention {@code CliArgs}/{@code TableResolver} already use.
+     */
+    static void scanAndPrintUpToLimit(List<FileScan> files, List<String> columns, long limit,
+                                       BufferAllocator allocator) throws Exception {
+        ParquetToArrowReader reader = new ParquetToArrowReader();
+        long remaining = limit;
+        long totalRows = 0;
+        boolean headerPrinted = false;
+
+        for (FileScan file : files) {
+            if (remaining <= 0) {
+                break; // the real proof point -- a later file's TableLocation is never even opened
+            }
+            try (VectorSchemaRoot root = reader.read(file.dataFile(), allocator, columns,
+                    file.residualPredicate(), file.partitionValues())) {
+                if (!headerPrinted) {
+                    printHeader(root);
+                    headerPrinted = true;
+                }
+                int toPrint = (int) Math.min(root.getRowCount(), remaining);
+                printRows(root, toPrint);
+                totalRows += toPrint;
+                remaining -= toPrint;
             }
         }
 

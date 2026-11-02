@@ -93,6 +93,30 @@ class LogicalPlanExecutorTest {
                 "needed columns = group-by column + aggregate input column, the same union QueryCommand computed inline before this rule existed");
     }
 
+    /**
+     * SQL engine Phase 2's whole premise: a bare {@code LIMIT} with no
+     * {@code ORDER BY}/{@code GROUP BY} must NOT require {@code
+     * CombinedQueryExecutor} -- {@code hasLimitOnly()} is the new signal
+     * {@code QueryCommand} uses to route it to the early-stop streaming
+     * path instead.
+     */
+    @Test
+    void resolve_limitWithoutOrderByOrGroupBy_hasLimitOnlyNotCombine(@TempDir Path tableRoot) throws Exception {
+        writeFixtureCommit(tableRoot);
+        SqlQuery query = SqlQueryTranslator.translate("SELECT amount FROM logs LIMIT 3");
+        LogicalPlan plan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(query));
+
+        ResolvedScan resolved = new LogicalPlanExecutor().resolve(plan, new DeltaTableFormat(tableRoot),
+                TableLocation.forLocal(tableRoot), null, null);
+
+        assertFalse(resolved.needsCombine(), "a bare LIMIT alone must not force CombinedQueryExecutor");
+        assertTrue(resolved.hasLimitOnly());
+        assertNotNull(resolved.limit());
+        assertEquals(3, resolved.limit().limit());
+        assertNull(resolved.aggregate());
+        assertNull(resolved.sort());
+    }
+
     @Test
     void resolve_atVersion_matchesRequestedVersion(@TempDir Path tableRoot) throws Exception {
         writeFixtureCommit(tableRoot);
