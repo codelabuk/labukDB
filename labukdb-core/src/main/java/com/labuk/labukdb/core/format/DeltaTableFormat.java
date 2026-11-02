@@ -4,7 +4,9 @@ import com.labuk.labukdb.core.log.Snapshot;
 import com.labuk.labukdb.core.log.SnapshotManager;
 import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.log.action.MetadataAction;
+import com.labuk.labukdb.core.storage.TableLocation;
 
+import java.io.IOException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
@@ -14,9 +16,14 @@ import java.util.stream.Collectors;
  * {@link TableFormat} for Delta — pure delegation to the existing
  * {@code log.SnapshotManager}, translating its Delta-shaped {@link Snapshot}
  * into the format-agnostic {@link NormalizedSnapshot}. No new resolution
- * logic lives here; see {@link TableFormat}'s javadoc for this class's
- * current scope (tested standalone, not yet wired into
- * {@code planner}/{@code flight}/{@code cli}).
+ * logic lives here.
+ *
+ * <b>Now wired into the query-serving path</b> (see {@code
+ * core.logical.LogicalPlanExecutor}/{@code QueryCommand.runSql}) — see
+ * {@link #DeltaTableFormat(TableLocation)}, added specifically because the
+ * original {@link #DeltaTableFormat(Path)} constructor is local-only and
+ * can't serve a remote (MinIO/S3) Delta table the way {@code
+ * SnapshotManager.forLocation} already could.
  */
 public final class DeltaTableFormat implements TableFormat {
 
@@ -24,6 +31,11 @@ public final class DeltaTableFormat implements TableFormat {
 
     public DeltaTableFormat(Path tableRoot) {
         this.snapshotManager = new SnapshotManager(tableRoot);
+    }
+
+    /** Local or remote (S3/MinIO/ADLS) — the same dispatch every other {@code TableLocation}-aware reader/writer in this project uses. */
+    public DeltaTableFormat(TableLocation tableRoot) throws IOException {
+        this.snapshotManager = SnapshotManager.forLocation(tableRoot);
     }
 
     @Override

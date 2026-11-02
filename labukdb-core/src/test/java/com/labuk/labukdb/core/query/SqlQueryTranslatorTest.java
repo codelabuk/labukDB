@@ -57,6 +57,24 @@ class SqlQueryTranslatorTest {
         assertTrue(query.columns().isEmpty(), "no separate projection list once aggregating");
     }
 
+    /**
+     * {@code MIN}/{@code MAX} are fully implemented ({@code
+     * AggregateFunction}/{@code AggregateOperator}) but had zero coverage
+     * through actual SQL text until this session's SQL engine Phase 1
+     * research found the gap — closing it here.
+     */
+    @Test
+    void groupBy_withMinAndMax() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT level, MIN(amount) AS min_amt, MAX(amount) AS max_amt FROM logs GROUP BY level");
+
+        assertEquals(List.of("level"), query.groupByColumns());
+        assertEquals(List.of(
+                new AggregateSpec("amount", AggregateFunction.MIN, "min_amt"),
+                new AggregateSpec("amount", AggregateFunction.MAX, "max_amt")
+        ), query.aggregates());
+    }
+
     @Test
     void orderByLimit_withNoGroupBy() {
         SqlQuery query = SqlQueryTranslator.translate(

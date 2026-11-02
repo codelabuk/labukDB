@@ -139,6 +139,27 @@ class QueryCommandSqlIntegrationTest {
         assertTrue(output.contains("2 row(s)"), output);
     }
 
+    /**
+     * {@code MIN}/{@code MAX} are fully implemented and already tested via
+     * {@code AggregateOperatorTest}/Flight's JSON-request path, but had
+     * zero coverage through actual SQL text until this session's SQL
+     * engine Phase 1 work found the gap — closing it here.
+     */
+    @Test
+    void sqlGroupByMinMax_combinesAcrossMultipleFiles(@TempDir Path tableRoot) throws Exception {
+        buildTwoPartitionFixture(tableRoot); // ERROR: amounts 1..5. INFO: amounts 100..104.
+        TableCatalog.atDefaultLocation().register("logs", tableRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT level, MIN(amount) AS min_amt, MAX(amount) AS max_amt FROM logs GROUP BY level"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("level | min_amt | max_amt"), output);
+        assertTrue(output.contains("ERROR | 1 | 5"), "ERROR partition's true min/max across all 5 rows: " + output);
+        assertTrue(output.contains("INFO | 100 | 104"), "INFO partition's true min/max across all 5 rows: " + output);
+        assertTrue(output.contains("2 row(s)"), output);
+    }
+
     @Test
     void sqlOrderByLimit_withNoGroupBy_returnsGlobalTopN(@TempDir Path tableRoot) throws Exception {
         buildTwoPartitionFixture(tableRoot); // amounts 1..5 and 100..104 across two files

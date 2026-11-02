@@ -1429,6 +1429,113 @@ unaffected) — zero regressions.
 
 ---
 
+## Update — SQL engine architecture: Phase 1 (LogicalPlan IR + optimizer shell)
+
+**The biggest standing architectural debt in the project — joins/subqueries
+are impossible with the flat `SqlQuery`+hardcoded-branching design — now
+has a real foundation under it.** Confirmed by direct tracing before any
+code was written (not assumed): `SqlQuery` is a flat record with a single
+`String table` field, and `SqlQueryTranslator` **explicitly detects and
+rejects** JOINs/subqueries in its own parsing code — not a grammar
+limitation. The parser underneath (JSqlParser) already parses JOIN/
+subquery syntax correctly; the translator throws that structure away.
+`QueryCommand`/`LabukDbFlightProducer` drove execution via hardcoded
+`if (combineMode) {...} else {...}` branching, duplicated three ways
+(Delta streaming, Delta combined, Iceberg — which *always* combined
+regardless of need, a real pre-existing inefficiency).
+
+No prior session had scoped this as a phased plan — `V2_ARCHITECTURE.md`
+explicitly listed joins/optimizer as "out of scope until a concrete
+requirement needs them." The full arc, Phase 1 against it:
+- **Phase 1 (this update)**: a real `LogicalPlan` IR + rule-based
+  optimizer shell, the existing single-table SQL subset wired through it
+  with zero behavior change.
+- **Phase 2**: more optimizer rules.
+- **Phase 3**: joins — needs `Predicate` extended with cross-column
+  comparisons (`t1.a = t2.b`, currently impossible — every leaf is
+  `column OP literal`), a new `Join` physical operator, and
+  `SqlQueryTranslator` actually walking `plainSelect.getJoins()`.
+- **Phase 4**: subqueries (scalar, `IN (SELECT ...)`, `EXISTS`).
+
+**New `labukdb-core/.../core/logical/` package**: a sealed `LogicalPlan`
+interface (`TableScan`/`Filter`/`Aggregate`/`Sort`/`Limit`/`Project`),
+reusing the existing `Predicate`/`AggregateSpec`/`SortKey` shapes
+directly rather than reinventing them. `LogicalPlanBuilder` wraps an
+already-translated `SqlQuery` into the tree (deliberately doesn't touch
+`SqlQueryTranslator` itself — its JSqlParser-AST walking, including the
+documented IN/OR grammar-quirk detection, was already correct and
+tested; Phase 1's risk stayed isolated to new code). Two real optimizer
+rules, not an empty scaffold: `PushFilterIntoScan` merges a `Filter`
+directly onto its `TableScan` (the IR-level expression of what
+`QueryPlanner`'s pruning already does physically); `PushProjectIntoScan`
+computes the full needed-column union across the whole tree and
+eliminates the top-level `Project` entirely once it's absorbed — always
+true for a single-table query, since there is no remaining physical
+work once the reader only decodes the needed columns. Both written as
+plain `instanceof` recursive tree-rewrites, not `switch` pattern
+matching over the sealed type — this project targets Java 17 release
+with no preview features enabled, and pattern matching for `switch`
+wasn't finalized until Java 21.
+
+**`LogicalPlanExecutor.resolve`** is the one format-agnostic resolution
+path replacing the 3-way duplicated branching — but it deliberately
+does **not** open the table itself: format detection (Delta vs. Iceberg
+vs. REST-catalog Iceberg) needs cross-module visibility into
+`labukdb-format-iceberg` that `labukdb-core` doesn't have (and
+shouldn't — the dependency runs the other way). `QueryCommand` (which
+already depends on both modules) resolves the table name into an
+already-open `TableFormat` plus the `TableLocation` its data files
+resolve against, exactly as it already did, and hands both in;
+`LogicalPlanExecutor`'s job starts at snapshot resolution and ends at
+"files to scan" — the genuinely format-agnostic part.
+
+**Real gap found and fixed as part of this unification, not a pure
+refactor**: `DeltaTableFormat` existed and was unit-tested standalone,
+but had only a local-only `Path`-based constructor — `QueryCommand`'s
+actual Delta query path bypassed it entirely in favor of talking to
+`SnapshotManager`/`Snapshot`/`AddFile` directly (confirmed by grep: zero
+references to `DeltaTableFormat` in the file). Migrating the query path
+onto it would have silently broken remote (MinIO) Delta SQL queries
+without a new `DeltaTableFormat(TableLocation)` constructor — added,
+delegating to the already-remote-capable `SnapshotManager.forLocation`,
+the same fix shape this project has used for this exact class of gap
+before (see the DynamoDB lock-table bootstrap race fix earlier this
+document).
+
+**Deliberate, named behavioral improvement, not a silent regression**:
+Iceberg's CLI SQL path previously *always* went through
+`CombinedQueryExecutor` regardless of whether the query aggregated/
+sorted/limited (`IcebergTableFormat`'s own javadoc had already flagged
+this as non-ideal); the unified path now streams per-file for a plain
+`SELECT col FROM table` on *either* format, matching Delta's existing
+smarter behavior — lower memory for the common case, identical output.
+
+**Also closed, found during this session's research rather than
+invented**: `MIN`/`MAX` were fully implemented and tested via
+`AggregateOperatorTest`/Flight's JSON-request path, but had zero test
+coverage through actual SQL text — added to `SqlQueryTranslatorTest`
+and `QueryCommandSqlIntegrationTest`.
+
+Verified with `LogicalPlanBuilderTest`, `PushFilterIntoScanTest`,
+`PushProjectIntoScanTest` (rule tests, including idempotence and
+absorption through a full `Aggregate`/`Sort`/`Limit` stack), and
+`LogicalPlanExecutorTest` (against a real local Delta fixture — the
+identical path for Iceberg is already proven end-to-end by
+`QueryCommandIcebergIntegrationTest`/`QueryCommandIcebergMinioIntegrationTest`,
+which depend on both modules; `labukdb-core`'s own test tree can't).
+Every existing SQL-text test (`SqlQueryTranslatorTest`,
+`QueryCommandSqlIntegrationTest`, `QueryCommandSqlMinioIntegrationTest`,
+`QueryCommandIcebergIntegrationTest` including its REST-routing test,
+`QueryCommandIcebergMinioIntegrationTest`) passed byte-identical — the
+real end-to-end proof the rewire changed nothing observable. Flight's
+own suite (completely untouched code — Phase 1 is CLI `--sql`-only)
+stayed green throughout. Full regression: 210 (core) + 50
+(format-iceberg) + 14 (cli) + 22 (flight, untouched) = 296 tests, 0
+failures/errors, 40 skipped — up from 255/37 in the three touched
+modules before this pass (+19 new: 18 core, 1 cli), zero regressions.
+
+---
+
 ## Known test flakiness — `FlightIntegrationTest`
 
 **A known, pre-existing flaky test — root cause still open, not Arrow's.**

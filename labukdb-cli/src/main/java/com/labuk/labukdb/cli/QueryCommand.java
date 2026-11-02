@@ -7,11 +7,18 @@ import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.format.DataFileRef;
+import com.labuk.labukdb.core.format.DeltaTableFormat;
 import com.labuk.labukdb.core.format.DetectedFormat;
 import com.labuk.labukdb.core.format.NormalizedSnapshot;
+import com.labuk.labukdb.core.format.TableFormat;
 import com.labuk.labukdb.core.log.Snapshot;
 import com.labuk.labukdb.core.log.SnapshotManager;
 import com.labuk.labukdb.core.log.action.AddFile;
+import com.labuk.labukdb.core.logical.LogicalPlan;
+import com.labuk.labukdb.core.logical.LogicalPlanBuilder;
+import com.labuk.labukdb.core.logical.LogicalPlanExecutor;
+import com.labuk.labukdb.core.logical.ResolvedScan;
+import com.labuk.labukdb.core.logical.RuleBasedOptimizer;
 import com.labuk.labukdb.core.planner.NormalizedScanPlan;
 import com.labuk.labukdb.core.planner.PartitionValueSubstituter;
 import com.labuk.labukdb.core.planner.Predicate;
@@ -99,89 +106,125 @@ final class QueryCommand {
     /**
      * {@code --sql}: {@link SqlQueryTranslator} gives the exact {@link Predicate}/
      * {@link AggregateSpec}/{@link SortKey} structures the engine already
-     * executes correctly. A plain {@code SELECT}+{@code WHERE} (no {@code GROUP BY}/
-     * aggregates/{@code ORDER BY}/{@code LIMIT}) reuses the existing per-file
-     * streaming scan; anything needing cross-file combination goes through
-     * {@link CombinedQueryExecutor} — same {@code combineMode} trigger
-     * {@code LabukDbFlightProducer} uses, for the same reason (those can't be
-     * answered correctly file-by-file). Unlike {@code --limit} (which defaults
-     * to capping output at 50 rows), a bare SQL {@code SELECT} with no
-     * {@code LIMIT} clause prints every matching row — that is what "no LIMIT"
-     * means in SQL, and silently capping it would misrepresent the result.
+     * executes correctly. {@link LogicalPlanBuilder}/{@link RuleBasedOptimizer}/
+     * {@link LogicalPlanExecutor} (new — see {@code core.logical}'s own
+     * javadoc for the full SQL-engine-architecture Phase 1 writeup) resolve
+     * the query against whichever table format is actually at the table
+     * name — one path for Delta, Iceberg, and REST-catalog Iceberg alike,
+     * replacing what used to be three separately-duplicated branches here.
+     * A plain {@code SELECT}+{@code WHERE} (no {@code GROUP BY}/aggregates/
+     * {@code ORDER BY}/{@code LIMIT}) reuses the existing per-file streaming
+     * scan, for *either* format now (previously only Delta did this —
+     * Iceberg always fully materialized via {@link CombinedQueryExecutor}
+     * regardless of need); anything needing cross-file combination goes
+     * through {@link CombinedQueryExecutor} — same {@code combineMode}
+     * trigger {@code LabukDbFlightProducer} uses, for the same reason
+     * (those can't be answered correctly file-by-file). Unlike
+     * {@code --limit} (which defaults to capping output at 50 rows), a bare
+     * SQL {@code SELECT} with no {@code LIMIT} clause prints every matching
+     * row — that is what "no LIMIT" means in SQL, and silently capping it
+     * would misrepresent the result.
      */
     private static void runSql(CliArgs parsed) throws Exception {
         SqlQuery query = SqlQueryTranslator.translate(parsed.sql);
-        boolean combineMode = !query.groupByColumns().isEmpty() || !query.aggregates().isEmpty()
-                || !query.orderBy().isEmpty() || query.limit() >= 0;
+        LogicalPlan plan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(query));
 
         TableCatalog catalog = TableCatalog.atDefaultLocation();
         String raw = catalog.resolve(query.table()).orElse(query.table());
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            TableFormat format;
+            TableLocation dataFileRoot;
+            String displayName;
+            String versionLabel;
+
             if (IcebergRestLocation.isRestUri(raw)) {
-                runIceberg(openIcebergRest(raw), raw, query.predicate(), query.columns(), query.groupByColumns(),
-                        query.aggregates(), query.orderBy(), query.limit(), Integer.MAX_VALUE, 0,
-                        parsed.version, parsed.asOf, allocator);
-                return;
-            }
-
-            TableLocation tableRoot = TableResolver.resolve(query.table(), catalog);
-            if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                runIceberg(new IcebergTableFormat(tableRoot), tableRoot.toString(), query.predicate(),
-                        query.columns(), query.groupByColumns(), query.aggregates(), query.orderBy(), query.limit(),
-                        Integer.MAX_VALUE, 0, parsed.version, parsed.asOf, allocator);
-                return;
-            }
-
-            SnapshotManager snapshotManager = SnapshotManager.forLocation(tableRoot);
-            Snapshot snapshot = resolveSnapshot(snapshotManager, parsed.version, parsed.asOf);
-
-            if (!combineMode) {
-                ScanPlan plan = new QueryPlanner().plan(snapshot, query.predicate(), query.columns());
-                printTableAndFileSummary(tableRoot, snapshot, plan);
-                scanAndPrintPerFile(tableRoot, plan, allocator, Integer.MAX_VALUE, 0);
-                return;
-            }
-
-            boolean aggregating = !query.groupByColumns().isEmpty() || !query.aggregates().isEmpty();
-            Set<String> neededColumns = new LinkedHashSet<>();
-            if (aggregating) {
-                neededColumns.addAll(query.groupByColumns());
-                for (AggregateSpec spec : query.aggregates()) {
-                    neededColumns.add(spec.column());
-                }
+                IcebergTableFormat icebergFormat = openIcebergRest(raw);
+                format = icebergFormat;
+                dataFileRoot = TableLocation.fromStringWithEnvironmentConfig(icebergFormat.location());
+                displayName = raw;
+                versionLabel = "Iceberg snapshot";
             } else {
-                neededColumns.addAll(query.columns());
-                for (SortKey key : query.orderBy()) {
-                    neededColumns.add(key.column());
+                TableLocation tableRoot = TableResolver.resolve(query.table(), catalog);
+                if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+                    IcebergTableFormat icebergFormat = new IcebergTableFormat(tableRoot);
+                    format = icebergFormat;
+                    dataFileRoot = TableLocation.fromStringWithEnvironmentConfig(icebergFormat.location());
+                    displayName = tableRoot.toString();
+                    versionLabel = "Iceberg snapshot";
+                } else {
+                    format = new DeltaTableFormat(tableRoot);
+                    dataFileRoot = tableRoot;
+                    displayName = tableRoot.toString();
+                    versionLabel = "version";
                 }
             }
-            List<String> projectedColumns = List.copyOf(neededColumns);
 
-            ScanPlan plan = new QueryPlanner().plan(snapshot, query.predicate(), projectedColumns);
-            printTableAndFileSummary(tableRoot, snapshot, plan);
+            ResolvedScan resolved = new LogicalPlanExecutor().resolve(plan, format, dataFileRoot,
+                    parsed.version, parsed.asOf);
+            printResolvedSummary(displayName, versionLabel, resolved);
 
-            if (plan.getFilesToScan().isEmpty()) {
+            if (resolved.files().isEmpty()) {
                 System.out.println("0 row(s)");
                 return;
             }
 
-            List<FileScan> files = new ArrayList<>();
-            for (AddFile file : plan.getFilesToScan()) {
-                TableLocation dataFile = tableRoot.resolve(file.getPath());
-                Predicate perFileResidual =
-                        PartitionValueSubstituter.simplify(plan.getResidualPredicate(), file.getPartitionValues());
-                files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
-            }
+            if (resolved.needsCombine()) {
+                List<String> groupByColumns = resolved.aggregate() != null
+                        ? resolved.aggregate().groupByColumns() : List.of();
+                List<AggregateSpec> aggregates = resolved.aggregate() != null
+                        ? resolved.aggregate().aggregates() : List.of();
+                List<SortKey> sortKeys = resolved.sort() != null ? resolved.sort().sortKeys() : List.of();
+                long limitValue = resolved.limit() != null ? resolved.limit().limit() : -1;
 
-            try (VectorSchemaRoot result = new CombinedQueryExecutor().execute(files, projectedColumns,
-                    query.groupByColumns(), query.aggregates(), query.orderBy(), query.limit(), allocator)) {
-                printHeader(result);
-                printRows(result, result.getRowCount());
-                System.out.println();
-                System.out.println(result.getRowCount() + " row(s)");
+                try (VectorSchemaRoot result = new CombinedQueryExecutor().execute(resolved.files(),
+                        resolved.columns(), groupByColumns, aggregates, sortKeys, limitValue, allocator)) {
+                    printHeader(result);
+                    printRows(result, result.getRowCount());
+                    System.out.println();
+                    System.out.println(result.getRowCount() + " row(s)");
+                }
+            } else {
+                scanAndPrintAllFiles(resolved.files(), resolved.columns(), allocator);
             }
         }
+    }
+
+    private static void printResolvedSummary(String displayName, String versionLabel, ResolvedScan resolved) {
+        System.out.println("Table: " + displayName + " (" + versionLabel + " " + resolved.snapshotVersion() + ")");
+        System.out.println("Files: " + resolved.files().size() + " / " + resolved.totalFilesInSnapshot()
+                + " (skipped " + resolved.filesSkipped() + " via partition/file-stats pruning)");
+        System.out.println();
+    }
+
+    /**
+     * The {@code --sql} path's unified per-file streaming print, for either
+     * table format — a bare {@code SELECT} with no {@code LIMIT} always
+     * prints every row (see {@link #runSql}'s own javadoc), so unlike
+     * {@link #scanAndPrintPerFile} (the flag-based {@code --table} path's
+     * own version, untouched, which caps output at {@code --limit}), this
+     * has no row cap at all.
+     */
+    private static void scanAndPrintAllFiles(List<FileScan> files, List<String> columns,
+                                               BufferAllocator allocator) throws Exception {
+        ParquetToArrowReader reader = new ParquetToArrowReader();
+        int totalRows = 0;
+        boolean headerPrinted = false;
+
+        for (FileScan file : files) {
+            try (VectorSchemaRoot root = reader.read(file.dataFile(), allocator, columns,
+                    file.residualPredicate(), file.partitionValues())) {
+                if (!headerPrinted) {
+                    printHeader(root);
+                    headerPrinted = true;
+                }
+                printRows(root, root.getRowCount());
+                totalRows += root.getRowCount();
+            }
+        }
+
+        System.out.println();
+        System.out.println(totalRows + " row(s)");
     }
 
     /**
