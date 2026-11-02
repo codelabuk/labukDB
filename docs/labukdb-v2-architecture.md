@@ -1643,6 +1643,87 @@ skipped — zero regressions.
 
 ---
 
+## Update — SQL engine architecture: Phase 3, increment 1 (two-table `INNER` equi-join)
+
+The last piece of the SQL engine's core architectural debt: `SqlQueryTranslator`
+explicitly detected and rejected any `JOIN` — confirmed via `javap` on the
+real `jsqlparser-5.3.jar` before writing any code (not assumed): the
+grammar already parses `JOIN` fully (`PlainSelect.getJoins() ->
+List<Join>`, each exposing `isInner()`, `getRightItem()`, `getOnExpression()`).
+The grammar was never the blocker; the translator's own rejection was.
+
+**Deliberately scoped as a first increment, not full join support** —
+two tables only, `INNER`/equi-join only, no `GROUP BY`/aggregates/
+`ORDER BY`/`LIMIT` combined with a join yet, every column reference must
+be table-qualified, and `WHERE` must be per-side-splittable (a condition
+spanning both tables belongs in `JOIN ... ON`, rejected otherwise with a
+clear error — correctly evaluating a cross-table `WHERE` condition after
+the join would need a "`Predicate` against an already-decoded Arrow row"
+evaluator that doesn't exist yet, a separate piece of work).
+
+**Key design choice**: a SQL-level table alias (`a`/`b`) never reaches
+the physical reader at all — it's stripped to the bare physical column
+name before being pushed into that side's own `TableScan`, exactly like
+every column already works today, and only resurfaces once, when
+`HashJoinOperator` names its *combined output* columns
+(`"a.service"`/`"b.service"`) to keep two same-named columns from
+colliding. `TableScan`/`QueryPlanner`/`decode/` never needed to change
+at all.
+
+New `core.logical.Join`/`JoinKey` IR nodes (added to `LogicalPlan`'s
+`permits` clause), `SqlQuery.JoinClause`/`JoinKeyPair` (additive,
+nullable — every existing non-join query's shape is unchanged), and a
+new `HashJoinOperator` (classic build/probe, `right` always the build
+side this increment — no cost-based side selection yet). `LogicalPlanExecutor`
+gained `resolveJoin`, resolving each side completely independently via
+the exact same per-side logic the single-table path already used
+(extracted into a shared `resolveSide` helper) — which means a Delta
+table joining an Iceberg table works as a **free consequence of the
+design**, not a specifically-built feature, proven by a real test
+(`QueryCommandSqlJoinIntegrationTest.innerJoin_deltaToIceberg_...`), not
+just asserted in prose.
+
+**Real bug found and fixed during this work, not assumed away**:
+the WHERE-splitting logic's column-table collector only ever inspected
+the *left* side of a comparison (matching the rest of this file's
+existing `column OP literal` assumption) — so `a.x = b.y` (a genuine
+cross-table condition) silently collected only `{a}`, missed `b`, and
+got routed to one side's predicate instead of being rejected, where it
+then failed with a confusing, unrelated "unsupported literal: b.y"
+error deep inside `toPredicate` instead of the intended clear "belongs
+in `JOIN ... ON`" message. Caught by the test written specifically to
+prove that rejection path, not discovered later. Fixed by having the
+collector also inspect the right side whenever it's itself a `Column`.
+
+`PushProjectIntoScan` needed one real exception to its existing
+behavior: for a single-table query, the top-level `Project` is always
+eliminated once the scan is narrowed (no remaining physical work). For
+a join, column pruning is deliberately *not* pushed across the join
+boundary this increment (each side decodes every column — a stated
+simplification), so the post-join combined output has more columns than
+the final `SELECT` wants — the outer `Project` is the only place that
+final selection survives, and is now kept (not eliminated) whenever the
+rewritten input is a `Join`.
+
+Verified with 17 new tests across every layer (translator parsing +
+every rejection case, `LogicalPlanBuilder`/`PushFilterIntoScan` tree
+shape, `HashJoinOperator` correctness — matching rows, dropped
+non-matches, true fan-out on a duplicate build-side key, null-key
+non-matching, multi-key joins — and two CLI integration tests, one of
+them the Delta↔Iceberg proof above). Manually verified by hand against
+real local Delta tables: a plain join (orphan row correctly dropped),
+a `WHERE`-split query (predicate correctly pushed to one side), and a
+real `LEFT JOIN` rejection with the expected clear error — all through
+the actual `bin/labukdb` script, not just the test suite. Full
+regression: 226 (core) + 50 (format-iceberg) + 19 (cli) + 22 (flight,
+untouched) = 317 tests, 0 failures/errors, 40 skipped — zero
+regressions (one `FlightIntegrationTest`-family flake observed and
+confirmed via rerun to be the same pre-existing, already-documented
+issue below, not caused by this work — Flight's own code is completely
+untouched by any SQL engine phase so far).
+
+---
+
 ## Known test flakiness — `FlightIntegrationTest`
 
 **A known, pre-existing flaky test — root cause still open, not Arrow's.**

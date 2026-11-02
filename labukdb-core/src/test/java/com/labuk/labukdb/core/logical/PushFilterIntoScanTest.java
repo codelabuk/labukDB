@@ -47,6 +47,40 @@ class PushFilterIntoScanTest {
         assertSame(condition, scan.predicate());
     }
 
+    /** SQL engine Phase 3, increment 1: each side's own Filter absorbs into its own TableScan independently. */
+    @Test
+    void joinWithPerSideFilters_absorbsEachIndependently() {
+        Predicate leftCondition = Predicate.compare("amount", ComparisonOp.GT, 10L);
+        Predicate rightCondition = Predicate.compare("active", ComparisonOp.EQ, "Y");
+        LogicalPlan plan = new Join(
+                new Filter(new TableScan("orders", null, null), leftCondition),
+                new Filter(new TableScan("customers", null, null), rightCondition),
+                List.of(new JoinKey("customer_id", "id")));
+
+        LogicalPlan result = new PushFilterIntoScan().apply(plan);
+
+        Join join = assertInstanceOf(Join.class, result);
+        TableScan leftScan = assertInstanceOf(TableScan.class, join.left(), "left Filter must be absorbed");
+        assertSame(leftCondition, leftScan.predicate());
+        TableScan rightScan = assertInstanceOf(TableScan.class, join.right(), "right Filter must be absorbed");
+        assertSame(rightCondition, rightScan.predicate());
+    }
+
+    @Test
+    void joinWithOnlyOneSideFiltered_otherSideStaysBare() {
+        Predicate leftCondition = Predicate.compare("amount", ComparisonOp.GT, 10L);
+        LogicalPlan plan = new Join(
+                new Filter(new TableScan("orders", null, null), leftCondition),
+                new TableScan("customers", null, null),
+                List.of(new JoinKey("customer_id", "id")));
+
+        LogicalPlan result = new PushFilterIntoScan().apply(plan);
+
+        Join join = assertInstanceOf(Join.class, result);
+        assertSame(leftCondition, ((TableScan) join.left()).predicate());
+        assertNull(((TableScan) join.right()).predicate());
+    }
+
     @Test
     void idempotent_onAlreadyOptimizedPlan() {
         Predicate condition = Predicate.compare("level", ComparisonOp.EQ, "ERROR");

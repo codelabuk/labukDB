@@ -156,9 +156,73 @@ class SqlQueryTranslatorTest {
     }
 
     @Test
-    void join_rejectedWithClearError() {
+    void innerEquiJoin_parsesIntoJoinClause() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.service, b.region FROM orders a JOIN customers b ON a.customer_id = b.id");
+
+        assertEquals("orders", query.table());
+        assertEquals(List.of("a.service", "b.region"), query.columns());
+        assertNotNull(query.join());
+        SqlQuery.JoinClause join = query.join();
+        assertEquals("a", join.leftAlias());
+        assertEquals("customers", join.rightTable());
+        assertEquals("b", join.rightAlias());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("customer_id", "id")), join.keys());
+        assertNull(join.leftPredicate());
+        assertNull(join.rightPredicate());
+    }
+
+    @Test
+    void innerEquiJoin_withMultiKeyAndPerSideWhere_splitsCorrectly() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.service FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id AND a.region = b.region "
+                        + "WHERE a.amount > 10 AND b.active = 'Y'");
+
+        SqlQuery.JoinClause join = query.join();
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("customer_id", "id"),
+                new SqlQuery.JoinKeyPair("region", "region")), join.keys());
+        assertNotNull(join.leftPredicate(), "a.amount > 10 must route to the left side");
+        assertNotNull(join.rightPredicate(), "b.active = 'Y' must route to the right side");
+    }
+
+    @Test
+    void leftJoin_rejectedWithClearError() {
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
-                () -> SqlQueryTranslator.translate("SELECT a.x FROM a JOIN b ON a.id = b.id"));
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a LEFT JOIN b ON a.id = b.id"));
+        assertTrue(thrown.getMessage().contains("INNER"), thrown.getMessage());
+    }
+
+    @Test
+    void nonEquiJoinCondition_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a JOIN b ON a.id > b.id"));
+        assertTrue(thrown.getMessage().contains("equality"), thrown.getMessage());
+    }
+
+    @Test
+    void unqualifiedSelectColumnWithJoin_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT x FROM a JOIN b ON a.id = b.id"));
+        assertTrue(thrown.getMessage().contains("qualified"), thrown.getMessage());
+    }
+
+    @Test
+    void crossTableWhereCondition_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a JOIN b ON a.id = b.id WHERE a.x = b.y"));
+        assertTrue(thrown.getMessage().contains("ON"), thrown.getMessage());
+    }
+
+    @Test
+    void groupByCombinedWithJoin_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.level, COUNT(a.x) AS cnt FROM a JOIN b ON a.id = b.id GROUP BY a.level"));
         assertTrue(thrown.getMessage().contains("JOIN"), thrown.getMessage());
     }
 

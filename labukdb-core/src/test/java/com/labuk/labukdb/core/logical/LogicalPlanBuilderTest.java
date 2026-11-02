@@ -62,6 +62,42 @@ class LogicalPlanBuilderTest {
         assertInstanceOf(TableScan.class, sort.input());
     }
 
+    /** SQL engine Phase 3, increment 1: {@code Project(Join(Filter(TableScan), Filter(TableScan)))}. */
+    @Test
+    void innerJoinWithPerSideWhere_buildsJoinWithFilterOnEachScan() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.service, b.region FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id WHERE a.amount > 10 AND b.active = 'Y'");
+        LogicalPlan plan = LogicalPlanBuilder.build(query);
+
+        Project project = assertInstanceOf(Project.class, plan);
+        assertEquals(List.of("a.service", "b.region"), project.columns());
+        Join join = assertInstanceOf(Join.class, project.input());
+        assertEquals(List.of(new JoinKey("customer_id", "id")), join.keys());
+
+        Filter leftFilter = assertInstanceOf(Filter.class, join.left());
+        assertNotNull(leftFilter.condition());
+        TableScan leftScan = assertInstanceOf(TableScan.class, leftFilter.input());
+        assertEquals("orders", leftScan.tableName());
+
+        Filter rightFilter = assertInstanceOf(Filter.class, join.right());
+        assertNotNull(rightFilter.condition());
+        TableScan rightScan = assertInstanceOf(TableScan.class, rightFilter.input());
+        assertEquals("customers", rightScan.tableName());
+    }
+
+    @Test
+    void innerJoinWithNoWhere_bothSidesAreBareScans() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.service, b.region FROM orders a JOIN customers b ON a.customer_id = b.id");
+        LogicalPlan plan = LogicalPlanBuilder.build(query);
+
+        Project project = assertInstanceOf(Project.class, plan);
+        Join join = assertInstanceOf(Join.class, project.input());
+        assertInstanceOf(TableScan.class, join.left());
+        assertInstanceOf(TableScan.class, join.right());
+    }
+
     @Test
     void everyClauseCombined_nestsInTheExpectedOrder() {
         SqlQuery query = SqlQueryTranslator.translate(

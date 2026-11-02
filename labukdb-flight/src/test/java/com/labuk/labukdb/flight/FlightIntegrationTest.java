@@ -40,6 +40,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -70,6 +73,17 @@ class FlightIntegrationTest {
     private FlightServer server;
     private FlightClient client;
     private TableCatalog catalog;
+    // Explicitly supplied (rather than left to FlightServer's own default
+    // cached thread pool) so tearDown can shut it down and await its full
+    // drain itself: FlightServer.close()/awaitTermination() only waits on
+    // the underlying io.grpc.Server, never on this executor directly (confirmed
+    // by disassembling arrow-flight-core 16.1.0's FlightServer/Builder --
+    // server.close() calls grpcExecutor.shutdown() but only awaitTermination()s
+    // the grpc Server). That gap let a producer callback still be running
+    // against this test's allocator after tearDown considered the server
+    // "closed", which is the leading suspect for this suite's intermittent
+    // "Memory was leaked by query" flake on allocator.close().
+    private ExecutorService grpcExecutor;
 
     @TempDir
     Path catalogDir;
@@ -90,8 +104,11 @@ class FlightIntegrationTest {
         LabukDbFlightProducer producer = new LabukDbFlightProducer(
                 allocator, catalog, new org.apache.hadoop.conf.Configuration(), walRoot);
 
+        grpcExecutor = Executors.newCachedThreadPool();
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
-        server = FlightServer.builder(allocator, serverLocation, producer).build();
+        server = FlightServer.builder(allocator, serverLocation, producer)
+                .executor(grpcExecutor)
+                .build();
         server.start();
 
         Location clientLocation = Location.forGrpcInsecure("localhost", server.getPort());
@@ -102,6 +119,10 @@ class FlightIntegrationTest {
     void tearDown() throws Exception {
         client.close();
         server.close();
+        grpcExecutor.shutdown();
+        if (!grpcExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+            grpcExecutor.shutdownNow();
+        }
         allocator.close();
     }
 

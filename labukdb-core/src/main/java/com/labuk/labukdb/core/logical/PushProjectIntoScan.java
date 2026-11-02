@@ -26,6 +26,18 @@ import java.util.Set;
  * {@code ParquetToArrowReader} already unions predicate columns in at
  * decode time (see {@code PredicateColumns.collect}), exactly as before
  * this rule existed.
+ *
+ * <b>Join exception (SQL engine Phase 3, increment 1):</b> the "no
+ * remaining physical work" justification above only holds because a
+ * single-table scan's {@code requestedColumns} ends up being exactly
+ * the {@code SELECT} list. For a {@link Join}, column pruning is
+ * deliberately NOT pushed across the join boundary in this increment
+ * (each side's {@code TableScan} keeps {@code requestedColumns == null}
+ * — "decode everything," a stated simplification, not an oversight) —
+ * so the combined post-join output has more columns than the final
+ * {@code SELECT} wants, and the outer {@link Project} is the only place
+ * that final selection survives. It is therefore kept, not eliminated,
+ * whenever the rewritten input is a {@link Join}.
  */
 public final class PushProjectIntoScan implements OptimizerRule {
 
@@ -52,7 +64,11 @@ public final class PushProjectIntoScan implements OptimizerRule {
             }
         }
 
-        return pushInto(project.input(), List.copyOf(needed));
+        LogicalPlan rewrittenInput = pushInto(project.input(), List.copyOf(needed));
+        if (rewrittenInput instanceof Join) {
+            return new Project(rewrittenInput, project.columns());
+        }
+        return rewrittenInput;
     }
 
     private LogicalPlan pushInto(LogicalPlan plan, List<String> columns) {
@@ -71,6 +87,8 @@ public final class PushProjectIntoScan implements OptimizerRule {
         if (plan instanceof Limit limit) {
             return new Limit(pushInto(limit.input(), columns), limit.limit());
         }
+        // Join: deliberately NOT pushed into (see class javadoc) -- returned
+        // unchanged, so both sides keep requestedColumns == null ("decode everything").
         return plan;
     }
 

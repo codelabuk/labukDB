@@ -32,10 +32,9 @@ import java.util.List;
  * this class's job starts at "snapshot resolution" and ends at "files to
  * scan," the part that's genuinely format-agnostic.
  *
- * Returns metadata only — does not execute aggregation or printing
- * itself; the terminal execution (stream-and-print vs. combine-and-print)
- * stays the caller's job, preserving the exact memory profile each case
- * already has.
+ * Returns metadata only — does not execute aggregation, the join itself,
+ * or printing; the terminal execution (stream-and-print vs.
+ * combine-and-print vs. hash-join-and-print) stays the caller's job.
  */
 public final class LogicalPlanExecutor {
 
@@ -46,6 +45,46 @@ public final class LogicalPlanExecutor {
         Sort sort = findSort(optimizedPlan);
         Limit limit = findLimit(optimizedPlan);
 
+        ResolvedScan side = resolveSide(scan, format, dataFileRoot, version, asOf);
+        return new ResolvedScan(side.files(), side.columns(), aggregate, sort, limit,
+                side.snapshotVersion(), side.totalFilesInSnapshot(), side.filesSkipped());
+    }
+
+    /**
+     * SQL engine Phase 3, increment 1: finds the two-table {@link Join}
+     * in an optimized plan and resolves each side independently via
+     * {@link #resolveSide} — the exact same per-side logic the
+     * single-table {@link #resolve} uses, run twice. After optimization
+     * each side is guaranteed to be a bare {@link TableScan} ({@link
+     * PushFilterIntoScan} has already absorbed any {@link Filter}
+     * directly onto it), so each side can be resolved completely
+     * independently — including, as a free consequence rather than a
+     * specifically-built feature, against two different table formats
+     * (one Delta, one Iceberg).
+     */
+    public JoinExecution resolveJoin(LogicalPlan optimizedPlan, TableFormat leftFormat, TableLocation leftDataRoot,
+                                      TableFormat rightFormat, TableLocation rightDataRoot,
+                                      Long version, Instant asOf) throws Exception {
+        Join join = findJoin(optimizedPlan);
+        TableScan leftScan = (TableScan) join.left();
+        TableScan rightScan = (TableScan) join.right();
+
+        ResolvedScan leftResolved = resolveSide(leftScan, leftFormat, leftDataRoot, version, asOf);
+        ResolvedScan rightResolved = resolveSide(rightScan, rightFormat, rightDataRoot, version, asOf);
+
+        List<String> leftKeys = new ArrayList<>();
+        List<String> rightKeys = new ArrayList<>();
+        for (JoinKey key : join.keys()) {
+            leftKeys.add(key.leftColumn());
+            rightKeys.add(key.rightColumn());
+        }
+
+        return new JoinExecution(leftResolved, rightResolved, leftKeys, rightKeys);
+    }
+
+    /** One side's independently-resolved scan — shared building block for both {@link #resolve} and {@link #resolveJoin}. */
+    private ResolvedScan resolveSide(TableScan scan, TableFormat format, TableLocation dataFileRoot,
+                                      Long version, Instant asOf) throws Exception {
         NormalizedSnapshot snapshot = version != null ? format.atVersion(version)
                 : asOf != null ? format.atTimestamp(asOf)
                 : format.latest();
@@ -60,7 +99,7 @@ public final class LogicalPlanExecutor {
             files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
         }
 
-        return new ResolvedScan(files, scan.requestedColumns(), aggregate, sort, limit,
+        return new ResolvedScan(files, scan.requestedColumns(), null, null, null,
                 snapshot.getVersion(), scanPlan.getTotalFilesInSnapshot(), scanPlan.getFilesSkipped());
     }
 
@@ -81,6 +120,16 @@ public final class LogicalPlanExecutor {
             return findScan(limit.input());
         }
         throw new IllegalStateException("No TableScan found in plan: " + plan);
+    }
+
+    private Join findJoin(LogicalPlan plan) {
+        if (plan instanceof Join join) {
+            return join;
+        }
+        if (plan instanceof Project project) {
+            return findJoin(project.input());
+        }
+        throw new IllegalStateException("No Join found in plan: " + plan);
     }
 
     private Aggregate findAggregate(LogicalPlan plan) {

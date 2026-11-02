@@ -5,6 +5,7 @@ import com.labuk.labukdb.core.decode.ParquetToArrowReader;
 import com.labuk.labukdb.core.execution.AggregateSpec;
 import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
+import com.labuk.labukdb.core.execution.HashJoinOperator;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.format.DataFileRef;
 import com.labuk.labukdb.core.format.DeltaTableFormat;
@@ -17,6 +18,7 @@ import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.logical.LogicalPlan;
 import com.labuk.labukdb.core.logical.LogicalPlanBuilder;
 import com.labuk.labukdb.core.logical.LogicalPlanExecutor;
+import com.labuk.labukdb.core.logical.JoinExecution;
 import com.labuk.labukdb.core.logical.ResolvedScan;
 import com.labuk.labukdb.core.logical.RuleBasedOptimizer;
 import com.labuk.labukdb.core.planner.NormalizedScanPlan;
@@ -128,41 +130,18 @@ final class QueryCommand {
     private static void runSql(CliArgs parsed) throws Exception {
         SqlQuery query = SqlQueryTranslator.translate(parsed.sql);
         LogicalPlan plan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(query));
-
         TableCatalog catalog = TableCatalog.atDefaultLocation();
-        String raw = catalog.resolve(query.table()).orElse(query.table());
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-            TableFormat format;
-            TableLocation dataFileRoot;
-            String displayName;
-            String versionLabel;
-
-            if (IcebergRestLocation.isRestUri(raw)) {
-                IcebergTableFormat icebergFormat = openIcebergRest(raw);
-                format = icebergFormat;
-                dataFileRoot = TableLocation.fromStringWithEnvironmentConfig(icebergFormat.location());
-                displayName = raw;
-                versionLabel = "Iceberg snapshot";
-            } else {
-                TableLocation tableRoot = TableResolver.resolve(query.table(), catalog);
-                if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                    IcebergTableFormat icebergFormat = new IcebergTableFormat(tableRoot);
-                    format = icebergFormat;
-                    dataFileRoot = TableLocation.fromStringWithEnvironmentConfig(icebergFormat.location());
-                    displayName = tableRoot.toString();
-                    versionLabel = "Iceberg snapshot";
-                } else {
-                    format = new DeltaTableFormat(tableRoot);
-                    dataFileRoot = tableRoot;
-                    displayName = tableRoot.toString();
-                    versionLabel = "version";
-                }
+            if (query.join() != null) {
+                runSqlJoin(query, plan, catalog, parsed, allocator);
+                return;
             }
 
-            ResolvedScan resolved = new LogicalPlanExecutor().resolve(plan, format, dataFileRoot,
-                    parsed.version, parsed.asOf);
-            printResolvedSummary(displayName, versionLabel, resolved);
+            ResolvedTable resolvedTable = resolveTableFormat(query.table(), catalog);
+            ResolvedScan resolved = new LogicalPlanExecutor().resolve(plan, resolvedTable.format(),
+                    resolvedTable.dataFileRoot(), parsed.version, parsed.asOf);
+            printResolvedSummary(resolvedTable.displayName(), resolvedTable.versionLabel(), resolved);
 
             if (resolved.files().isEmpty()) {
                 System.out.println("0 row(s)");
@@ -191,6 +170,93 @@ final class QueryCommand {
                 scanAndPrintUpToLimit(resolved.files(), resolved.columns(), resolved.limit().limit(), allocator);
             } else {
                 scanAndPrintAllFiles(resolved.files(), resolved.columns(), allocator);
+            }
+        }
+    }
+
+    /** One table name resolved into an already-open format, the location its data files resolve against, and display metadata. */
+    private record ResolvedTable(TableFormat format, TableLocation dataFileRoot, String displayName, String versionLabel) {
+    }
+
+    /**
+     * The same Delta-vs-Iceberg-vs-REST-Iceberg detection {@code runSql}'s
+     * single-table path always used — extracted here specifically so SQL
+     * engine Phase 3's {@link #runSqlJoin} can run it twice, once per
+     * side, with zero duplicated detection logic.
+     */
+    private static ResolvedTable resolveTableFormat(String tableName, TableCatalog catalog) throws Exception {
+        String raw = catalog.resolve(tableName).orElse(tableName);
+
+        if (IcebergRestLocation.isRestUri(raw)) {
+            IcebergTableFormat icebergFormat = openIcebergRest(raw);
+            return new ResolvedTable(icebergFormat,
+                    TableLocation.fromStringWithEnvironmentConfig(icebergFormat.location()), raw, "Iceberg snapshot");
+        }
+
+        TableLocation tableRoot = TableResolver.resolve(tableName, catalog);
+        if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
+            IcebergTableFormat icebergFormat = new IcebergTableFormat(tableRoot);
+            return new ResolvedTable(icebergFormat,
+                    TableLocation.fromStringWithEnvironmentConfig(icebergFormat.location()),
+                    tableRoot.toString(), "Iceberg snapshot");
+        }
+        return new ResolvedTable(new DeltaTableFormat(tableRoot), tableRoot, tableRoot.toString(), "version");
+    }
+
+    /**
+     * SQL engine Phase 3, increment 1 — a two-table {@code INNER}
+     * equi-join. Each side is resolved and fully materialized completely
+     * independently (reusing {@link CombinedQueryExecutor} with empty
+     * {@code groupBy}/{@code aggregates}/{@code sortKeys} and
+     * {@code limit=-1}, which reduces to exactly "decode every surviving
+     * file and concatenate" — a join inherently needs to see every row
+     * of both sides anyway, the same assumption {@code GROUP BY}/
+     * {@code ORDER BY} already make), then {@link HashJoinOperator}
+     * combines them. The final {@code SELECT} list (already the
+     * alias-qualified names {@code HashJoinOperator}'s own output uses,
+     * e.g. {@code "a.service"}) selects the printed columns via a
+     * zero-copy {@link VectorSchemaRoot} view over the combined root's
+     * own vectors — never closed itself, since it shares (not copies)
+     * the combined root's buffers; only the combined root owns them.
+     */
+    private static void runSqlJoin(SqlQuery query, LogicalPlan plan, TableCatalog catalog, CliArgs parsed,
+                                     BufferAllocator allocator) throws Exception {
+        SqlQuery.JoinClause join = query.join();
+        ResolvedTable leftTable = resolveTableFormat(query.table(), catalog);
+        ResolvedTable rightTable = resolveTableFormat(join.rightTable(), catalog);
+
+        JoinExecution execution = new LogicalPlanExecutor().resolveJoin(plan,
+                leftTable.format(), leftTable.dataFileRoot(), rightTable.format(), rightTable.dataFileRoot(),
+                parsed.version, parsed.asOf);
+
+        System.out.println("Left:  " + leftTable.displayName() + " (" + leftTable.versionLabel() + " "
+                + execution.left().snapshotVersion() + ") -- " + execution.left().files().size() + " / "
+                + execution.left().totalFilesInSnapshot() + " files");
+        System.out.println("Right: " + rightTable.displayName() + " (" + rightTable.versionLabel() + " "
+                + execution.right().snapshotVersion() + ") -- " + execution.right().files().size() + " / "
+                + execution.right().totalFilesInSnapshot() + " files");
+        System.out.println();
+
+        if (execution.left().files().isEmpty() || execution.right().files().isEmpty()) {
+            System.out.println("0 row(s)");
+            return;
+        }
+
+        try (VectorSchemaRoot leftRoot = new CombinedQueryExecutor().execute(execution.left().files(),
+                execution.left().columns(), List.of(), List.of(), List.of(), -1, allocator);
+             VectorSchemaRoot rightRoot = new CombinedQueryExecutor().execute(execution.right().files(),
+                     execution.right().columns(), List.of(), List.of(), List.of(), -1, allocator)) {
+
+            try (VectorSchemaRoot combined = new HashJoinOperator().innerJoin(
+                    leftRoot, execution.leftKeys(), join.leftAlias(),
+                    rightRoot, execution.rightKeys(), join.rightAlias(), allocator)) {
+
+                VectorSchemaRoot projected = new VectorSchemaRoot(
+                        query.columns().stream().map(combined::getVector).toList());
+                printHeader(projected);
+                printRows(projected, projected.getRowCount());
+                System.out.println();
+                System.out.println(projected.getRowCount() + " row(s)");
             }
         }
     }
