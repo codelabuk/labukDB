@@ -12,10 +12,20 @@ one piece. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the v1 system
 this plan builds on top of, and [USAGE.md](../USAGE.md) for how to
 actually use what's built.
 
-Diagram sources: [`labukdb-v2-module-architecture.puml`](labukdb-v2-module-architecture.puml)
+Diagram sources now live in [`flow-charts/`](flow-charts/) — see
+[`flow-charts/README.md`](README.md) for the full index,
+including the newer per-topic diagrams (module overview, Delta/Iceberg
+write paths, read path, SQL engine Phase 1, Flight query sequence,
+catalog/format detection). This file's own render below is
+[`flow-charts/labukdb-v2-module-architecture.puml`](labukdb-v2-module-architecture.puml)
 (PlantUML source — edit this), rendered as
-[`labukdb-v2-module-architecture.pdf`](labukdb-v2-module-architecture.pdf) and
-[`.png`](labukdb-v2-module-architecture.png).
+[`.pdf`](labukdb-v2-module-architecture.pdf) and
+[`.png`](labukdb-v2-module-architecture.png). **Known stale
+as of the SQL engine Phase 1 update below** — the rendered image predates
+`core.logical`, and its own `DeltaTableFormat`/CLI-dispatch notes are
+now factually wrong (patched in the `.puml` source, not yet re-rendered —
+see `flow-charts/README.md` for why). Prefer the new per-topic diagrams
+for anything touching the SQL layer or Delta's query-path format wiring.
 
 ![labukDB v2 module architecture](labukdb-v2-module-architecture.png)
 
@@ -1533,6 +1543,65 @@ stayed green throughout. Full regression: 210 (core) + 50
 (format-iceberg) + 14 (cli) + 22 (flight, untouched) = 296 tests, 0
 failures/errors, 40 skipped — up from 255/37 in the three touched
 modules before this pass (+19 new: 18 core, 1 cli), zero regressions.
+
+**Addendum — manual `--sql` verification against a real Spark-written
+table, and a real pre-existing script bug it surfaced.** The automated
+suite above proves correctness; it doesn't prove the shipped CLI jar
+actually runs outside a test harness. Built `labukdb-cli.jar` and ran it
+directly against the real Delta table at `local-lakehouse-lab`'s
+`lakehouse/logs_delta` (genuine Spark/Delta-Lake 3.2.0 output, 3999 rows
+across 8 files, schema `level`/`service`/`message`/`event_ts`/`log_date`)
+— `GROUP BY` (`1444`/`2555` ERROR/WARN, matching the real data exactly),
+a plain `WHERE`-filtered select (295 rows, exercising the new per-file
+streaming path), and `ORDER BY ... LIMIT` (partition pruning dropped 4 of
+8 files for `level = 'ERROR'`, confirmed in the printed summary line).
+All three matched expectations.
+
+This surfaced a real, pre-existing bug, not introduced by Phase 1: the
+committed `bin/labukdb`/`bin/labukdb.bat` wrapper scripts (and both
+README.md's and USAGE.md's documented direct-jar-invocation examples)
+were missing Arrow's required `--add-opens=java.base/java.nio=
+org.apache.arrow.memory.core,ALL-UNNAMED` flag. `catalog add`/`list`
+never touch Arrow memory, so this never surfaced through those commands
+— only `query`/`describe` do, and every test-suite JVM already had the
+flag via Surefire's `argLine`, so no test run had ever caught it either.
+Fixed by baking the flag into both wrapper scripts directly and
+correcting both docs' examples.
+
+Extended the same manual proof to real MinIO for both formats: built a
+small persistent Delta table and a small persistent Iceberg table
+directly on MinIO (same 2-partition ERROR/INFO shape as the test
+fixtures, via a one-off driver reusing `TableCreator`/`CommitWriter`/
+`HadoopTables` — not part of the repo) at `s3a://warehouse/manual-verify/
+logs_{delta,iceberg}_<uuid>`, registered them in the catalog, and ran the
+identical `GROUP BY`/`WHERE`/`ORDER BY ... LIMIT` queries through
+`bin/labukdb` against both. All six runs (3 queries × 2 formats) matched
+expectations exactly, including partition pruning (`Files: 1 / 2` for
+the `WHERE level = 'ERROR'` case on both formats) and each format's own
+correct version-label wording (`version 2` for Delta, `Iceberg snapshot
+<snapshotId>` for Iceberg) — the first time Phase 1's unified
+`LogicalPlanExecutor` path has been proven by hand against real remote
+storage for both formats, not just the automated MinIO integration
+tests.
+
+**Addendum — architecture diagrams reorganized into `docs/flow-charts/`.**
+The single mega-diagram (`labukdb-v2-module-architecture.puml`) had
+drifted further: its own notes still claimed `DeltaTableFormat` was
+"unused by cli/flight" (now false — Phase 1 wired it in for `--sql`) and
+it had zero mention of `core.logical` at all. Moved all three existing
+`.puml` files (plus the module diagram's `.svg`/`.png`/`.pdf` renders)
+into a new `docs/flow-charts/` folder via `git mv`, patched the module
+diagram's most actively-wrong notes in place (not a full redraw), and
+added seven new focused diagrams: module overview, Delta write path,
+Iceberg write path, read path (pruning + decode), **SQL engine Phase 1**
+(the new IR/optimizer, including the actual before/after tree-shape
+transformation), a rebuilt Flight query sequence (the old one referenced
+`DeltaFlightProducer`/`DeltaCli`, renamed away long ago), and catalog +
+format detection. See `docs/flow-charts/README.md` for the full index.
+Same honest limitation as before: this environment still can't upload to
+the public PlantUML renderer (blocked as a data-sharing action), so
+these are `.puml` sources only, no fresh `.svg`/`.png` — stated plainly
+in the new folder's own README rather than silently left unmentioned.
 
 ---
 

@@ -1,0 +1,130 @@
+@startuml module-overview
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam roundCorner 10
+skinparam shadowing false
+
+skinparam rectangle {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+skinparam component {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam database {
+  BorderColor #0F6E56
+  BackgroundColor #E1F5EE
+  FontColor #04342C
+}
+skinparam actor {
+  BorderColor #993C1D
+  BackgroundColor #FAECE7
+  FontColor #4A1B0C
+}
+skinparam note {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+
+title labukDB — Module Dependency Overview\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+
+legend top left
+  |= color |= meaning |
+  |<#EEEDFE>| a Maven module |
+  |<#9FE1CB>| real storage (Delta/Iceberg table) |
+  |<#FAECE7>| an external actor (writer or client) |
+endlegend
+
+package "External writers" #F1EFE8 {
+  [Spark batch/streaming] as SB #D3D1C7
+  [Flink] as FL #D3D1C7
+  [Other Iceberg writer\n(Trino, etc.)] as OIW #D3D1C7
+}
+
+database "Delta table\n(_delta_log/ + Parquet)" as DT #9FE1CB
+database "Iceberg table\n(metadata/ + Parquet)" as IT #9FE1CB
+
+SB --> DT
+FL --> DT
+OIW --> IT
+
+package "labukdb-core\n(embeddable library, DuckDB-style --\nno Flight/gRPC dependency)" as CORE #EEEDFE {
+  [storage/ — location dispatch\n(local/MinIO/S3/ADLS)] as P_STORAGE
+  [format/ — TableFormat SPI\n(format-agnostic snapshot shape)] as P_FORMAT
+  [log/ — Delta commit log\n+ write path] as P_LOG
+  [planner/ — pruning] as P_PLANNER
+  [decode/ — Parquet → Arrow] as P_DECODE
+  [encode/ — Arrow → Parquet] as P_ENCODE
+  [execution/ — query operators\n(aggregate/sort/limit/combine)] as P_EXECUTION
+  [query/ — SQL text → SqlQuery] as P_QUERY
+  [logical/ — LogicalPlan IR\n+ optimizer (SQL engine Phase 1)] as P_LOGICAL
+  [catalog/ — name → location] as P_CATALOG
+}
+
+package "labukdb-format-iceberg\n(optional for core embedders;\nrequired by cli/flight below)" as ICEMOD #D9F2C4 {
+  [IcebergTableFormat / Writer /\nCreator / Merger / Compactor /\nVacuum / REST catalog /\nDynamoDbLockManager] as ICE_CLASSES
+}
+
+package "labukdb-flight\n(Arrow Flight server producer)" as FLIGHTMOD #EEEDFE {
+  [LabukDbFlightProducer] as DFP
+}
+
+package "labukdb-server-app\n(bootstrap, shaded jar)" as SERVERMOD #EEEDFE {
+  [LabukDbServerApp] as DFSA
+}
+
+package "labukdb-cli\n(in-process, no server)" as CLIMOD #EEEDFE {
+  [LabukDbCli / QueryCommand /\nCatalogCommand / DescribeCommand] as CLI_CLASSES
+}
+
+DT --> P_LOG
+IT --> ICE_CLASSES
+
+ICEMOD --> CORE : depends on
+FLIGHTMOD --> CORE : depends on
+FLIGHTMOD --> ICEMOD : depends on
+SERVERMOD --> FLIGHTMOD : depends on
+CLIMOD --> CORE : depends on
+CLIMOD --> ICEMOD : depends on
+
+note right of ICEMOD
+  Dependency runs ONE WAY: core never
+  depends on format-iceberg. This is why
+  format detection (DetectedFormat) lives
+  in core but actually CONSTRUCTING an
+  IcebergTableFormat happens in cli/flight
+  — the first layer that can see both.
+  core.logical.LogicalPlanExecutor (new,
+  SQL engine Phase 1) follows the same
+  rule: it takes an already-opened
+  TableFormat rather than detecting/
+  opening the table itself.
+end note
+
+actor "Python\n(pyarrow.flight)" as PY #FAECE7
+actor "Java\n(arrow-flight-core)" as JV #FAECE7
+actor "Go/Rust/JS\n(any Flight client)" as GX #FAECE7
+actor "Shell\n(bin/labukdb)" as SH #FAECE7
+
+PY --> DFSA
+JV --> DFSA
+GX --> DFSA
+DFSA --> DFP
+SH --> CLI_CLASSES
+
+note bottom of CLIMOD
+  Two query paths inside cli/, both real:
+  --table/--filter/--columns (flag-based,
+  unchanged since v1) and --sql "<SELECT...>"
+  (SQL engine Phase 1 — see
+  sql-engine-logical-plan.puml). Both end up
+  calling the exact same execution/ operators.
+end note
+
+@enduml

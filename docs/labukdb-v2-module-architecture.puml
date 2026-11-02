@@ -33,7 +33,7 @@ skinparam note {
   FontColor #2C2C2A
 }
 
-title labukDB v2 — Multi-Module Architecture (planned)\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+title labukDB v2 — Multi-Module Architecture (planned)\nSource patched for SQL engine Phase 1 accuracy -- not re-rendered (see flow-charts/README.md); prefer the per-topic diagrams in this folder for current detail\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
 
 legend top left
   |= color |= meaning |
@@ -81,9 +81,9 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [RemoteWriteSafetyWarning\n(logs on construction of any\nremote, no-lock writer -- strong\nfor an explicit custom S3 endpoint\n(MinIO-shaped), light otherwise;\ncan't detect an actual concurrent\nwriter, only risky configuration)] as RWSW #D9F2C4
   }
 
-  package "format/ — TableFormat SPI (wired into cli/flight\nfor Iceberg's query path; Delta's own\npath still bypasses it, see note)" #D9F2C4 {
+  package "format/ — TableFormat SPI (wired into cli's --sql path\nfor BOTH formats as of SQL engine Phase 1 --\nsee flow-charts/sql-engine-logical-plan.puml.\nFlight and cli's flag-based --table path\nstill bypass it for Delta, see note)" #D9F2C4 {
     [TableFormat\n(interface: snapshot → schema +\npartitionSpec + List<DataFileRef>)] as TF #D9F2C4
-    [DeltaTableFormat\n(wraps log/ below --\nunused by cli/flight today)] as DTF #D9F2C4
+    [DeltaTableFormat\n(wraps log/ below --\nnow wired into cli's --sql path via\nnew TableLocation ctor, added for\nthis -- still unused by cli's flag-\nbased path or by flight/)] as DTF #D9F2C4
     [DetectedFormat\n(probes _delta_log/ vs metadata/\nto pick Delta or Iceberg per table)] as DF #D9F2C4
   }
 
@@ -94,7 +94,12 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     (labukdb-format-iceberg depends on
     core, not the reverse) -- so
     detection lives here, construction
-    lives in cli/flight.
+    lives in cli/flight. core.logical's
+    LogicalPlanExecutor (new, see
+    flow-charts/sql-engine-logical-plan.puml)
+    takes an already-opened TableFormat
+    instead of detecting format itself,
+    for the same reason.
   end note
 
   package "log/ — commit log + write path (reused + new in v2)" #EEEDFE {
@@ -150,7 +155,7 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     [RowGroupPruner] as RGP
     [GroupPredicateEvaluator] as GPE
     [PartitionValueAppender] as PVA
-    [NestedTypeDecoder\n(LIST<primitive> read --\nread+write both done now)] as NTD
+    [NestedTypeDecoder\n(LIST/MAP/STRUCT, any nesting\ndepth -- read+write both done,\nlocal + MinIO-verified)] as NTD
     [Int96TimestampCodec] as ITC
     [ParquetFooterCache] as PFC
     [DecimalCodec\n(Decimal128, precision<=38;\nshared by decode + encode)] as DCC #D9F2C4
@@ -188,8 +193,17 @@ package "labukdb-core  (embeddable library — no Flight/gRPC dependency, DuckDB
     with a specific error, not silently
     misparsed. COUNT(*) rejected too,
     matching AggregateOperator's existing
-    COUNT(column)-only semantics.
+    COUNT(column)-only semantics. Still
+    rejects JOIN/subqueries post-parse --
+    jsqlparser itself already parses them
+    fine (Phase 3/4, not started).
   end note
+
+  package "logical/ -- SQL engine Phase 1\n(IR + optimizer shell -- full detail in\nflow-charts/sql-engine-logical-plan.puml)" #D9F2C4 {
+    [LogicalPlanBuilder\n(SqlQuery -> tree)] as LPB #D9F2C4
+    [RuleBasedOptimizer\n(PushFilterIntoScan,\nPushProjectIntoScan)] as RBO #D9F2C4
+    [LogicalPlanExecutor\n(resolve: plan + TableFormat\n-> ResolvedScan)] as LPE #D9F2C4
+  }
 
   package "catalog/ — name → location (reused)" #EEEDFE {
     [TableCatalog\n(name → location only -- format is\ndetected lazily via DetectedFormat,\nnot stored here; ~/.labukdb/catalog.json)] as CAT
@@ -294,7 +308,8 @@ QP  ..> NSP : planNormalized() returns
 PP  --> NSP : pruneNormalized()\n(same mightMatch logic,\nDataFileRef overload)
 FSP --> NSP : pruneNormalized()\n(same mightMatch logic,\nDataFileRef overload)
 DF  --> TL  : exists("_delta_log") /\nexists("metadata")
-ITF --> QP  : planNormalized() --\nIceberg's query path only;\nDeltaTableFormat/DTF above\nstays unused by cli/flight
+ITF --> QP  : planNormalized() --\nIceberg's query path (flight,\ncli's flag-based path, and cli's\n--sql path all use this)
+DTF --> QP  : planNormalized() --\ncli's --sql path only, as of\nSQL engine Phase 1 (new)
 
 PTAR --> RGP
 PTAR --> GPE
@@ -336,13 +351,28 @@ DFSA --> DFP
 CLI --> TR2
 TR2 --> CAT
 TR2 --> TL
-CLI --> IRL  : every query, first --\nicebergrest:// reference?\n(checked before DF/TableLocation)
+note right of CLI
+  --table flag-based path: unchanged from
+  before Phase 1 -- IRL/IRC/DF-detect then
+  QP (Delta, streaming) or ITF (Iceberg,
+  always combine), same as flight/ below.
+  --sql path (Phase 1, new): one unified
+  LogicalPlanExecutor path for BOTH formats
+  -- see flow-charts/sql-engine-logical-plan.puml
+  for the real detail; summarized below.
+end note
+CLI --> IRL  : --table flag path, first --\nicebergrest:// reference?
 CLI --> IRC  : REST-detected -- connect\n(ICEBERG_REST_* env vars)
-CLI --> DF   : not a REST ref --\nDelta or path-based Iceberg?
-CLI --> QP   : Delta-detected -- direct\nin-process query (catalog / describe /\nquery only -- no ingest/compact/vacuum yet)
-CLI --> ITF  : Iceberg-detected (path or REST) --\nalways combine mode\n(see ITF --> QP above)
+CLI --> DF   : --table flag path, not REST --\nDelta or path-based Iceberg?
+CLI --> QP   : --table flag path, Delta-detected\n(direct in-process, streaming)
+CLI --> ITF  : --table flag path, Iceberg-detected\n(path or REST) -- always combine
 CLI --> SQTR : --sql "<SELECT ...>"\n(mutually exclusive with\n--table/--columns/--filter/--limit)
-CLI --> CQE  : combine-mode SQL --\nGROUP BY/ORDER BY/LIMIT present\n(Delta), or any Iceberg SQL query
+SQQ  --> LPB : LogicalPlanBuilder.build()
+LPB  --> RBO : RuleBasedOptimizer.DEFAULT.optimize()\n(PushFilterIntoScan, PushProjectIntoScan)
+RBO  --> LPE : LogicalPlanExecutor.resolve(plan,\nformat, dataFileRoot, version, asOf)
+LPE  --> DTF : Delta-detected (--sql path only)
+LPE  --> ITF : Iceberg-detected, path or REST\n(--sql path only)
+LPE  --> CQE : needsCombine() --\nGROUP BY/ORDER BY/LIMIT present,\neither format now (fixes Iceberg\nalways-combine inefficiency)
 
 ' ─── CLIENTS ─────────────────────────────────────────────
 actor "Python\n(pyarrow.flight)" as PY  #FAECE7

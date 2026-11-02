@@ -1,0 +1,112 @@
+@startuml flight-query-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam sequenceMessageAlign center
+skinparam roundCorner 8
+skinparam shadowing false
+
+skinparam participant {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam actor {
+  BorderColor #993C1D
+  BackgroundColor #FAECE7
+  FontColor #4A1B0C
+}
+
+title labukDB — Flight Query Round Trip (rebuilt, current class names)\nReplaces the stale v1 flight-sequence.puml (DeltaFlightProducer/DeltaCli no longer exist)\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+
+actor       "Client\n(Python / Java / any\nFlight client)" as C
+participant "LabukDbFlightProducer"                        as DFP
+participant "IcebergRestLocation /\nDetectedFormat"          as DF
+participant "TableFormat\n(DeltaTableFormat path\nunused here -- see note) /\nIcebergTableFormat"          as TF
+participant "QueryPlanner"                                  as QP
+participant "TicketRegistry"                                as TR
+participant "CombinedQueryExecutor /\nParquetToArrowReader"  as EXEC
+
+== GetFlightInfo (planning — no data file fully opened) ==
+
+C   -> DFP  : GetFlightInfo(FlightDescriptor)\n{"table":"logs","predicate":{...},\n"columns":[...],"groupBy":[...],\n"aggregates":[...],"orderBy":[...],"limit":N}
+DFP -> DF   : icebergrest:// reference?\n(checked BEFORE any TableLocation --\nisRemoteUri's regex would otherwise misroute it)
+
+alt REST-catalog Iceberg
+  DFP -> TF  : IcebergRestConfiguration.connect()\n+ new IcebergTableFormat(catalog, identifier)
+else path-based (Delta or Iceberg)
+  DFP -> DF  : DetectedFormat.detect(tableRoot)\n(exists("_delta_log") vs exists("metadata"))
+  alt Delta
+    DFP -> DFP : resolve via SnapshotManager/Snapshot\ndirectly -- NOT via DeltaTableFormat\n(see note below)
+  else Iceberg
+    DFP -> TF  : new IcebergTableFormat(tableRoot)
+  end
+end
+
+DFP -> TF  : latest() / atVersion() / atTimestamp()\n(Delta: SnapshotManager directly instead)
+TF  --> DFP : Snapshot / NormalizedSnapshot\n(live file set + schema + partition columns)
+
+DFP -> QP  : plan(snapshot, predicate, columns)\n-- Delta --  or  planNormalized(...) -- Iceberg --
+
+group Pruning (no file opened yet)
+  QP -> QP  : ① PartitionPruner -- exact match\non partition values from the log
+  QP -> QP  : ② FileStatsPruner -- range check on\nfile stats min/max from the log\n(Iceberg's DataFileRef.getStats() is\nalways null today -- partition pruning\nonly, no column-stats pruning yet)
+  QP --> DFP : ScanPlan / NormalizedScanPlan\n(surviving files + residual predicate\n+ skip count)
+end
+
+DFP -> DFP : combineMode?\n(groupBy/aggregates/orderBy/limit present,\nDelta -- Iceberg is ALWAYS combine mode,\nunlike cli's --sql path, which this\nsession's SQL engine Phase 1 fixed for\ncli only -- see sql-engine-logical-plan.puml)
+
+alt combine mode
+  DFP -> TR  : register ONE CombinedScanTicket\ncovering every surviving file
+  TR --> DFP : opaque ticket id
+  DFP --> C  : FlightInfo -- schema + ONE FlightEndpoint
+else plain scan (Delta only)
+  loop for each surviving file
+    DFP -> DFP : PartitionValueSubstituter --\nfold partition predicate clauses\nto constants per file
+    DFP -> TR  : register(ScanTicket)
+    TR --> DFP : opaque ticket id
+  end
+  DFP --> C  : FlightInfo -- schema + N FlightEndpoints\n(client can fetch in parallel)
+end
+
+== DoGet (one per endpoint) ==
+
+C   -> DFP  : DoGet(ticket)
+DFP -> TR   : lookup(ticketId)
+TR  --> DFP : ScanTicket / CombinedScanTicket
+
+alt CombinedScanTicket
+  DFP -> EXEC : CombinedQueryExecutor.execute(files,\ncolumns, groupBy, aggregates, orderBy, limit)
+  EXEC -> EXEC : decode every file, concatenate,\noptionally aggregate, optionally sort+limit
+else ScanTicket
+  DFP -> EXEC : ParquetToArrowReader.read(dataFile,\ncolumns, residualPredicate, partitionValues)
+  EXEC -> EXEC : ③ RowGroupPruner (footer stats) --\n④ GroupPredicateEvaluator (per-row,\nfused with decode) -- NestedTypeDecoder\n(LIST/MAP/STRUCT) -- Int96TimestampCodec --\nDecimalCodec -- PartitionValueAppender
+end
+
+EXEC --> DFP : VectorSchemaRoot
+DFP --> C   : Arrow IPC stream\n(zero-copy -- Flight wire format IS Arrow IPC)
+DFP -> TR   : invalidate(ticketId)
+
+note over DFP, TF
+  <b>Delta's query path bypasses DeltaTableFormat
+  here</b> -- confirmed by grep: zero references
+  to it in LabukDbFlightProducer. This is
+  UNCHANGED by SQL engine Phase 1 (this session),
+  which only wired DeltaTableFormat into cli's
+  --sql path (see sql-engine-logical-plan.puml).
+  Mapping Flight's own query protocol onto the
+  same LogicalPlan/TableFormat path is natural
+  future work, not done yet.
+end note
+
+note over C, DFP
+  DoPut (write path, not shown above): Delta
+  buffers via WriteBuffer (WAL-backed, flush on
+  size/time threshold); Iceberg commits
+  immediately, one DoPut = one Iceberg commit,
+  no WriteBuffer equivalent. Both
+  live-MinIO-verified.
+end note
+
+@enduml

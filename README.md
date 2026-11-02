@@ -69,7 +69,12 @@ bin/labukdb query --table logs --filter "level=ERROR" --columns service,message 
 
 (Windows: `bin\labukdb.bat ...`. Zip extraction on Windows won't preserve
 the executable bit on `bin/labukdb` — `chmod +x bin/labukdb` once in Git
-Bash, or just use `java -jar labukdb-cli/target/labukdb-cli.jar ...`.)
+Bash, or just run the jar directly — `describe`/`query` need the same
+`--add-opens` flag the wrapper scripts already bake in: `java
+--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED
+-jar labukdb-cli/target/labukdb-cli.jar ...`; `catalog` subcommands never
+touch Arrow memory and work without it, but it's harmless to always
+include.)
 
 Every subcommand accepts either a catalog name or a raw filesystem/URI
 path wherever a table is expected. Filter syntax: `=`, `!=`, `<`, `<=`,

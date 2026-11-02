@@ -1,0 +1,105 @@
+@startuml catalog-and-format-detection
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam roundCorner 10
+skinparam shadowing false
+
+skinparam component {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam note {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+
+title labukDB — Catalog Resolution + Format Detection\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+
+[Raw table reference\n(--table arg, SQL FROM-clause name,\nor Flight request's "table" field)] as RAW
+
+package "catalog/ (labukdb-core)" #EEEDFE {
+  [TableCatalog\n(name -> location string only --\nNO format field; ~/.labukdb/catalog.json,\nJackson-backed, rewritten on every\nregister/unregister)] as CAT
+}
+
+package "cli/ (labukdb-cli)" #EEEDFE {
+  [TableResolver\n(catalog name, raw path, or\nremote URI -- catalog lookup wins\nif it matches, else used literally)] as TR2
+  [IcebergRestLocation\n(icebergrest://ns.table --\nchecked BEFORE TableResolver,\nsince isRemoteUri's regex would\notherwise misroute it to Hadoop FS)] as IRL
+}
+
+package "storage/ (labukdb-core)" #EEEDFE {
+  [TableLocation\n(local vs. remote, decided once;\nfromStringWithEnvironmentConfig --\nauto-picks up MinIO/ADLS connector\nconfig from env for an absolute URI)] as TL
+  [MinioConfiguration /\nAdlsConfiguration\n(fromEnvironment())] as CONF
+}
+
+package "format/ (labukdb-core)" #EEEDFE {
+  [DetectedFormat\n(probes exists("_delta_log")\nvs exists("metadata") at the\ntable root -- lazy, not stored\nin the catalog)] as DF
+  [TableFormat\n(interface: latest/atVersion/\natTimestamp -> NormalizedSnapshot)] as TF
+  [DeltaTableFormat] as DTF
+}
+
+package "labukdb-format-iceberg" #D9F2C4 {
+  [IcebergTableFormat\n(path-based or Catalog-based)] as ITF
+  [IcebergRestConfiguration\n(ICEBERG_REST_* env vars\n-> RESTCatalog)] as IRC
+}
+
+RAW --> IRL : is it icebergrest://... ?
+IRL --> IRC : yes -- connect,\nparse TableIdentifier
+IRC --> ITF : new IcebergTableFormat(\ncatalog, identifier)
+
+RAW --> TR2 : no -- resolve as\ncatalog name or path
+TR2 --> CAT : catalog.resolve(name)\n.orElse(name)
+TR2 --> TL  : isRemoteUri? ->\nforRemote(uri, conf) :\nfromString(raw)
+TL  --> CONF
+
+TL --> DF : detect(tableRoot)
+DF --> DTF : _delta_log/ found
+DF --> ITF : metadata/ found
+
+DTF ..|> TF
+ITF ..|> TF
+
+note bottom of CAT
+  Deliberate interim limitation (stated
+  plainly in its own javadoc): no format
+  tag stored per entry. Nothing stops a
+  Delta table and an Iceberg table from
+  being registered under different names
+  side by side -- each consumer
+  independently detects format at query
+  time via DetectedFormat, not at
+  registration time. Confirmed: this
+  already works today, just never
+  exercised by a single query spanning
+  both (no cross-table/cross-format join
+  exists at any layer above this).
+end note
+
+note bottom of DTF
+  <b>Real gap found + fixed this session
+  (SQL engine Phase 1):</b> DeltaTableFormat
+  existed, unit-tested standalone, but had
+  ONLY a local-only Path constructor --
+  QueryCommand's actual Delta query path
+  bypassed it entirely in favor of
+  SnapshotManager/Snapshot/AddFile directly
+  (confirmed by grep: zero references).
+  Added DeltaTableFormat(TableLocation),
+  delegating to the already-remote-capable
+  SnapshotManager.forLocation -- the
+  constructor migrating the query path onto
+  it needed first, or MinIO Delta SQL
+  queries would have silently broken.
+
+  Still true after the fix: Flight and cli's
+  flag-based --table path still bypass
+  DeltaTableFormat for Delta (unchanged,
+  out of Phase 1's scope) -- only cli's
+  --sql path uses it, via the new
+  core.logical.LogicalPlanExecutor.
+end note
+
+@enduml

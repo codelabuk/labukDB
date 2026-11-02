@@ -2,5 +2,14 @@
 # Usage: bin/labukdb catalog add logs /path/to/table
 # Works from any directory — resolves the jar relative to this script's
 # own location, not the caller's current directory.
+#
+# --add-opens is required for any command that actually decodes rows
+# (query, describe) -- Arrow's off-heap buffer access needs it (see
+# https://arrow.apache.org/docs/java/install.html). catalog add/list/remove
+# never touch Arrow memory, so this was missing here without that gap ever
+# showing up until a real `query --sql` was run manually against a real
+# table outside the test suite, where every JVM invocation already set it
+# via Surefire's argLine.
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec java -jar "$DIR/../labukdb-cli/target/labukdb-cli.jar" "$@"
+exec java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED \
+     -jar "$DIR/../labukdb-cli/target/labukdb-cli.jar" "$@"

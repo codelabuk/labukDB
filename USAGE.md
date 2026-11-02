@@ -122,8 +122,10 @@ mvn clean package          # runs tests too; add -DskipTests to skip them
 Produces `labukdb-cli/target/labukdb-cli.jar` (one file, every dependency
 bundled) and `labukdb-server-app/target/labukdb-server-app.jar`, the
 standalone Flight server. (Windows: `bin\labukdb.bat ...`; on Git Bash,
-`chmod +x bin/labukdb` once, or just run
-`java -jar labukdb-cli/target/labukdb-cli.jar ...` directly.)
+`chmod +x bin/labukdb` once, or just run the jar directly — `describe`/
+`query` need the same `--add-opens` flag the wrapper scripts already
+bake in: `java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED
+-jar labukdb-cli/target/labukdb-cli.jar ...`.)
 
 Every subcommand below, and every `--table`/`FROM`, accepts **either** a
 name registered via `catalog add` **or** a raw filesystem/URI path —

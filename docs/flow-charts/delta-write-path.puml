@@ -1,0 +1,102 @@
+@startuml delta-write-path
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam roundCorner 10
+skinparam shadowing false
+
+skinparam component {
+  BorderColor #534AB7
+  BackgroundColor #EEEDFE
+  FontColor #26215C
+}
+skinparam database {
+  BorderColor #0F6E56
+  BackgroundColor #E1F5EE
+  FontColor #04342C
+}
+skinparam note {
+  BorderColor #888780
+  BackgroundColor #F1EFE8
+  FontColor #2C2C2A
+}
+
+title labukDB — Delta Write Path (log/)\nCopyright 2026 Afzal and lakehouse-flight contributors — Apache 2.0
+
+database "Delta table\n(_delta_log/ + Parquet)" as DT #9FE1CB
+
+[TableCreator\n(version 0: protocol + metaData\nonly, no add actions)] as TCR
+[ArrowToDeltaSchema\n(Arrow Schema -> schemaString;\nList/Map/Struct all self-similar\nor nested-JSON-object shaped)] as ADS
+[ArrowToParquetWriter\n(Arrow -> real Parquet file)] as ATPW
+
+[CommitWriter\n(atomic create-if-absent commit --\noptimistic concurrency, retry on conflict)] as CW
+[TableMerger\n(upsert/MERGE by key,\ndataChange=true)] as TMRG
+[PartitionRowMerger\n(format-agnostic merge-by-key\nalgorithm -- shared with Iceberg's\nown merger, not duplicated)] as PRM
+[Compactor\n(bin-pack small files,\ndataChange=false)] as COMP
+[Vacuum\n(delete orphaned files\npast retention window)] as VAC
+
+[LockProvider\n(interface)] as LP
+[DynamoDbLockProvider\n(opt-in cross-process lock)] as DDBL
+[RemoteWriteSafetyWarning\n(logs on construction of any\nremote, no-lock writer)] as RWSW
+
+TCR --> ADS : build schemaString
+TCR --> DT : write version 0
+
+CW --> DT : append add/remove actions
+TMRG --> PRM : combineFiles() + merge()
+TMRG --> CW : commit via replaceFiles\n(dataChange=true)
+COMP --> CW : commit bin-packed files\n(dataChange=false)
+VAC --> DT : delete files past\nretired-and-expired
+PRM --> ATPW : write new merged\npartition file
+
+CW ..> DDBL : optional, via\nforLocation(location, lockProvider)
+CW ..> RWSW : construction --\nwarns if remote + no lock
+LP <|.. DDBL
+
+note right of CW
+  <b>CONFIRMED BROKEN</b> (real 8-process
+  stress test against real MinIO), not
+  assumed: remote, no lock -- plain append
+  AND TableMerger/Compactor both lose
+  commits silently under genuine
+  concurrency. MERGE is the WORSE failure
+  mode (7 of 8 inserts lost, zero
+  exceptions) since its commit unit
+  replaces the whole partition, not just
+  adds a file.
+
+  Remote, WITH lock (DynamoDbLockProvider):
+  <b>done, live-verified</b> -- same failing
+  scenarios pass with it engaged.
+  TableMerger/Compactor gained their own
+  lock-accepting overloads specifically to
+  close this (previously only plain
+  appendBatch could opt in).
+
+  Local disk: safe unconditionally, lock
+  never needed (real atomic filesystem ops).
+end note
+
+note bottom of DDBL
+  Root cause (not the lock's design, the
+  thing it mitigates): S3-compatible
+  storage's conditional PUT isn't always
+  honored under concurrency the way local
+  disk's CREATE_NEW is. DynamoDB's own
+  conditional PutItem IS proven atomic
+  (8-thread test: 1 success, 7 clean
+  conflicts) -- chosen because it mirrors
+  real Delta Lake OSS's own
+  S3DynamoDBLogStore pattern, not invented.
+
+  Real regression fixed: 8 processes racing
+  ensureTableExists() against a brand-new
+  lock table all hit ResourceNotFoundException
+  then raced createTable -- 6 of 8 got an
+  uncaught ResourceInUseException. Fixed by
+  catching it and falling through to the
+  existing poll-until-ACTIVE loop.
+end note
+
+@enduml
