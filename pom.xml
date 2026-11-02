@@ -166,7 +166,7 @@
               in here means `mvn test` just works for every module that runs
               Arrow-touching tests, without each one repeating the flag.
             -->
-            <argLine>--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED -Darrow.memory.debug.allocator=true</argLine>
+            <argLine>--add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED</argLine>
           </configuration>
         </plugin>
         <plugin>
