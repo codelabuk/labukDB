@@ -52,6 +52,18 @@ public final class AggregateOperator {
             throw new IllegalArgumentException("At least one input batch is required");
         }
 
+        // Single primitive-typed group-by column -> hash as a raw long, no
+        // boxed List<Object> key at all (see LongKeyMultimap). Multi-column
+        // and VARCHAR group-by columns fall through to the boxed path below
+        // unchanged -- same cross-type matching behavior as before either
+        // way (see HashJoinOperator's identical fast-path guard for why).
+        boolean fastPath = groupByColumns.size() == 1
+                && isLongEncodable(inputBatches.get(0).getVector(groupByColumns.get(0)));
+
+        if (fastPath) {
+            return aggregateSingleColumnFast(inputBatches, groupByColumns.get(0), aggregates, allocator);
+        }
+
         Map<List<Object>, Map<AggregateSpec, Accumulator>> groups = new LinkedHashMap<>();
 
         for (VectorSchemaRoot batch : inputBatches) {
@@ -76,6 +88,117 @@ public final class AggregateOperator {
         }
 
         return buildResult(groups, groupByColumns, aggregates, inputBatches.get(0).getSchema(), allocator);
+    }
+
+    /**
+     * Same grouping logic as the boxed path above, specialized for one
+     * primitive-typed {@code GROUP BY} column: rows are bucketed by raw
+     * {@code long} key, with no per-row boxing -- the only boxing left is
+     * one {@code Long} per <em>distinct group</em> (as {@code keyToSlot}'s
+     * key), not one per row, which is the actual win when groups are
+     * smaller than the input (the common case). SQL groups every {@code
+     * NULL} key value into one shared group (unlike a join key, which
+     * never matches null to anything) -- there's no safe {@code long}
+     * sentinel for null, so null-keyed rows are tracked in one separate
+     * accumulator instead, bypassing {@code keyToSlot} entirely.
+     */
+    private VectorSchemaRoot aggregateSingleColumnFast(
+            List<VectorSchemaRoot> inputBatches, String groupByColumn,
+            List<AggregateSpec> aggregates, BufferAllocator allocator) {
+
+        Map<Long, Integer> keyToSlot = new LinkedHashMap<>();
+        List<Map<AggregateSpec, Accumulator>> accumulatorsBySlot = new ArrayList<>();
+        Map<AggregateSpec, Accumulator> nullGroup = null;
+        boolean sawNullGroup = false;
+
+        for (VectorSchemaRoot batch : inputBatches) {
+            FieldVector groupVector = batch.getVector(groupByColumn);
+            List<FieldVector> aggVectors = aggregates.stream().map(spec -> batch.getVector(spec.column())).toList();
+
+            for (int row = 0; row < batch.getRowCount(); row++) {
+                Map<AggregateSpec, Accumulator> accumulators;
+                if (groupVector.isNull(row)) {
+                    if (!sawNullGroup) {
+                        nullGroup = newAccumulators(aggregates);
+                        sawNullGroup = true;
+                    }
+                    accumulators = nullGroup;
+                } else {
+                    long key = encodeLong(groupVector, row);
+                    Integer slot = keyToSlot.get(key);
+                    if (slot == null) {
+                        slot = accumulatorsBySlot.size();
+                        keyToSlot.put(key, slot);
+                        accumulatorsBySlot.add(newAccumulators(aggregates));
+                    }
+                    accumulators = accumulatorsBySlot.get(slot);
+                }
+
+                for (int i = 0; i < aggregates.size(); i++) {
+                    AggregateSpec spec = aggregates.get(i);
+                    Object value = getValue(aggVectors.get(i), row);
+                    accumulators.get(spec).accept(value);
+                }
+            }
+        }
+
+        FieldVector representativeGroupVector = inputBatches.get(0).getVector(groupByColumn);
+        List<Field> outputFields = new ArrayList<>();
+        outputFields.add(inputBatches.get(0).getSchema().findField(groupByColumn));
+        for (AggregateSpec spec : aggregates) {
+            outputFields.add(outputFieldFor(spec, inputBatches.get(0).getSchema()));
+        }
+        VectorSchemaRoot result = VectorSchemaRoot.create(new Schema(outputFields), allocator);
+        result.allocateNew();
+
+        int row = 0;
+        for (Map.Entry<Long, Integer> entry : keyToSlot.entrySet()) {
+            setLongKey(result.getVector(0), row, representativeGroupVector, entry.getKey());
+            writeAccumulators(result, row, 1, accumulatorsBySlot.get(entry.getValue()), aggregates);
+            row++;
+        }
+        if (sawNullGroup) {
+            result.getVector(0).setNull(row);
+            writeAccumulators(result, row, 1, nullGroup, aggregates);
+            row++;
+        }
+        result.setRowCount(row);
+        return result;
+    }
+
+    private void writeAccumulators(VectorSchemaRoot result, int row, int startCol,
+                                    Map<AggregateSpec, Accumulator> accumulators, List<AggregateSpec> aggregates) {
+        int col = startCol;
+        for (AggregateSpec spec : aggregates) {
+            setValue(result.getVector(col++), row, accumulators.get(spec).result(spec.function()));
+        }
+    }
+
+    /** Writes a raw long key (from {@link #encodeLong}) back out as its original Arrow type. */
+    private void setLongKey(FieldVector dest, int row, FieldVector sourceType, long key) {
+        if (sourceType instanceof IntVector) ((IntVector) dest).setSafe(row, (int) key);
+        else if (sourceType instanceof BigIntVector) ((BigIntVector) dest).setSafe(row, key);
+        else if (sourceType instanceof BitVector) ((BitVector) dest).setSafe(row, (int) key);
+        else if (sourceType instanceof Float4Vector) ((Float4Vector) dest).setSafe(row, (float) Double.longBitsToDouble(key));
+        else if (sourceType instanceof Float8Vector) ((Float8Vector) dest).setSafe(row, Double.longBitsToDouble(key));
+        else if (sourceType instanceof TimeStampMicroVector) ((TimeStampMicroVector) dest).setSafe(row, key);
+        else throw new UnsupportedOperationException("Not long-encodable: " + sourceType.getClass());
+    }
+
+    private static boolean isLongEncodable(FieldVector v) {
+        return v instanceof IntVector || v instanceof BigIntVector || v instanceof BitVector
+                || v instanceof Float4Vector || v instanceof Float8Vector || v instanceof TimeStampMicroVector;
+    }
+
+    /** Must only be called on a vector {@link #isLongEncodable}; widens/bit-casts so equal values hash/compare equal. */
+    private static long encodeLong(FieldVector v, int row) {
+        if (v instanceof IntVector iv) return iv.get(row);
+        if (v instanceof BigIntVector bv) return bv.get(row);
+        if (v instanceof BitVector bv) return bv.get(row) != 0 ? 1L : 0L;
+        if (v instanceof Float4Vector fv) return Double.doubleToLongBits((double) fv.get(row));
+        if (v instanceof Float8Vector fv) return Double.doubleToLongBits(fv.get(row));
+        if (v instanceof TimeStampMicroVector tv) return tv.get(row);
+        throw new IllegalStateException("Not long-encodable: " + v.getClass());
     }
 
     private Map<AggregateSpec, Accumulator> newAccumulators(List<AggregateSpec> aggregates) {

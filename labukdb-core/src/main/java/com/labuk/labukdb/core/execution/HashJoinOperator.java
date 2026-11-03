@@ -48,14 +48,47 @@ public final class HashJoinOperator {
             throw new IllegalArgumentException("Join requires at least one key pair, with equal counts on each side");
         }
 
+        List<FieldVector> leftKeyVectors = leftKeys.stream().map(left::getVector).toList();
         List<FieldVector> rightKeyVectors = rightKeys.stream().map(right::getVector).toList();
-        Map<List<Object>, List<Integer>> buildIndex = new LinkedHashMap<>();
-        for (int row = 0; row < right.getRowCount(); row++) {
-            List<Object> key = keyTuple(rightKeyVectors, row);
-            if (key == null) {
-                continue; // a null key component never matches -- standard SQL join semantics
+
+        // Single primitive-typed key column on both sides -> hash/compare as
+        // a raw long, no per-row boxed List<Object> composite key (just one
+        // boxed Long per *distinct key*, same tradeoff AggregateOperator's
+        // fast path already makes -- java.util.HashMap's own internals beat
+        // a hand-rolled open-addressing table at the row counts measured
+        // here, so this reuses a standard Map rather than a bespoke one;
+        // see docs/labukdb-v2-architecture.md for the benchmark that showed
+        // this). Composite keys and VARCHAR keys fall through to the boxed
+        // List<Object> path below unchanged. Requiring the *same* vector
+        // class on both sides mirrors the boxed path's own existing
+        // behavior: getValue() boxes IntVector to Integer and BigIntVector
+        // to Long, which never .equals() each other either -- so this fast
+        // path introduces no new cross-type matching behavior, just a
+        // faster version of what already matches.
+        boolean fastPath = leftKeyVectors.size() == 1
+                && isLongEncodable(leftKeyVectors.get(0))
+                && leftKeyVectors.get(0).getClass() == rightKeyVectors.get(0).getClass();
+
+        Map<Long, List<Integer>> longIndex = null;
+        Map<List<Object>, List<Integer>> boxedIndex = null;
+        if (fastPath) {
+            FieldVector rightKey = rightKeyVectors.get(0);
+            longIndex = new LinkedHashMap<>();
+            for (int row = 0; row < right.getRowCount(); row++) {
+                if (rightKey.isNull(row)) {
+                    continue; // a null key component never matches -- standard SQL join semantics
+                }
+                longIndex.computeIfAbsent(encodeLong(rightKey, row), k -> new ArrayList<>()).add(row);
             }
-            buildIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+        } else {
+            boxedIndex = new LinkedHashMap<>();
+            for (int row = 0; row < right.getRowCount(); row++) {
+                List<Object> key = keyTuple(rightKeyVectors, row);
+                if (key == null) {
+                    continue;
+                }
+                boxedIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
+            }
         }
 
         List<Field> outputFields = new ArrayList<>();
@@ -68,33 +101,62 @@ public final class HashJoinOperator {
         VectorSchemaRoot result = VectorSchemaRoot.create(new Schema(outputFields), allocator);
         result.allocateNew();
 
-        List<FieldVector> leftKeyVectors = leftKeys.stream().map(left::getVector).toList();
         List<FieldVector> leftAllVectors = left.getFieldVectors();
         List<FieldVector> rightAllVectors = right.getFieldVectors();
 
         int outRow = 0;
-        for (int l = 0; l < left.getRowCount(); l++) {
-            List<Object> key = keyTuple(leftKeyVectors, l);
-            if (key == null) {
-                continue;
-            }
-            List<Integer> matches = buildIndex.get(key);
-            if (matches == null) {
-                continue;
-            }
-            for (int r : matches) {
-                int col = 0;
-                for (FieldVector v : leftAllVectors) {
-                    setValue(result.getVector(col++), outRow, getValue(v, l));
+        if (fastPath) {
+            FieldVector leftKey = leftKeyVectors.get(0);
+            for (int l = 0; l < left.getRowCount(); l++) {
+                if (leftKey.isNull(l)) {
+                    continue;
                 }
-                for (FieldVector v : rightAllVectors) {
-                    setValue(result.getVector(col++), outRow, getValue(v, r));
-                }
-                outRow++;
+                List<Integer> matches = longIndex.get(encodeLong(leftKey, l));
+                outRow = emitMatches(matches, l, leftAllVectors, rightAllVectors, result, outRow);
+            }
+        } else {
+            for (int l = 0; l < left.getRowCount(); l++) {
+                List<Object> key = keyTuple(leftKeyVectors, l);
+                List<Integer> matches = key == null ? null : boxedIndex.get(key);
+                outRow = emitMatches(matches, l, leftAllVectors, rightAllVectors, result, outRow);
             }
         }
         result.setRowCount(outRow);
         return result;
+    }
+
+    private static int emitMatches(List<Integer> matches, int leftRow, List<FieldVector> leftAllVectors,
+                                     List<FieldVector> rightAllVectors, VectorSchemaRoot result, int outRow) {
+        if (matches == null) {
+            return outRow;
+        }
+        for (int r : matches) {
+            int col = 0;
+            for (FieldVector v : leftAllVectors) {
+                copyValue(v, leftRow, result.getVector(col++), outRow);
+            }
+            for (FieldVector v : rightAllVectors) {
+                copyValue(v, r, result.getVector(col++), outRow);
+            }
+            outRow++;
+        }
+        return outRow;
+    }
+
+    private static boolean isLongEncodable(FieldVector v) {
+        return v instanceof IntVector || v instanceof BigIntVector || v instanceof BitVector
+                || v instanceof Float4Vector || v instanceof Float8Vector || v instanceof TimeStampMicroVector;
+    }
+
+    /** Must only be called on a vector {@link #isLongEncodable}; widens/bit-casts so equal values hash/compare equal. */
+    private static long encodeLong(FieldVector v, int row) {
+        if (v instanceof IntVector iv) return iv.get(row);
+        if (v instanceof BigIntVector bv) return bv.get(row);
+        if (v instanceof BitVector bv) return bv.get(row) != 0 ? 1L : 0L;
+        if (v instanceof Float4Vector fv) return Double.doubleToLongBits((double) fv.get(row));
+        if (v instanceof Float8Vector fv) return Double.doubleToLongBits(fv.get(row));
+        if (v instanceof TimeStampMicroVector tv) return tv.get(row);
+        throw new IllegalStateException("Not long-encodable: " + v.getClass());
     }
 
     private List<Object> keyTuple(List<FieldVector> keyVectors, int row) {
@@ -112,6 +174,31 @@ public final class HashJoinOperator {
         return new Field(alias + "." + field.getName(), field.getFieldType(), field.getChildren());
     }
 
+    /**
+     * Primitive-to-primitive copy, no {@code Object} ever created -- this
+     * runs once per column per *matched pair*, the highest-volume site in
+     * the whole operator (a duplicate build-side key multiplies it by the
+     * fan-out), so boxing here is the first thing worth removing. {@code
+     * getValue} below still exists for the key-extraction path, which only
+     * avoids per-row composite-key boxing for a single primitive-typed key
+     * column (see the {@code fastPath} branch in {@link #innerJoin}) --
+     * composite and VARCHAR keys still need it.
+     */
+    private static void copyValue(FieldVector src, int srcIdx, FieldVector dest, int destIdx) {
+        if (src.isNull(srcIdx)) {
+            dest.setNull(destIdx);
+            return;
+        }
+        if (src instanceof IntVector s) ((IntVector) dest).setSafe(destIdx, s.get(srcIdx));
+        else if (src instanceof BigIntVector s) ((BigIntVector) dest).setSafe(destIdx, s.get(srcIdx));
+        else if (src instanceof Float4Vector s) ((Float4Vector) dest).setSafe(destIdx, s.get(srcIdx));
+        else if (src instanceof Float8Vector s) ((Float8Vector) dest).setSafe(destIdx, s.get(srcIdx));
+        else if (src instanceof BitVector s) ((BitVector) dest).setSafe(destIdx, s.get(srcIdx));
+        else if (src instanceof VarCharVector s) ((VarCharVector) dest).setSafe(destIdx, s.get(srcIdx));
+        else if (src instanceof TimeStampMicroVector s) ((TimeStampMicroVector) dest).setSafe(destIdx, s.get(srcIdx));
+        else throw new UnsupportedOperationException("Unsupported vector type in execution/: " + src.getClass());
+    }
+
     // Same boxed-value get/set pattern AggregateOperator already uses -- two
     // independent, small occurrences don't yet justify a shared utility.
     private Object getValue(FieldVector vector, int index) {
@@ -126,20 +213,5 @@ public final class HashJoinOperator {
         if (vector instanceof VarCharVector v) return new String(v.get(index), StandardCharsets.UTF_8);
         if (vector instanceof TimeStampMicroVector v) return v.get(index);
         throw new UnsupportedOperationException("Unsupported vector type in execution/: " + vector.getClass());
-    }
-
-    private void setValue(FieldVector vector, int index, Object value) {
-        if (value == null) {
-            vector.setNull(index);
-            return;
-        }
-        if (vector instanceof IntVector v) v.setSafe(index, (Integer) value);
-        else if (vector instanceof BigIntVector v) v.setSafe(index, ((Number) value).longValue());
-        else if (vector instanceof Float4Vector v) v.setSafe(index, (Float) value);
-        else if (vector instanceof Float8Vector v) v.setSafe(index, ((Number) value).doubleValue());
-        else if (vector instanceof BitVector v) v.setSafe(index, ((Boolean) value) ? 1 : 0);
-        else if (vector instanceof VarCharVector v) v.setSafe(index, value.toString().getBytes(StandardCharsets.UTF_8));
-        else if (vector instanceof TimeStampMicroVector v) v.setSafe(index, ((Number) value).longValue());
-        else throw new UnsupportedOperationException("Unsupported vector type in execution/: " + vector.getClass());
     }
 }

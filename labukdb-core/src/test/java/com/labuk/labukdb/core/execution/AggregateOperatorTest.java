@@ -99,6 +99,87 @@ class AggregateOperatorTest {
         }
     }
 
+    /** Single BigIntVector group-by column -- exercises the primitive fast path, not the boxed List&lt;Object&gt; path. */
+    @Test
+    void groupBy_onSinglePrimitiveColumn_usesFastPathAndComputesCorrectSums() {
+        Field region = new Field("region_id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(region, amount)), allocator)) {
+            batch.allocateNew();
+            BigIntVector regionVector = (BigIntVector) batch.getVector("region_id");
+            BigIntVector amountVector = (BigIntVector) batch.getVector("amount");
+            long[] regions = {1, 2, 1, 2, 1};
+            long[] amounts = {10, 100, 20, 200, 30};
+            for (int i = 0; i < regions.length; i++) {
+                regionVector.setSafe(i, regions[i]);
+                amountVector.setSafe(i, amounts[i]);
+            }
+            batch.setRowCount(regions.length);
+
+            try (VectorSchemaRoot result = new AggregateOperator().aggregate(
+                    List.of(batch), List.of("region_id"),
+                    List.of(new AggregateSpec("amount", AggregateFunction.SUM, "total")),
+                    allocator)) {
+                assertEquals(2, result.getRowCount());
+                Map<Long, Double> totalsByRegion = new java.util.HashMap<>();
+                BigIntVector regionOut = (BigIntVector) result.getVector("region_id");
+                Float8Vector totalOut = (Float8Vector) result.getVector("total");
+                for (int i = 0; i < result.getRowCount(); i++) {
+                    totalsByRegion.put(regionOut.get(i), totalOut.get(i));
+                }
+                assertEquals(60.0, totalsByRegion.get(1L)); // 10+20+30
+                assertEquals(300.0, totalsByRegion.get(2L)); // 100+200
+            }
+        }
+    }
+
+    /** SQL groups every NULL key value into one shared group -- not excluded, and distinct from the fast path's non-null groups. */
+    @Test
+    void groupBy_onSinglePrimitiveColumn_withNullValues_formsOneSharedNullGroup() {
+        Field region = new Field("region_id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(region, amount)), allocator)) {
+            batch.allocateNew();
+            BigIntVector regionVector = (BigIntVector) batch.getVector("region_id");
+            BigIntVector amountVector = (BigIntVector) batch.getVector("amount");
+            regionVector.setSafe(0, 1);
+            amountVector.setSafe(0, 10);
+            regionVector.setNull(1);
+            amountVector.setSafe(1, 5);
+            regionVector.setNull(2);
+            amountVector.setSafe(2, 7);
+            batch.setRowCount(3);
+
+            try (VectorSchemaRoot result = new AggregateOperator().aggregate(
+                    List.of(batch), List.of("region_id"),
+                    List.of(new AggregateSpec("amount", AggregateFunction.SUM, "total"),
+                            new AggregateSpec("amount", AggregateFunction.COUNT, "cnt")),
+                    allocator)) {
+                assertEquals(2, result.getRowCount(), "one group for region_id=1, one shared group for both nulls -- not 3, not 1");
+
+                BigIntVector regionOut = (BigIntVector) result.getVector("region_id");
+                Float8Vector totalOut = (Float8Vector) result.getVector("total");
+                BigIntVector cntOut = (BigIntVector) result.getVector("cnt");
+
+                boolean sawNullGroup = false;
+                for (int i = 0; i < result.getRowCount(); i++) {
+                    if (regionOut.isNull(i)) {
+                        sawNullGroup = true;
+                        assertEquals(12.0, totalOut.get(i), "both null-keyed rows (5+7) must be in the same group");
+                        assertEquals(2L, cntOut.get(i));
+                    } else {
+                        assertEquals(1L, regionOut.get(i));
+                        assertEquals(10.0, totalOut.get(i));
+                        assertEquals(1L, cntOut.get(i));
+                    }
+                }
+                assertTrue(sawNullGroup, "the null group must be present in the output, not silently dropped");
+            }
+        }
+    }
+
     @Test
     void noGroupByColumns_producesOneGlobalGroup() {
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);

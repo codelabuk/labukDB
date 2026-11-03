@@ -1724,32 +1724,142 @@ untouched by any SQL engine phase so far).
 
 ---
 
-## Known test flakiness — `FlightIntegrationTest`
+## Fixed — `FlightIntegrationTest`/`FlightAggregationIntegrationTest` memory-leak flake
 
-**A known, pre-existing flaky test — root cause still open, not Arrow's.**
-`FlightIntegrationTest` intermittently fails (~1-in-4 observed) with
-`IllegalStateException: Memory was leaked by query` during
-`allocator.close()` in teardown — confirmed not tied to any specific code
-path (it hits read-only tests as often as write ones, and has now also
-been observed once on `FlightIcebergIntegrationTest`, a brand-new test
-with no resource-handling difference from the already-stable
-`FlightAggregationIntegrationTest` it mirrors — passed cleanly on every
-other run, standalone and full-suite, reinforcing that this is suite-wide
-timing/load-dependent flakiness, not a defect in any one test). Earlier
-notes in this project cited Arrow's own
-[ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448) /
+**Root-caused and fixed.** The intermittent `IllegalStateException: Memory
+was leaked by query` during `allocator.close()` in teardown (previously
+documented below as open) traced to a real gap in Arrow's own
+`FlightServer`, confirmed by disassembling `arrow-flight-core:16.1.0`
+with `javap`: when no executor is supplied, `FlightServer.Builder.build()`
+creates a default `Executors.newCachedThreadPool(...)` and stores it as
+`FlightServer.grpcExecutor` — the same executor gRPC dispatches producer
+work through. `FlightServer.close()` → `shutdown()` does call
+`grpcExecutor.shutdown()`, but `awaitTermination()` only ever calls
+`io.grpc.Server.awaitTermination(...)` — it never calls
+`grpcExecutor.awaitTermination(...)`. Nothing guarantees that executor's
+threads have actually drained by the time `close()` returns, so a
+producer callback could still be running against the test's allocator
+after teardown considered the server closed, racing the immediately-following
+`allocator.close()`.
+
+Fix: both tests now supply their own named `ExecutorService` via
+`FlightServer.Builder.executor(...)` and explicitly `shutdown()` +
+`awaitTermination(5, SECONDS)` it in `tearDown()`, between `server.close()`
+and `allocator.close()` — guaranteeing full drain before the allocator is
+released, regardless of what Arrow's own `close()` does. Validated with
+25 consecutive clean full-module runs (0 reproductions) after the fix,
+against 2 known reproductions earlier in this project's history. The
+earlier note below (kept for history) incorrectly cited a long-since-fixed
+Arrow issue as a possible explanation — that was wrong on closer reading
+and is superseded by the actual root cause above.
+
+<details>
+<summary>Original flakiness note (superseded)</summary>
+
+`FlightIntegrationTest` intermittently failed (~1-in-4 observed) with the
+same exception — confirmed not tied to any specific code path (it hit
+read-only tests as often as write ones). Earlier notes in this project
+cited Arrow's own [ARROW-4448](https://issues.apache.org/jira/browse/ARROW-4448) /
 [apache/arrow#21006](https://github.com/apache/arrow/issues/21006) (the
 same ticket — ARROW-4448 is its old JIRA id, #21006 its GitHub-migration
-id) as an explanation; that was wrong on closer reading. That issue was
-**resolved as fixed** (not dismissed as an unfixable flake) via
+id) as an explanation. That issue was **resolved as fixed** via
 [PR #3805](https://github.com/apache/arrow/pull/3805), targeting Arrow
-**0.13.0** in 2019. This project pins Arrow **16.1.0** — the fix already
-shipped many major versions before the version this project depends on,
-so it can't be the same recurring bug; the resemblance is only the
-generic leak-detector message, not the root cause. The actual cause here
-is genuinely unverified and still needs real investigation (e.g. a
-heap-dump/leak-detector run under the loop that reproduces it), not
-assumed to be either an Arrow bug or this project's own code.
+**0.13.0** in 2019 — many major versions before this project's pinned
+**16.1.0**, so it couldn't have been the same recurring bug; the
+resemblance was only the generic leak-detector message, not the root
+cause. The real cause turned out to be this project's own test setup not
+draining Arrow's default executor, not an Arrow regression.
+
+</details>
+
+---
+
+## Update — removing per-row boxing from `AggregateOperator`/`HashJoinOperator`
+
+**Motivation.** Both operators extracted every row value as a boxed
+`java.lang.Object` and keyed `GROUP BY`/join grouping with
+`Map<List<Object>, ...>`. Arrow's own column storage is correctly
+off-heap (`BufferAllocator`/`ArrowBuf`), so this was never a storage
+problem — it's a processing-code problem: a join's output-materialization
+loop runs once per column *per matched pair* (multiplied by fan-out), and
+both operators retain boxed group/join keys in a map for the whole
+operation. This was identified and designed deliberately, before it
+became a real incident, not discovered as a bug report. Scoped
+intentionally to single-column primitive-typed keys only — composite
+(multi-column) keys and `VARCHAR` keys stay on the original boxed path
+unchanged (a different, higher-risk algorithm and a different mechanism,
+respectively — not smaller versions of this fix).
+
+**What actually shipped:**
+1. **Output-copy fix (`copyValue`), both operators** — the output
+   row-materialization loop now does a direct primitive `get`/`setSafe`
+   per column, never constructing an `Object`. Pure internal change, no
+   behavior difference.
+2. **Single-column primitive fast path, both operators** — a single
+   `IntVector`/`BigIntVector`/`Float4Vector`/`Float8Vector`/`BitVector`/
+   `TimeStampMicroVector` group-by or join key is now hashed as a raw
+   `long` (float/double via `Double.doubleToLongBits`) instead of a
+   per-row boxed `List<Object>` tuple. `AggregateOperator` buckets by a
+   plain `Map<Long, Integer>` (one boxed `Long` per *distinct group*, not
+   per row). `HashJoinOperator` buckets by `Map<Long, List<Integer>>`
+   (one boxed `Long` per *distinct key*, not per row).
+3. **NULL semantics preserved correctly on the fast path** — a join row
+   with a null key still never matches anything (unchanged). A `GROUP BY`
+   still puts every null-keyed row into one shared group (SQL semantics,
+   unchanged) — handled via a dedicated side accumulator, since there's
+   no safe `long` sentinel for null that can't collide with a real value.
+
+**A real dead end worth recording, not hiding.** The first implementation
+used a hand-rolled, open-addressed `long -> List<Integer>` table
+(`LongKeyMultimap`) for *both* operators, reasoning that avoiding
+`java.util.HashMap`'s own boxed-key overhead would compound the win. A
+benchmark (below) proved this backwards for the join: at 1M/5M rows, the
+hand-rolled table was **slower** than the original boxed baseline (815ms
+→ 1,225ms at 1M; 3,946ms → 5,802ms at 5M), even after catching and fixing
+an actual bug in it (`% capacity` instead of a bitmask, despite capacity
+always being a power of two). Isolating the two changes (output-copy fix
+alone, fast path disabled) showed the output-copy fix alone *beat* the
+baseline (574ms at 1M) — the hand-rolled hash table itself was the
+regression, not the boxing-avoidance idea. `java.util.HashMap`'s own
+internals simply beat a quickly hand-rolled open-addressing table at
+these row counts, by more than the cost of boxing one `Long` per
+distinct key. `AggregateOperator`'s fast path never hit this problem
+because it was already written against a plain `Map<Long, Integer>`
+from the start. **Fix: deleted `LongKeyMultimap` entirely, replaced
+`HashJoinOperator`'s build index with `Map<Long, List<Integer>>`** — the
+same pattern that was already working in `AggregateOperator`. Lesson
+worth keeping: don't assume a hand-rolled data structure beats the
+standard library without measuring — it didn't, here.
+
+**Benchmark** (`labukdb-core/src/test/java/.../execution/OperatorBenchmark.java`,
+hand-run, not part of `mvn test` — single-shot JVM runs, no JMH warmup
+iterations, so treat as directional, not precise; join case is a 1:1
+unique-key join to isolate key-lookup cost from fan-out):
+
+| Scenario | Baseline | After fix (first run) | After fix (repeat runs) |
+|---|---|---|---|
+| Aggregate, 100K rows / 10K groups | 142 ms | 91–114 ms | 73–173 ms |
+| Aggregate, 1M rows / 100K groups | 521 ms | 338–477 ms | 567–580 ms |
+| Aggregate, 5M rows / 500K groups | 1,432 ms | 987–1,270 ms | 1,105–1,237 ms |
+| Join, 100K rows (1:1) | 92 ms | 95–106 ms | 91–129 ms |
+| Join, 1M rows (1:1) | 815 ms | 381–453 ms | 453–491 ms |
+| Join, 5M rows (1:1) | 3,946 ms | 1,414–1,623 ms | 1,623–1,815 ms |
+
+Honest read: the join win is large and consistent across every repeat
+run (always well under half the baseline at 1M/5M). The aggregate win is
+real but noisier run-to-run — likely more sensitive to JIT
+warmup/GC timing at this measurement's single-shot granularity, not a
+sign the fix is ineffective (every run still beat or matched baseline at
+1M/5M; the 100K case is too fast to read much into either way). A proper
+JMH run with multiple warmup iterations would tighten this if it matters
+later — not done here, since the directional result was already clear
+enough to act on.
+
+Full regression: 319 tests (226→228 core, others unchanged), 0
+failures/errors, 40 skipped. Manually verified unchanged output via
+`bin/labukdb query --sql "SELECT a.service, b.region FROM orders a JOIN
+customers b ON a.customer_id = b.id"` against the existing local
+`orders`/`customers` fixtures.
 
 ---
 
