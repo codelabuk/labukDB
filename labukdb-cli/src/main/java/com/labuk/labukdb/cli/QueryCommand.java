@@ -2,11 +2,13 @@ package com.labuk.labukdb.cli;
 
 import com.labuk.labukdb.core.catalog.TableCatalog;
 import com.labuk.labukdb.core.decode.ParquetToArrowReader;
+import com.labuk.labukdb.core.execution.AggregateOperator;
 import com.labuk.labukdb.core.execution.AggregateSpec;
 import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.HashJoinOperator;
 import com.labuk.labukdb.core.execution.SortKey;
+import com.labuk.labukdb.core.execution.SortLimitOperator;
 import com.labuk.labukdb.core.format.DataFileRef;
 import com.labuk.labukdb.core.format.DeltaTableFormat;
 import com.labuk.labukdb.core.format.DetectedFormat;
@@ -212,12 +214,19 @@ final class QueryCommand {
      * file and concatenate" — a join inherently needs to see every row
      * of both sides anyway, the same assumption {@code GROUP BY}/
      * {@code ORDER BY} already make), then {@link HashJoinOperator}
-     * combines them. The final {@code SELECT} list (already the
-     * alias-qualified names {@code HashJoinOperator}'s own output uses,
-     * e.g. {@code "a.service"}) selects the printed columns via a
-     * zero-copy {@link VectorSchemaRoot} view over the combined root's
-     * own vectors — never closed itself, since it shares (not copies)
-     * the combined root's buffers; only the combined root owns them.
+     * combines them.
+     *
+     * Increment 2 adds optional {@code GROUP BY}/aggregates/{@code ORDER
+     * BY}/{@code LIMIT} on top of the joined result — the exact same
+     * {@code AggregateOperator}/{@code SortLimitOperator} calls {@link
+     * CombinedQueryExecutor#execute} already makes for the single-table
+     * path, just applied here to the join's combined output instead.
+     * When nothing aggregated, the final {@code SELECT} list (already
+     * the alias-qualified names {@code HashJoinOperator}'s own output
+     * uses, e.g. {@code "a.service"}) selects the printed columns via a
+     * zero-copy {@link VectorSchemaRoot} view over the last root's own
+     * vectors — never closed itself, since it shares (not copies) that
+     * root's buffers, which the surrounding {@code finally} closes.
      */
     private static void runSqlJoin(SqlQuery query, LogicalPlan plan, TableCatalog catalog, CliArgs parsed,
                                      BufferAllocator allocator) throws Exception {
@@ -247,16 +256,43 @@ final class QueryCommand {
              VectorSchemaRoot rightRoot = new CombinedQueryExecutor().execute(execution.right().files(),
                      execution.right().columns(), List.of(), List.of(), List.of(), -1, allocator)) {
 
-            try (VectorSchemaRoot combined = new HashJoinOperator().innerJoin(
+            // Can't stay a single try-with-resources on one fixed variable --
+            // SQL engine Phase 3 increment 2's optional aggregate/sort steps
+            // each produce a fresh root, so this follows the same
+            // nullable-local-plus-finally idiom CombinedQueryExecutor.execute
+            // already uses, to guarantee every intermediate root still closes.
+            VectorSchemaRoot current = new HashJoinOperator().innerJoin(
                     leftRoot, execution.leftKeys(), join.leftAlias(),
-                    rightRoot, execution.rightKeys(), join.rightAlias(), allocator)) {
+                    rightRoot, execution.rightKeys(), join.rightAlias(), allocator);
+            try {
+                if (execution.aggregate() != null) {
+                    VectorSchemaRoot aggregated = new AggregateOperator().aggregate(
+                            List.of(current), execution.aggregate().groupByColumns(),
+                            execution.aggregate().aggregates(), allocator);
+                    current.close();
+                    current = aggregated;
+                }
+                if (execution.sort() != null || execution.limit() != null) {
+                    List<SortKey> sortKeys = execution.sort() != null ? execution.sort().sortKeys() : List.of();
+                    long limitValue = execution.limit() != null ? execution.limit().limit() : -1;
+                    VectorSchemaRoot sorted = new SortLimitOperator().sortAndLimit(current, sortKeys, limitValue, allocator);
+                    current.close();
+                    current = sorted;
+                }
 
-                VectorSchemaRoot projected = new VectorSchemaRoot(
-                        query.columns().stream().map(combined::getVector).toList());
-                printHeader(projected);
-                printRows(projected, projected.getRowCount());
+                // An aggregate's own output (groupByColumns ++ aggregate
+                // outputs) is already the final shape -- same reasoning as
+                // the single-table path, so this zero-copy trim only runs
+                // when nothing aggregated the join's wider combined columns.
+                VectorSchemaRoot toPrint = execution.aggregate() == null
+                        ? new VectorSchemaRoot(query.columns().stream().map(current::getVector).toList())
+                        : current;
+                printHeader(toPrint);
+                printRows(toPrint, toPrint.getRowCount());
                 System.out.println();
-                System.out.println(projected.getRowCount() + " row(s)");
+                System.out.println(toPrint.getRowCount() + " row(s)");
+            } finally {
+                current.close();
             }
         }
     }

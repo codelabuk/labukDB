@@ -98,6 +98,39 @@ class LogicalPlanBuilderTest {
         assertInstanceOf(TableScan.class, join.right());
     }
 
+    /** SQL engine Phase 3, increment 2: {@code Project(Aggregate(Join(...)))}. */
+    @Test
+    void innerJoinWithGroupByAndAggregate_wrapsAggregateDirectlyOnJoin() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.region, SUM(b.amount) AS total FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id GROUP BY a.region");
+        LogicalPlan plan = LogicalPlanBuilder.build(query);
+
+        Project project = assertInstanceOf(Project.class, plan);
+        assertEquals(List.of(), project.columns());
+        Aggregate aggregate = assertInstanceOf(Aggregate.class, project.input());
+        assertEquals(List.of("a.region"), aggregate.groupByColumns());
+        assertEquals(1, aggregate.aggregates().size());
+        assertInstanceOf(Join.class, aggregate.input());
+    }
+
+    /** SQL engine Phase 3, increment 2: {@code Project(Limit(Sort(Join(...))))}. */
+    @Test
+    void innerJoinWithOrderByAndLimit_wrapsLimitOverSortOverJoin() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.service, b.region FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id ORDER BY b.region DESC LIMIT 5");
+        LogicalPlan plan = LogicalPlanBuilder.build(query);
+
+        Project project = assertInstanceOf(Project.class, plan);
+        assertEquals(List.of("a.service", "b.region"), project.columns());
+        Limit limit = assertInstanceOf(Limit.class, project.input());
+        assertEquals(5, limit.limit());
+        Sort sort = assertInstanceOf(Sort.class, limit.input());
+        assertEquals(List.of(new com.labuk.labukdb.core.execution.SortKey("b.region", false)), sort.sortKeys());
+        assertInstanceOf(Join.class, sort.input());
+    }
+
     @Test
     void everyClauseCombined_nestsInTheExpectedOrder() {
         SqlQuery query = SqlQueryTranslator.translate(

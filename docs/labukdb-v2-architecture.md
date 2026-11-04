@@ -1863,6 +1863,92 @@ customers b ON a.customer_id = b.id"` against the existing local
 
 ---
 
+## Update — SQL engine architecture: Phase 3, increment 2 (JOIN + GROUP BY/ORDER BY/LIMIT)
+
+Increment 1 shipped a real two-table `INNER` equi-join but explicitly
+rejected combining it with `GROUP BY`/aggregates/`ORDER BY`/`LIMIT`.
+This increment removes that rejection — chosen over the other three
+increment-2 candidates (LEFT/RIGHT/FULL joins, 3+-way joins, cost-based
+join-side selection) because it reuses `AggregateOperator`/
+`SortLimitOperator` completely unchanged on the join's combined output,
+rather than needing new execution logic.
+
+**Key insight that kept this scoped:** `SqlQuery`'s record already has
+top-level `groupByColumns`/`aggregates`/`orderBy`/`limit` fields
+regardless of whether `join` is set — increment 1 just always forced
+them empty for a join query. No new fields were needed anywhere; this
+was about *populating* those existing fields and composing `Aggregate`/
+`Sort`/`Limit` above `Join` exactly the way `LogicalPlanBuilder.build()`
+already composes them above a single-table `TableScan`. The one real
+wrinkle: once a join's output columns are alias-qualified (`a.region`,
+`b.amount` — `HashJoinOperator`'s own naming), `GROUP BY`/`ORDER BY`
+columns and an aggregate's column argument must also be qualified, the
+same requirement increment 1 already enforces for `SELECT`/`WHERE`/`ON`.
+
+**A real pre-existing bug found and fixed along the way, not introduced
+by this increment:** `PushProjectIntoScan.apply()`'s special case for
+keeping the outer `Project` only recognized a *bare* `Join` as the
+rewritten input (`rewrittenInput instanceof Join`) — exactly increment
+1's shape, `Project(Join(...))`. Once `Sort`/`Limit` can sit between
+`Project` and `Join` (this increment's `Project(Limit(Sort(Join(...))))`
+shape, for a join + `ORDER BY`/`LIMIT` query with no `GROUP BY`), that
+check silently failed and `Project` was eliminated — which is wrong,
+because without an `Aggregate`, the join's full combined columns are
+still wider than the real `SELECT` list (column pruning is deliberately
+not pushed across the join boundary), so `Project` must survive to do
+that final trim regardless of how deep the `Join` sits. Fixed with a
+`containsJoin` helper that recurses through `Filter`/`Aggregate`/
+`Sort`/`Limit`, keeping `Project` whenever `aggregate == null &&
+containsJoin(rewrittenInput)`. Caught by a new, direct regression test
+(`PushProjectIntoScanTest.joinWithOrderByAndLimit_keepsProjectEvenThough
+JoinIsNotTheImmediateChild`) before it ever reached integration-test
+level — this is exactly the kind of thing a full read-through-before-
+design catches that implementation-first wouldn't have.
+
+**What changed:** `SqlQueryTranslator.translateJoin` no longer rejects
+`GROUP BY`/aggregates/`ORDER BY`/`LIMIT`, parses them the same way the
+non-join path does (loop shape copied, not re-invented) with every
+column routed through a new `requireQualifiedColumnName` check;
+`LogicalPlanBuilder.buildJoin` wraps `Join` with `Aggregate`/`Sort`/
+`Limit` mirroring `build()`'s own tail; `LogicalPlanExecutor.findJoin`
+generalized from Project-only recursion to also recurse through
+`Limit`/`Sort`/`Aggregate`/`Filter`; `findAggregate`/`findSort`/
+`findLimit` gained a `Project` case (needed now that `Project` can
+survive above a join); `JoinExecution` gained nullable `aggregate`/
+`sort`/`limit` fields mirroring `ResolvedScan`'s own shape;
+`QueryCommand.runSqlJoin` now applies the same optional aggregate-then-
+sort/limit sequence `CombinedQueryExecutor.execute` already applies for
+the single-table path, just on the join's combined output — switched
+from a single try-with-resources to the same nullable-local-plus-
+finally idiom `CombinedQueryExecutor.execute` uses, since the root can
+now be reassigned multiple times (aggregate, then sort/limit, each
+producing a fresh root to close).
+
+Still not supported, unchanged from increment 1: `LEFT`/`RIGHT`/`FULL`
+joins, non-equi join conditions, 3+-way joins, cost-based build/probe
+side selection, subqueries. Column pruning is still not pushed across
+the join boundary.
+
+Verified with 9 new/changed tests: `SqlQueryTranslatorTest` (a join +
+`GROUP BY` + aggregate parses correctly with qualified names; a join +
+`ORDER BY`/`LIMIT` parses correctly; unqualified `GROUP BY`/`ORDER BY`
+columns with a join still rejected — the old single rejection test
+replaced since the behavior it asserted is no longer a rejection),
+`LogicalPlanBuilderTest` (+2, the two new tree shapes), `PushProjectInto
+ScanTest` (+2, the bug-fix regression test and an aggregate+join
+regression guard confirming `Project` still eliminates correctly there),
+`QueryCommandSqlJoinIntegrationTest` (+2, real end-to-end `GROUP BY` and
+`ORDER BY`/`LIMIT` queries against local Delta fixtures, including a
+multi-row-per-group case — two orders for one customer combining into
+one aggregated group, not a 1-row-per-group coincidence). Full
+regression: 328 tests, 0 failures/errors, 40 skipped — zero regressions.
+Manually verified via `bin/labukdb query --sql` against the existing
+local `orders`/`customers` fixtures: a real `GROUP BY` query (`COUNT`
+per region, orphan `customer_id` correctly excluded before aggregation)
+and a real `ORDER BY ... DESC LIMIT 1` query (correct top row selected).
+
+---
+
 *This document and its diagrams describe a plan, not current behavior.
 Update both the `.puml` source and this file together as the design
 changes — don't let them drift the way `ARCHITECTURE.md` briefly did

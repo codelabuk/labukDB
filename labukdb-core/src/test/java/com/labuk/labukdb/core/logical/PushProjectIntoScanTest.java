@@ -53,4 +53,45 @@ class PushProjectIntoScanTest {
         LogicalPlan plan = new TableScan("logs", null, List.of("amount"));
         assertSame(plan, new PushProjectIntoScan().apply(plan));
     }
+
+    /**
+     * SQL engine Phase 3, increment 2 -- the real bug this increment found
+     * and fixed: without an Aggregate present, Project must survive no
+     * matter how deep the Join sits (Sort/Limit between Project and Join),
+     * since the join's combined columns are still wider than the real
+     * SELECT list. Before the fix, this exact shape silently eliminated
+     * Project because the old check only recognized a *bare* Join child.
+     */
+    @Test
+    void joinWithOrderByAndLimit_keepsProjectEvenThoughJoinIsNotTheImmediateChild() {
+        LogicalPlan join = new Join(new TableScan("orders", null, null), new TableScan("customers", null, null),
+                List.of(new JoinKey("customer_id", "id")));
+        LogicalPlan plan = new Project(
+                new Limit(new Sort(join, List.of(new SortKey("b.region", false))), 5),
+                List.of("a.service", "b.region"));
+
+        LogicalPlan result = new PushProjectIntoScan().apply(plan);
+
+        Project project = assertInstanceOf(Project.class, result, "Project must survive -- the join's combined "
+                + "columns are still wider than the real SELECT list");
+        assertEquals(List.of("a.service", "b.region"), project.columns());
+        Limit limit = assertInstanceOf(Limit.class, project.input());
+        Sort sort = assertInstanceOf(Sort.class, limit.input());
+        assertSame(join, sort.input(), "the Join itself is untouched -- column pruning still isn't pushed across it");
+    }
+
+    /** Join + Aggregate: Project is still eliminated, same as the no-join aggregate case -- Aggregate's own output is already the final shape. */
+    @Test
+    void joinWithGroupByAndAggregate_stillEliminatesProject() {
+        LogicalPlan join = new Join(new TableScan("orders", null, null), new TableScan("customers", null, null),
+                List.of(new JoinKey("customer_id", "id")));
+        LogicalPlan plan = new Project(
+                new Aggregate(join, List.of("a.region"), List.of(new AggregateSpec("b.amount", AggregateFunction.SUM, "total"))),
+                List.of()); // SqlQueryTranslator leaves columns() empty once aggregating, join or not
+
+        LogicalPlan result = new PushProjectIntoScan().apply(plan);
+
+        Aggregate aggregate = assertInstanceOf(Aggregate.class, result, "Project must be eliminated once Aggregate is present, even with a Join underneath");
+        assertSame(join, aggregate.input(), "the Join itself is untouched");
+    }
 }

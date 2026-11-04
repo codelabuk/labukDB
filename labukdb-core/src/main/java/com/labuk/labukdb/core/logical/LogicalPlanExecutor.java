@@ -79,7 +79,11 @@ public final class LogicalPlanExecutor {
             rightKeys.add(key.rightColumn());
         }
 
-        return new JoinExecution(leftResolved, rightResolved, leftKeys, rightKeys);
+        Aggregate aggregate = findAggregate(optimizedPlan);
+        Sort sort = findSort(optimizedPlan);
+        Limit limit = findLimit(optimizedPlan);
+
+        return new JoinExecution(leftResolved, rightResolved, leftKeys, rightKeys, aggregate, sort, limit);
     }
 
     /** One side's independently-resolved scan — shared building block for both {@link #resolve} and {@link #resolveJoin}. */
@@ -122,6 +126,12 @@ public final class LogicalPlanExecutor {
         throw new IllegalStateException("No TableScan found in plan: " + plan);
     }
 
+    /**
+     * SQL engine Phase 3, increment 2: generalized from Project-only to
+     * recurse through Limit/Sort/Aggregate/Filter too, since a Join may
+     * now be wrapped in any combination of those (join + GROUP BY/
+     * aggregates/ORDER BY/LIMIT).
+     */
     private Join findJoin(LogicalPlan plan) {
         if (plan instanceof Join join) {
             return join;
@@ -129,12 +139,27 @@ public final class LogicalPlanExecutor {
         if (plan instanceof Project project) {
             return findJoin(project.input());
         }
+        if (plan instanceof Limit limit) {
+            return findJoin(limit.input());
+        }
+        if (plan instanceof Sort sort) {
+            return findJoin(sort.input());
+        }
+        if (plan instanceof Aggregate aggregate) {
+            return findJoin(aggregate.input());
+        }
+        if (plan instanceof Filter filter) {
+            return findJoin(filter.input());
+        }
         throw new IllegalStateException("No Join found in plan: " + plan);
     }
 
     private Aggregate findAggregate(LogicalPlan plan) {
         if (plan instanceof Aggregate aggregate) {
             return aggregate;
+        }
+        if (plan instanceof Project project) {
+            return findAggregate(project.input());
         }
         if (plan instanceof Filter filter) {
             return findAggregate(filter.input());
@@ -152,6 +177,9 @@ public final class LogicalPlanExecutor {
         if (plan instanceof Sort sort) {
             return sort;
         }
+        if (plan instanceof Project project) {
+            return findSort(project.input());
+        }
         if (plan instanceof Filter filter) {
             return findSort(filter.input());
         }
@@ -167,6 +195,9 @@ public final class LogicalPlanExecutor {
     private Limit findLimit(LogicalPlan plan) {
         if (plan instanceof Limit limit) {
             return limit;
+        }
+        if (plan instanceof Project project) {
+            return findLimit(project.input());
         }
         if (plan instanceof Filter filter) {
             return findLimit(filter.input());

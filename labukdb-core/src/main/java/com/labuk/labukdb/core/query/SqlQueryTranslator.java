@@ -73,9 +73,14 @@ import java.util.Set;
  * only (no {@code LEFT}/{@code RIGHT}/{@code FULL}/{@code CROSS}),
  * {@code ON} must be one or more {@code AND}-combined column-to-column
  * equalities (no non-equi conditions), every column referenced anywhere
- * ({@code SELECT}/{@code WHERE}/{@code ON}) must be table-qualified, and
- * {@code GROUP BY}/aggregates/{@code ORDER BY}/{@code LIMIT} combined
- * with a join are rejected (not yet supported together). {@code WHERE}
+ * ({@code SELECT}/{@code WHERE}/{@code ON}/{@code GROUP BY}/{@code ORDER BY}/
+ * an aggregate's column argument) must be table-qualified. {@code GROUP BY}/
+ * aggregates/{@code ORDER BY}/{@code LIMIT} combined with a join (SQL
+ * engine Phase 3, increment 2) run exactly like the single-table path —
+ * {@code AggregateOperator}/{@code SortLimitOperator} on the join's
+ * combined output, unchanged — still no {@code LEFT}/{@code RIGHT}/
+ * {@code FULL}, no 3+-way joins, no cost-based join-side selection.
+ * {@code WHERE}
  * must be per-side-splittable — each top-level {@code AND}-ed condition
  * must reference columns from exactly one of the two joined tables; a
  * condition spanning both belongs in {@code JOIN ... ON}, not
@@ -194,27 +199,54 @@ public final class SqlQueryTranslator {
                     "JOIN's right side must be a plain table reference, not a subquery: " + join.getRightItem());
         }
 
-        if (plainSelect.getGroupBy() != null
-                || (plainSelect.getOrderByElements() != null && !plainSelect.getOrderByElements().isEmpty())
-                || plainSelect.getLimit() != null
-                || hasAggregateSelectItem(plainSelect)) {
-            throw new IllegalArgumentException(
-                    "GROUP BY/aggregates/ORDER BY/LIMIT combined with JOIN is not supported yet");
-        }
-
         String leftAlias = aliasOrName(leftTable);
         String rightAlias = aliasOrName(rightTable);
 
         List<String> joinColumns = new ArrayList<>();
+        List<AggregateSpec> aggregates = new ArrayList<>();
         for (SelectItem<?> item : plainSelect.getSelectItems()) {
             Expression expr = item.getExpression();
-            if (!(expr instanceof Column column) || column.getTable() == null) {
-                throw new IllegalArgumentException(
-                        "Every SELECT column must be table-qualified when JOIN is present, e.g. "
-                                + leftAlias + ".col: " + expr);
+            if (expr instanceof Column column) {
+                joinColumns.add(requireQualifiedColumnName(column, leftAlias, rightAlias));
+            } else if (expr instanceof Function function) {
+                aggregates.add(toJoinAggregateSpec(function, item, leftAlias, rightAlias));
+            } else {
+                throw new IllegalArgumentException("Unsupported SELECT item (only plain columns and "
+                        + "aggregate functions are supported): " + expr);
             }
-            joinColumns.add(column.getFullyQualifiedName());
         }
+
+        List<String> groupByColumns = new ArrayList<>();
+        if (plainSelect.getGroupBy() != null) {
+            for (Object raw : plainSelect.getGroupBy().getGroupByExpressions()) {
+                if (!(raw instanceof Column column)) {
+                    throw new IllegalArgumentException("GROUP BY only supports plain columns: " + raw);
+                }
+                groupByColumns.add(requireQualifiedColumnName(column, leftAlias, rightAlias));
+            }
+        }
+
+        List<SortKey> orderBy = new ArrayList<>();
+        if (plainSelect.getOrderByElements() != null) {
+            for (OrderByElement element : plainSelect.getOrderByElements()) {
+                Expression expr = element.getExpression();
+                if (!(expr instanceof Column column)) {
+                    throw new IllegalArgumentException("ORDER BY only supports plain columns, not expressions: " + expr);
+                }
+                orderBy.add(new SortKey(requireQualifiedColumnName(column, leftAlias, rightAlias), element.isAsc()));
+            }
+        }
+
+        long limit = -1;
+        if (plainSelect.getLimit() != null && plainSelect.getLimit().getRowCount() != null) {
+            limit = longLiteral(plainSelect.getLimit().getRowCount());
+        }
+
+        // Same "effective columns" convention the non-join path already uses:
+        // once GROUP BY/aggregates are present, AggregateOperator's own output
+        // shape (groupByColumns ++ aggregate outputs) is the real final shape,
+        // so the plain SELECT columns collected above are irrelevant.
+        List<String> effectiveColumns = (groupByColumns.isEmpty() && aggregates.isEmpty()) ? joinColumns : List.of();
 
         List<SqlQuery.JoinKeyPair> keys = toJoinKeys(join.getOnExpression(), leftAlias, rightAlias);
 
@@ -228,16 +260,46 @@ public final class SqlQueryTranslator {
 
         SqlQuery.JoinClause joinClause = new SqlQuery.JoinClause(
                 leftAlias, rightTable.getName(), rightAlias, keys, leftPredicate, rightPredicate);
-        return new SqlQuery(leftTable.getName(), joinColumns, null, List.of(), List.of(), List.of(), -1, joinClause);
+        return new SqlQuery(leftTable.getName(), effectiveColumns, null, groupByColumns, aggregates, orderBy, limit, joinClause);
     }
 
-    private static boolean hasAggregateSelectItem(PlainSelect plainSelect) {
-        for (SelectItem<?> item : plainSelect.getSelectItems()) {
-            if (item.getExpression() instanceof Function) {
-                return true;
-            }
+    /** Same qualification rule {@link #toJoinKeys}/{@link #collectColumnTables} already enforce for ON/WHERE, reused for SELECT/GROUP BY/ORDER BY. */
+    private static String requireQualifiedColumnName(Column column, String leftAlias, String rightAlias) {
+        if (column.getTable() == null) {
+            throw new IllegalArgumentException(
+                    "Every column must be table-qualified when JOIN is present, e.g. "
+                            + leftAlias + ".col: " + column);
         }
-        return false;
+        String side = column.getTable().getName();
+        if (!leftAlias.equals(side) && !rightAlias.equals(side)) {
+            throw new IllegalArgumentException("Column's table qualifier '" + side
+                    + "' doesn't match either joined table (" + leftAlias + ", " + rightAlias + "): " + column);
+        }
+        return column.getFullyQualifiedName();
+    }
+
+    /** Same as {@link #toAggregateSpec}, except its column argument must be table-qualified (a join's combined output is alias-qualified). */
+    private static AggregateSpec toJoinAggregateSpec(Function function, SelectItem<?> item, String leftAlias, String rightAlias) {
+        if (item.getAlias() == null) {
+            throw new IllegalArgumentException("Aggregate function requires an alias, e.g. "
+                    + function.getName() + "(col) AS name: " + function);
+        }
+        AggregateFunction aggFunction;
+        try {
+            aggFunction = AggregateFunction.valueOf(function.getName().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException("Unsupported aggregate function '" + function.getName()
+                    + "' -- supported: SUM, COUNT, MIN, MAX, AVG");
+        }
+        ExpressionList<?> params = function.getParameters();
+        if (function.isAllColumns() || (params != null && params.size() == 1 && params.get(0) instanceof AllColumns)) {
+            throw new IllegalArgumentException(aggFunction + "(*) is not supported -- "
+                    + aggFunction + "(column) counts non-null values of that column instead, matching SQL COUNT(column) semantics");
+        }
+        if (params == null || params.size() != 1 || !(params.get(0) instanceof Column column)) {
+            throw new IllegalArgumentException(aggFunction + " requires exactly one plain column argument: " + function);
+        }
+        return new AggregateSpec(requireQualifiedColumnName(column, leftAlias, rightAlias), aggFunction, item.getUnquotedAliasName());
     }
 
     private static String aliasOrName(Table table) {

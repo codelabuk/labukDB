@@ -218,12 +218,46 @@ class SqlQueryTranslatorTest {
         assertTrue(thrown.getMessage().contains("ON"), thrown.getMessage());
     }
 
+    /** SQL engine Phase 3, increment 2: GROUP BY/aggregates combined with a JOIN is now supported. */
     @Test
-    void groupByCombinedWithJoin_rejectedWithClearError() {
+    void joinWithGroupByAndAggregate_parsesCorrectlyWithQualifiedColumns() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.region, SUM(b.amount) AS total FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id GROUP BY a.region");
+
+        assertNotNull(query.join());
+        assertEquals(List.of(), query.columns(), "plain SELECT columns are irrelevant once GROUP BY is present");
+        assertEquals(List.of("a.region"), query.groupByColumns());
+        assertEquals(List.of(new AggregateSpec("b.amount", AggregateFunction.SUM, "total")), query.aggregates());
+    }
+
+    /** SQL engine Phase 3, increment 2: ORDER BY/LIMIT combined with a JOIN (no GROUP BY) is now supported. */
+    @Test
+    void joinWithOrderByAndLimit_parsesCorrectlyWithQualifiedColumns() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.service, b.region FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id ORDER BY b.region DESC LIMIT 5");
+
+        assertNotNull(query.join());
+        assertEquals(List.of("a.service", "b.region"), query.columns());
+        assertEquals(List.of(new SortKey("b.region", false)), query.orderBy());
+        assertEquals(5L, query.limit());
+    }
+
+    @Test
+    void unqualifiedGroupByColumnWithJoin_rejectedWithClearError() {
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
                 () -> SqlQueryTranslator.translate(
-                        "SELECT a.level, COUNT(a.x) AS cnt FROM a JOIN b ON a.id = b.id GROUP BY a.level"));
-        assertTrue(thrown.getMessage().contains("JOIN"), thrown.getMessage());
+                        "SELECT a.region, SUM(a.x) AS total FROM a JOIN b ON a.id = b.id GROUP BY region"));
+        assertTrue(thrown.getMessage().contains("qualified"), thrown.getMessage());
+    }
+
+    @Test
+    void unqualifiedOrderByColumnWithJoin_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY x"));
+        assertTrue(thrown.getMessage().contains("qualified"), thrown.getMessage());
     }
 
     @Test

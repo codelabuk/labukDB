@@ -64,6 +64,19 @@ public final class LogicalPlanBuilder {
             keys.add(new JoinKey(pair.leftColumn(), pair.rightColumn()));
         }
 
-        return new Project(new Join(left, right, keys), query.columns());
+        // SQL engine Phase 3, increment 2: wraps Join exactly the way build()
+        // above wraps a single-table TableScan -- AggregateOperator/
+        // SortLimitOperator run on the join's combined output unchanged.
+        LogicalPlan plan = new Join(left, right, keys);
+        if (!query.groupByColumns().isEmpty() || !query.aggregates().isEmpty()) {
+            plan = new Aggregate(plan, query.groupByColumns(), query.aggregates());
+        }
+        if (!query.orderBy().isEmpty()) {
+            plan = new Sort(plan, query.orderBy());
+        }
+        if (query.limit() >= 0) {
+            plan = new Limit(plan, query.limit());
+        }
+        return new Project(plan, query.columns());
     }
 }

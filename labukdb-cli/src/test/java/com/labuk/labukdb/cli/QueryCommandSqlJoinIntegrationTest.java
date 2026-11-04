@@ -194,4 +194,77 @@ class QueryCommandSqlJoinIntegrationTest {
         assertTrue(output.contains("payments-svc | eu-west"), output);
         assertTrue(output.contains("2 row(s)"), output);
     }
+
+    /** orders variant with an amount column, customer_id 1 appearing twice -- real multi-row aggregation per group, not a 1-row-per-group coincidence. */
+    private void buildDeltaOrdersWithAmount(Path tableRoot) throws Exception {
+        Field customerId = new Field("customer_id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field service = new Field("service", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Schema schema = new Schema(List.of(customerId, service, amount));
+        TableLocation location = TableLocation.forLocal(tableRoot);
+        new TableCreator().createTable(location, schema, List.of(), null);
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = VectorSchemaRoot.create(schema, allocator)) {
+            batch.allocateNew();
+            BigIntVector idVector = (BigIntVector) batch.getVector("customer_id");
+            VarCharVector serviceVector = (VarCharVector) batch.getVector("service");
+            BigIntVector amountVector = (BigIntVector) batch.getVector("amount");
+            long[] ids = {1, 1, 2};
+            String[] services = {"auth-svc", "gateway-svc", "payments-svc"};
+            long[] amounts = {10, 30, 20};
+            for (int i = 0; i < ids.length; i++) {
+                idVector.setSafe(i, ids[i]);
+                serviceVector.setSafe(i, services[i].getBytes(StandardCharsets.UTF_8));
+                amountVector.setSafe(i, amounts[i]);
+            }
+            batch.setRowCount(ids.length);
+            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+        }
+    }
+
+    /** SQL engine Phase 3, increment 2: JOIN + GROUP BY + aggregate, end to end. */
+    @Test
+    void innerJoin_withGroupByAndAggregate_combinesAcrossMultipleRowsPerGroup(@TempDir Path root) throws Exception {
+        Path ordersRoot = root.resolve("orders");
+        Path customersRoot = root.resolve("customers");
+        buildDeltaOrdersWithAmount(ordersRoot);
+        buildDeltaCustomers(customersRoot);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersRoot.toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("customers", customersRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT b.region, SUM(a.amount) AS total FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id GROUP BY b.region"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("us-east | 40"), "customer_id=1's two orders (10+30) must combine into one us-east group: " + output);
+        assertTrue(output.contains("eu-west | 20"), output);
+        assertTrue(output.contains("2 row(s)"), output);
+    }
+
+    /** SQL engine Phase 3, increment 2: JOIN + ORDER BY + LIMIT (no GROUP BY), end to end. */
+    @Test
+    void innerJoin_withOrderByAndLimit_sortsAndCapsTheCombinedOutput(@TempDir Path root) throws Exception {
+        Path ordersRoot = root.resolve("orders");
+        Path customersRoot = root.resolve("customers");
+        buildDeltaOrdersWithAmount(ordersRoot);
+        buildDeltaCustomers(customersRoot);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersRoot.toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("customers", customersRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT a.service, b.region FROM orders a JOIN customers b "
+                        + "ON a.customer_id = b.id ORDER BY a.amount DESC LIMIT 2"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("2 row(s)"), output);
+        assertFalse(output.contains("auth-svc"), "amount=10 (lowest) must be cut by LIMIT 2: " + output);
+        int gatewayIndex = output.indexOf("gateway-svc"); // amount=30, highest
+        int paymentsIndex = output.indexOf("payments-svc"); // amount=20
+        assertTrue(gatewayIndex >= 0 && paymentsIndex >= 0, output);
+        assertTrue(gatewayIndex < paymentsIndex, "ORDER BY amount DESC must put gateway-svc (30) before payments-svc (20): " + output);
+    }
 }

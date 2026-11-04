@@ -65,10 +65,39 @@ public final class PushProjectIntoScan implements OptimizerRule {
         }
 
         LogicalPlan rewrittenInput = pushInto(project.input(), List.copyOf(needed));
-        if (rewrittenInput instanceof Join) {
+        if (aggregate == null && containsJoin(rewrittenInput)) {
             return new Project(rewrittenInput, project.columns());
         }
         return rewrittenInput;
+    }
+
+    /**
+     * SQL engine Phase 3, increment 2: generalizes increment 1's bare-{@code
+     * Join} check, which missed {@code Project(Limit(Sort(Join(...))))} --
+     * a join + {@code ORDER BY}/{@code LIMIT} (no {@code GROUP BY}) query,
+     * where {@code Sort}/{@code Limit} sit between {@code Project} and
+     * {@code Join}. Without an {@code Aggregate} present, the join's full
+     * combined columns are still wider than the real {@code SELECT} list
+     * (column pruning isn't pushed across the join boundary), so {@code
+     * Project} must survive regardless of how deep the {@code Join} sits.
+     */
+    private boolean containsJoin(LogicalPlan plan) {
+        if (plan instanceof Join) {
+            return true;
+        }
+        if (plan instanceof Filter filter) {
+            return containsJoin(filter.input());
+        }
+        if (plan instanceof Aggregate aggregate) {
+            return containsJoin(aggregate.input());
+        }
+        if (plan instanceof Sort sort) {
+            return containsJoin(sort.input());
+        }
+        if (plan instanceof Limit limit) {
+            return containsJoin(limit.input());
+        }
+        return false;
     }
 
     private LogicalPlan pushInto(LogicalPlan plan, List<String> columns) {
