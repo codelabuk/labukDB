@@ -1,10 +1,13 @@
-# labukDB
+<p align="center">
+  <img alt="labukDB" src="docs/images/labukdb-lockup-light.svg" width="420">
+</p>
 
-[![CI](https://github.com/codelabuk/lakehouse-flight/actions/workflows/ci.yml/badge.svg)](https://github.com/codelabuk/lakehouse-flight/actions)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+<h4 align="center">A from-scratch Delta Lake &amp; Iceberg database — reads and writes, embeddable or served over Apache Arrow Flight.</h4>
 
-**A from-scratch Delta Lake + Iceberg database — reads and writes, local
-or remote, embeddable or served over Apache Arrow Flight.**
+<p align="center">
+  <a href="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-14B8A6?style=for-the-badge"></a>
+</p>
 
 No `delta-rs`, no `delta-kernel`, no DuckDB/Spark in the path: the
 transaction log, pruning, Parquet encode/decode, and the write path
@@ -277,5 +280,5 @@ as references, not pulled in as dependencies:
 
 ---
 
-*Copyright 2026 Afzal and labukDB (lakehouse-flight) contributors.
+*Copyright 2026 Afzal and labukDB contributors.
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).*
