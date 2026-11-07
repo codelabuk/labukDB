@@ -5,48 +5,39 @@
 <h4 align="center">A from-scratch Delta Lake &amp; Iceberg database — reads and writes, embeddable or served over Apache Arrow Flight.</h4>
 
 <p align="center">
-  <a href="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/codelabuk/labukDB/ci.yml?style=for-the-badge&label=CI"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-14B8A6?style=for-the-badge"></a>
 </p>
 
-No `delta-rs`, no `delta-kernel`, no DuckDB/Spark in the path: the
-transaction log, pruning, Parquet encode/decode, and the write path
-(append, upsert/MERGE by key, compaction, vacuum, multi-writer
-concurrency, table creation) are all implemented here, one small and
-independently testable layer at a time. It stopped being read-only a
-while ago — append, upsert/MERGE, compaction, vacuum, multi-writer
-optimistic concurrency, and creating a brand-new table from nothing are
-all implemented, tested, and **live-verified against a real MinIO
-cluster**, not just a local-disk fixture. Every language with an Arrow
-Flight client binding — Python, Java, Go, Rust, JS — talks to it
-unmodified. `labukdb-core` has no Flight/gRPC dependency, so it embeds
-like DuckDB or runs as a server like Postgres.
+labukDB reads and writes both **Delta Lake** and **Apache Iceberg**
+tables, built from scratch against each format's real on-disk protocol
+— the transaction log, pruning, Parquet encode/decode, and the full
+write path (append, upsert/MERGE by key, compaction, vacuum, table
+creation, multi-writer concurrency), one small and independently
+testable layer at a time. Use it embedded, in-process, with no server
+(the DuckDB model), or run it as a standalone Arrow Flight server that
+any language with a Flight client binding — Python, Java, Go, Rust, JS —
+connects to unmodified (the Postgres model). A SQL layer sits on top of
+both formats, including a real two-table join.
 
-**What makes this worth looking at**, beyond "another Delta reader":
-real multi-writer correctness research, with the failures kept visible
-rather than papered over. A live stress test found this project's own
-remote commit path *silently loses writes* under genuine concurrency on
-a real (non-compliant) S3-compatible deployment — root-caused precisely,
-fixed with an opt-in external lock, and proven fixed against the same
-live cluster. A second stress test found Iceberg's own upstream
-`HadoopTables` writer has the *identical class* of bug, also root-caused
-down to the exact library code and the exact storage-layer assumption
-that doesn't hold on object storage. Both findings, and the fixes, are
-documented in full in `docs/ARCHITECTURE.md`'s concurrency section —
-not papered over.
+Writes aren't a demo feature: append, upsert/MERGE, compaction, vacuum,
+multi-writer optimistic concurrency, and creating a brand-new table from
+nothing are all implemented, tested, and **live-verified against a real
+MinIO cluster**, not just a local-disk fixture.
 
-Companion project to `local-lakehouse-lab` (not part of it): that project
-is a Spark/Flink + DuckDB stack. This one is the from-scratch story —
-reading and writing the same `_delta_log` + Parquet format with its own
-log parsing, pruning, encode/decode, and write path, to understand the
-mechanics end to end rather than delegate to an existing engine. Not a
-full SQL engine (`GROUP BY`/`ORDER BY`/`LIMIT`, a narrow SQL subset via
-CLI `--sql`, and now a basic two-table `INNER` equi-join are real; no
-`LEFT`/`RIGHT`/`FULL` joins, no subqueries) and not a Spark replacement
-— different scope, even though it now reads/writes real tables Spark can
-also read.
+**What makes this worth looking at**: real multi-writer correctness
+research, with the failures kept visible rather than papered over. A
+live stress test found this project's own remote commit path *silently
+loses writes* under genuine concurrency on a real (non-compliant)
+S3-compatible deployment — root-caused precisely, fixed with an opt-in
+external lock, and proven fixed against the same live cluster. A second
+stress test found Iceberg's own upstream `HadoopTables` writer has the
+*identical class* of bug, also root-caused down to the exact library
+code and the exact storage-layer assumption that doesn't hold on object
+storage. Both findings, and the fixes, are documented in full in
+`docs/ARCHITECTURE.md`'s concurrency section.
 
-For the full guided tour, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+For the full architecture, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 For every CLI flag, SQL subset, and Flight wire-format field, see
 **[docs/USAGE.md](docs/USAGE.md)**.
 
@@ -58,196 +49,18 @@ For every CLI flag, SQL subset, and Flight wire-format field, see
 mvn clean package          # runs tests too; add -DskipTests to skip them
 ```
 
-Produces `labukdb-cli/target/labukdb-cli.jar` (one file, every dependency
-bundled) and `labukdb-server-app/target/labukdb-server-app.jar` (the
-standalone Flight server).
+Produces `labukdb-cli/target/labukdb-cli.jar` and
+`labukdb-server-app/target/labukdb-server-app.jar` (the standalone
+Flight server), each a single file with every dependency bundled.
 
 ```
 bin/labukdb catalog add logs D:\repo\local-lakehouse-lab\lakehouse\logs_delta
-bin/labukdb catalog list
-bin/labukdb describe logs
-bin/labukdb query --table logs --filter "level=ERROR" --columns service,message --limit 10
-```
-
-(Windows: `bin\labukdb.bat ...`. Zip extraction on Windows won't preserve
-the executable bit on `bin/labukdb` — `chmod +x bin/labukdb` once in Git
-Bash, or just run the jar directly — `describe`/`query` need the same
-`--add-opens` flag the wrapper scripts already bake in: `java
---add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED
--jar labukdb-cli/target/labukdb-cli.jar ...`; `catalog` subcommands never
-touch Arrow memory and work without it, but it's harmless to always
-include.)
-
-Every subcommand accepts either a catalog name or a raw filesystem/URI
-path wherever a table is expected. Filter syntax: `=`, `!=`, `<`, `<=`,
-`>`, `>=`, `IN`, `LIKE` (SQL-style, `%`/`_`), `AND`/`OR` — no generic
-`NOT`, see `Predicate`'s javadoc for why that doesn't lose expressiveness.
-
-**Running the Flight server:**
-
-```
-java --add-opens=java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED \
-     -jar labukdb-server-app/target/labukdb-server-app.jar
-```
-
-(The `--add-opens` flag is needed because Arrow's off-heap memory library
-requires it on Java 9+; `mvn test` sets this automatically via Surefire's
-`argLine` — running the built jar directly needs it passed explicitly.)
-
----
-
-## Architecture at a glance
-
-```
-  Read:  Delta/Iceberg table → 1. log/ (resolve) → 2. planner/ (prune) → 3. decode/ (Parquet → Arrow) ─┐
-  Write: Delta table ← log/ (commit: append/MERGE/compact/vacuum/create) ← encode/ (Arrow → Parquet) ──┤
-                                                                                                          │
-                                              4. flight/  (DoGet / DoPut)  ←───────────────────────────┘
-                                                        │
-                        Python / Java / Go / Rust / JS / LLM / dashboards / MCP
-```
-
-| Area | Package | Job | Key types |
-|---|---|---|---|
-| Read | `log/` | Parse the commit log, resolve a snapshot at a version, timestamp, or `latest()`. Incrementally cached; falls back to checkpoints where available. | `CommitLogReader`, `SnapshotManager`, `CheckpointReader` |
-| Read | `planner/` | Decide which files can be skipped, without opening them, using partition values and file-level stats. Fail-open: anything it can't decide, it keeps. | `Predicate`, `PartitionPruner`, `FileStatsPruner`, `QueryPlanner` |
-| Read | `decode/` | Per surviving file: prune row groups via Parquet footer stats, decode only requested columns, apply the residual filter row-by-row, reconstruct partition columns as constants. Decode and filter are fused into one pass. | `RowGroupPruner`, `GroupPredicateEvaluator`, `ParquetToArrowReader` |
-| Write | `encode/` | Arrow → Parquet (the write mirror of `decode/`), and Arrow `Schema` → Delta's JSON `schemaString`. | `ArrowToParquetWriter`, `ArrowToDeltaSchema` |
-| Write | `log/` | Append, upsert/MERGE by key, compact, vacuum, create a table — atomic commits with multi-writer optimistic concurrency control. | `CommitWriter`, `WriteBuffer`, `TableMerger`, `Compactor`, `Vacuum`, `TableCreator`, `LockProvider` |
-| Both | `flight/` | Serve it. A plain scan returns one `FlightEndpoint` per file; a query with `groupBy`/`aggregates`/`orderBy`/`limit` returns one combined endpoint, decoded and run through `execution/` server-side. `DoPut` buffers and flushes writes. | `LabukDbFlightProducer`, `LabukDbServerApp` |
-| — | `execution/` | `GROUP BY` aggregation and `ORDER BY`/`LIMIT`, reachable via Flight's `DoGet` and usable standalone as a library. | `AggregateOperator`, `SortLimitOperator` |
-
-Supporting packages: `storage/` (local/S3/MinIO/ADLS location resolution,
-`LockProvider` configuration), `catalog/` (`TableCatalog` maps a short
-name to a table location, persisted to `~/.labukdb/catalog.json` — not
-Unity Catalog, doesn't try to be), `cli/` (the `labukdb` tool), `format/`
-(the `TableFormat` SPI Delta and
-Iceberg both implement, auto-detected by probing for `_delta_log/` vs.
-`metadata/`), `query/` (SQL text → the engine's own query structures, via
-`SqlQueryTranslator`).
-
-**Multi-module:** `labukdb-core` (everything above except `flight/`,
-embeddable like DuckDB), `labukdb-flight` (Flight serving),
-`labukdb-format-iceberg` (Iceberg support), `labukdb-server-app` (the
-runnable server jar), `labukdb-cli` (the `labukdb` binary). See
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
-the full module design and every write-path decision.
-
----
-
-## Usage
-
-Four ways to ask the same engine a question — see
-**[docs/USAGE.md](docs/USAGE.md)** for the full reference (every CLI
-flag, every `FlightQueryRequest`/`FlightWriteRequest` field, the
-embedded library's write path).
-
-**CLI, flag-based:**
-```
-bin/labukdb query --table logs --filter "level=ERROR" --columns service,message --limit 10
-```
-
-**CLI, SQL** — a real `SELECT`, parsed into the engine's own executed
-structures (`SELECT <col>|<AGGFUNC>(<col>) AS <alias> FROM <table> [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`;
-no `NOT`/joins/subqueries/`COUNT(*)`, rejected with a specific error, not
-silently mishandled):
-```
 bin/labukdb query --sql "SELECT level, COUNT(amount) AS cnt FROM logs GROUP BY level"
 ```
 
-**Flight, JSON request** — against a running server, JSON-encoded as a
-`FlightDescriptor`'s command bytes:
-```json
-{"table": "logs", "groupBy": ["level"],
- "aggregates": [{"function": "COUNT", "column": "amount", "outputName": "cnt"}],
- "orderBy": [{"column": "cnt", "ascending": false}], "limit": 10}
-```
-No SQL-over-Flight yet — a client builds this JSON shape directly.
-
-**Embedded library, direct API** — `labukdb-core` in-process, no CLI, no
-server. Not published to Maven Central — `mvn clean install -DskipTests`
-first, then depend on `com.labuk:labukdb-core:0.1.0-SNAPSHOT` like any
-other artifact:
-
-```java
-SnapshotManager snapshotManager = new SnapshotManager(tableRoot);
-Snapshot snapshot = snapshotManager.latest();
-
-Predicate filter = Predicate.compare("level", ComparisonOp.EQ, "ERROR");
-ScanPlan plan = new QueryPlanner().plan(snapshot, filter, List.of("service", "message"));
-
-ParquetToArrowReader reader = new ParquetToArrowReader();
-try (RootAllocator allocator = new RootAllocator()) {
-    for (AddFile file : plan.getFilesToScan()) {
-        Predicate residual = PartitionValueSubstituter.simplify(
-                plan.getResidualPredicate(), file.getPartitionValues());
-        try (VectorSchemaRoot root = reader.read(tableRoot.resolve(file.getPath()).toFile(),
-                allocator, plan.getProjectedColumns(), residual, file.getPartitionValues())) {
-            System.out.println(root.contentToTSVString());
-        }
-    }
-}
-```
-
-Writing — `TableCreator`/`CommitWriter` both take a `TableLocation`, so
-this works identically against a local path or `s3a://`/`abfss://`:
-
-```java
-TableLocation location = TableLocation.forLocal(Path.of("/path/to/new/table"));
-new TableCreator().createTable(location, schema, List.of("level"), null);
-CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", "ERROR"));
-```
-
-`TableMerger.merge(...)` (upsert/delete by key), `Compactor`, and
-`Vacuum` all have matching `TableLocation` overloads, local or remote.
-For genuinely concurrent remote writers, see `docs/ARCHITECTURE.md`'s
-concurrency section before relying on this against object storage —
-optimistic concurrency control needs an atomic create-if-absent write
-from the underlying storage, and not every S3-compatible deployment
-actually provides that.
-
----
-
-## Storage backends
-
-Local disk, S3/MinIO (`s3a://`), and ADLS Gen2 (`abfss://`) all resolve
-through one entry point, `TableLocation`, by URI scheme.
-`hadoop-aws`/`hadoop-azure` are `optional` in `labukdb-core`'s own pom —
-embedding just `labukdb-core` doesn't pull in either cloud SDK. The
-shipped `labukdb-server-app.jar`/`labukdb-cli.jar` declare them
-non-optional (so the advertised `s3a://`/`abfss://` support actually
-ships) — real cost: both jars are ~780MB, dominated by the AWS SDK's
-all-services bundle. An open, undecided trade-off.
-
-### Configuring a remote backend
-
-No config file — the CLI and Flight server read connector settings from
-environment variables automatically whenever a table location uses a
-remote URI scheme:
-
-| Backend | Environment variables | Example location |
-|---|---|---|
-| Local disk | *(none)* | `/path/to/table` |
-| MinIO | `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | `s3a://bucket/table` |
-| S3 (real AWS) | *(none specific)* — falls back to Hadoop's default AWS credential chain when no `MINIO_*` vars are set | `s3a://bucket/table` |
-| ADLS Gen2 | `ADLS_STORAGE_ACCOUNT`, `ADLS_AUTH_TYPE` (`SharedKey`/`OAuth`), then the matching key/OAuth vars | `abfss://container@account.dfs.core.windows.net/table` |
-| Iceberg REST catalog | `ICEBERG_REST_URI` (required), plus warehouse/auth vars — see [USAGE.md](USAGE.md#iceberg-via-a-rest-catalog) | `icebergrest://namespace.table` |
-| Remote OCC lock (Delta, opt-in) | `DYNAMODB_LOCK_TABLE` (required to enable), `DYNAMODB_REGION`, `DYNAMODB_ENDPOINT` (for `amazon/dynamodb-local`), `DYNAMODB_ACCESS_KEY`/`_SECRET_KEY` | — |
-
-```
-export MINIO_ENDPOINT=https://your-minio-host
-export MINIO_ACCESS_KEY=...
-export MINIO_SECRET_KEY=...
-bin/labukdb catalog add logs s3a://bucket/path/to/table
-```
-
-Embedding `labukdb-core` directly: no env-var auto-detection at that
-layer — build the `Configuration` yourself:
-
-```java
-Configuration conf = MinioConfiguration.forMinio(endpoint, accessKey, secretKey);
-TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
-```
+See **[docs/USAGE.md](docs/USAGE.md)** for the Windows wrapper, running
+the Flight server, and every other flag, SQL construct, and wire-format
+field.
 
 ---
 
@@ -260,23 +73,6 @@ TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
 | [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) | The gRPC-based wire protocol `flight/` serves over |
 | [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction — no MapReduce/YARN/HDFS daemons |
 | [Jackson](https://github.com/FasterXML/jackson) | Parsing/writing `_delta_log` JSON commits |
-
-## Inspired by, deliberately not depending on
-
-The point is understanding the mechanics first-hand, so these were read
-as references, not pulled in as dependencies:
-
-- **[Delta Lake transaction log protocol](https://github.com/delta-io/delta/blob/master/PROTOCOL.md)** —
-  the spec `log/`/`planner/` implement against.
-- **[delta-kernel-rs](https://github.com/delta-io/delta-kernel-rs)** —
-  Delta's own "build an engine on top of this" library, deliberately not
-  used — the log replay, pruning, and decode it would hand you are
-  implemented from scratch here instead.
-- **[delta-rs](https://github.com/delta-io/delta-rs)** — another
-  from-scratch (Rust) implementation, a sanity check for "does my
-  understanding of the protocol match an independent one."
-- **[DuckDB](https://duckdb.org/)** — the natural "just use this
-  instead" answer this project deliberately isn't taking.
 
 ---
 

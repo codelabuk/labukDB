@@ -581,9 +581,9 @@ TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
 `MinioConfiguration.fromEnvironment()` / `AdlsConfiguration.fromEnvironment()`
 are available too, if you want the same env-var convenience the CLI/Flight
 server use internally (`MINIO_ENDPOINT`/`MINIO_ACCESS_KEY`/`MINIO_SECRET_KEY`,
-`ADLS_STORAGE_ACCOUNT`/`ADLS_AUTH_TYPE`/...) — see the README's
-[Storage backends](README.md#storage-backends) section for the full
-environment-variable table.
+`ADLS_STORAGE_ACCOUNT`/`ADLS_AUTH_TYPE`/...) — see
+[`ARCHITECTURE.md`'s Storage backends](ARCHITECTURE.md#storage-backends)
+section for the full environment-variable table.
 
 ---
 
