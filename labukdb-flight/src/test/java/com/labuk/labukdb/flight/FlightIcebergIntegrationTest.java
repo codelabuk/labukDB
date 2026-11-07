@@ -41,6 +41,9 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -70,6 +73,12 @@ class FlightIcebergIntegrationTest {
     private FlightServer server;
     private FlightClient client;
     private TableCatalog catalog;
+    // Supplied explicitly so tearDown can shut it down and await its drain
+    // itself -- FlightServer.close() only awaitTermination()s the underlying
+    // io.grpc.Server, never this executor (see FlightIntegrationTest's
+    // matching field for the full root-cause writeup) -- the cause of this
+    // suite's intermittent "Memory was leaked by query" flake.
+    private ExecutorService grpcExecutor;
 
     @TempDir
     Path catalogDir;
@@ -83,8 +92,11 @@ class FlightIcebergIntegrationTest {
         catalog = new TableCatalog(catalogDir.resolve("catalog.json"));
         LabukDbFlightProducer producer = new LabukDbFlightProducer(allocator, catalog, new Configuration(), walRoot);
 
+        grpcExecutor = Executors.newCachedThreadPool();
         Location serverLocation = Location.forGrpcInsecure("localhost", 0);
-        server = FlightServer.builder(allocator, serverLocation, producer).build();
+        server = FlightServer.builder(allocator, serverLocation, producer)
+                .executor(grpcExecutor)
+                .build();
         server.start();
 
         Location clientLocation = Location.forGrpcInsecure("localhost", server.getPort());
@@ -95,6 +107,10 @@ class FlightIcebergIntegrationTest {
     void tearDown() throws Exception {
         client.close();
         server.close();
+        grpcExecutor.shutdown();
+        if (!grpcExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+            grpcExecutor.shutdownNow();
+        }
         allocator.close();
     }
 
