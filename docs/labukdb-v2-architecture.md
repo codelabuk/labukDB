@@ -12,27 +12,12 @@ one piece. See [ARCHITECTURE.md](../ARCHITECTURE.md) for the v1 system
 this plan builds on top of, and [USAGE.md](../USAGE.md) for how to
 actually use what's built.
 
-Diagram sources now live in [`flow-charts/`](flow-charts/) — see
-[`flow-charts/README.md`](README.md) for the full index,
-including the newer per-topic diagrams (module overview, Delta/Iceberg
-write paths, read path, SQL engine Phase 1, Flight query sequence,
-catalog/format detection). This file's own render below is
-[`flow-charts/labukdb-v2-module-architecture.puml`](labukdb-v2-module-architecture.puml)
-(PlantUML source — edit this), rendered as
-[`.pdf`](labukdb-v2-module-architecture.pdf) and
-[`.png`](labukdb-v2-module-architecture.png). **Known stale
-as of the SQL engine Phase 1 update below** — the rendered image predates
-`core.logical`, and its own `DeltaTableFormat`/CLI-dispatch notes are
-now factually wrong (patched in the `.puml` source, not yet re-rendered —
-see `flow-charts/README.md` for why). Prefer the new per-topic diagrams
-for anything touching the SQL layer or Delta's query-path format wiring.
-
-![labukDB v2 module architecture](labukdb-v2-module-architecture.png)
-
-Legend: **lavender** boxes are reused from v1 as-is (package renamed
-`com.labuk.deltaflight` → `com.labuk.labukdb`); **green** boxes are new
-in v2 and built + verified (most of the diagram, at this point); **amber**
-boxes are new and still only planned — they don't exist yet.
+Architecture diagrams live in [`docs/README.md`](README.md) — Mermaid
+diagrams embedded directly in per-topic `.md` files under
+[`flow-charts/`](flow-charts/), rendered natively by GitHub with no
+plugin needed (the old single mega-diagram and its PlantUML/PDF/PNG/SVG
+exports were retired — see the dated update near the end of this file
+for why).
 
 ---
 
@@ -1999,7 +1984,55 @@ and with `GROUP BY`.
 
 ---
 
+## Update — architecture diagrams converted from PlantUML to Mermaid
+
+All 8 `.puml` diagrams rendered as raw text when browsing the repo on
+github.com — there was no plugin-free way to view them there. The one
+diagram with pre-rendered binaries (the old mega-diagram's `.pdf`/
+`.png`/`.svg`) was already proven stale (predated `core.logical`/the SQL
+engine work entirely), and a prior attempt to render via the public
+plantuml.com web service had been blocked by this environment's own
+permission system as a data-sharing action — so that path wasn't
+reliably available going forward either.
+
+Converted the 7 current per-topic diagrams to Mermaid, embedded directly
+in `.md` files under `docs/flow-charts/` — GitHub renders Mermaid code
+blocks natively, inline, with no plugin and no external service, and
+critically no staleness risk: the diagram source *is* the rendered view,
+generated fresh on every page load. This closes the viewing problem
+permanently rather than automating around it (the alternative considered
+— a CI step to auto-render PlantUML to SVG on every push — would have
+kept images fresh but still left every raw `.puml` file itself
+unreadable when browsed directly; Mermaid has neither problem).
+
+Deleted rather than converted: the old mega-diagram (`.puml` + `.pdf` +
+`.png` + `.svg`) and the two v1 diagrams (`architecture.puml`,
+`flight-sequence.puml`) — all three were already explicitly self-labeled
+superseded/historical before this conversion, not a new decision to
+retire them here. Git history preserves them if ever needed again.
+
+The SQL-engine diagram's content was also brought current while
+converting it (not just transliterated) — it had been frozen at a
+"Phase 1" framing that predated joins entirely; now reflects that Phase
+3 (both increments) is done and live-verified, with the actual remaining
+scope (Phase 3's LEFT/RIGHT/FULL/3+-way/cost-based-join-side piece,
+Phase 4 subqueries) stated plainly instead of speculatively.
+
+Verification note: this environment's own permission system also blocks
+running `npx`-fetched packages (classified as executing external code),
+so the new Mermaid syntax could not be locally rendered and visually
+confirmed via `@mermaid-js/mermaid-cli` the way a `.puml` file could at
+least be pasted into an online editor — verified instead by a careful
+manual read-through of each file's block structure (every `subgraph`/
+`end`, `alt`/`else`/`end`, and `loop`/`rect`/`end` pair counted and
+confirmed correctly nested). Visually confirming the actual GitHub
+render after this is pushed is still worth doing once, since manual
+syntax review can't catch everything a real renderer would.
+
+---
+
 *This document and its diagrams describe a plan, not current behavior.
-Update both the `.puml` source and this file together as the design
+Update both the diagram source (Mermaid, embedded in each
+`docs/flow-charts/*.md` file) and this file together as the design
 changes — don't let them drift the way `ARCHITECTURE.md` briefly did
 about nested-type support.*
