@@ -1949,6 +1949,56 @@ and a real `ORDER BY ... DESC LIMIT 1` query (correct top row selected).
 
 ---
 
+## Update — SQL engine Phase 3 (both increments) verified against real MinIO
+
+Every join test and manual check up to this point used local Delta
+fixtures only — a real gap, since joins specifically are the feature
+most likely to behave differently against a remote store (two
+independent table resolutions, two independent network round trips,
+all before the join logic ever runs). Closed by building two small
+real Delta tables directly on the existing MinIO instance (via a
+one-off fixture builder, same pattern as every prior MinIO
+verification this project has done — not part of the repo) and
+registering them in the catalog as `orders_minio`/`customers_minio`.
+
+All three query shapes ran correctly via real `bin/labukdb query --sql`
+against them:
+- Plain `JOIN`: 3 rows, `customer_id=999` (no matching customer)
+  correctly dropped.
+- `JOIN` + `GROUP BY`: `us-east | 40.0` (customer 1's two orders, 10+30,
+  correctly combined into one group across the remote join),
+  `eu-west | 20.0`.
+- `JOIN` + `ORDER BY ... DESC LIMIT 2`: `gateway-svc` (amount 30) then
+  `payments-svc` (amount 20) — `auth-svc` (amount 10, lowest) correctly
+  cut by the limit.
+
+No code changes were needed — this was purely a verification gap, not
+a bug. SQL engine Phase 3 (increments 1 and 2) is now confirmed against
+both local and real MinIO, matching Phase 1/2's existing verification
+coverage.
+
+The Delta↔Iceberg mixed join specifically was left as a named caveat
+at that point (the MinIO check above only exercised Delta↔Delta) —
+closed immediately after: a real Iceberg table was also built directly
+on MinIO (`customers_iceberg_minio`, via `HadoopTables` + a manual
+S3A stream upload of the Parquet data file — `FileSystem.copyFromLocalFile`
+doesn't work here, since it shells out to Hadoop's native POSIX `stat`
+via `winutils.exe`, not set up on this machine; a plain byte-array
+`FSDataOutputStream` write sidesteps that entirely) and joined against
+the existing real Delta `orders_minio` table:
+- Plain `JOIN` (Delta↔Iceberg, both on MinIO): 3 rows, orphan
+  `customer_id=999` correctly dropped — same result as the local test.
+- `JOIN` + `GROUP BY` (Delta↔Iceberg, both on MinIO): `us-east | 40.0`,
+  `eu-west | 20.0` — identical to the Delta↔Delta MinIO result, proving
+  the "each side resolves independently" design claim holds over a real
+  network round trip to two different table formats, not just locally.
+
+SQL engine Phase 3's MinIO verification is now complete for every
+combination tested so far: Delta↔Delta and Delta↔Iceberg, both plain
+and with `GROUP BY`.
+
+---
+
 *This document and its diagrams describe a plan, not current behavior.
 Update both the `.puml` source and this file together as the design
 changes — don't let them drift the way `ARCHITECTURE.md` briefly did
