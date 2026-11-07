@@ -12,13 +12,13 @@ sequenceDiagram
 
     Note over C,EXEC: GetFlightInfo (planning — no data file fully opened)
 
-    C->>DFP: GetFlightInfo(FlightDescriptor)<br/>{"table":"logs","predicate":{...},<br/>"columns":[...],"groupBy":[...],<br/>"aggregates":[...],"orderBy":[...],"limit":N}
+    C->>DFP: GetFlightInfo(FlightDescriptor)<br/>{'table':'logs','predicate':{...},<br/>'columns':[...],'groupBy':[...],<br/>'aggregates':[...],'orderBy':[...],'limit':N}
     DFP->>DF: icebergrest:// reference?<br/>(checked BEFORE any TableLocation —<br/>isRemoteUri's regex would otherwise misroute it)
 
     alt REST-catalog Iceberg
         DFP->>TF: IcebergRestConfiguration.connect()<br/>+ new IcebergTableFormat(catalog, identifier)
     else path-based (Delta or Iceberg)
-        DFP->>DF: DetectedFormat.detect(tableRoot)<br/>(exists("_delta_log") vs exists("metadata"))
+        DFP->>DF: DetectedFormat.detect(tableRoot)<br/>(exists('_delta_log') vs exists('metadata'))
         alt Delta
             DFP->>DFP: resolve via SnapshotManager/Snapshot<br/>directly — NOT via DeltaTableFormat<br/>(see note below)
         else Iceberg
@@ -26,7 +26,6 @@ sequenceDiagram
         end
     end
 
-    DFP->>TF: latest() / atVersion() / atTimestamp()<br/>(Delta: SnapshotManager directly instead)
     TF-->>DFP: Snapshot / NormalizedSnapshot<br/>(live file set + schema + partition columns)
 
     DFP->>QP: plan(snapshot, predicate, columns)<br/>-- Delta --  or  planNormalized(...) -- Iceberg --

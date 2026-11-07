@@ -5,7 +5,7 @@ flowchart TB
     classDef coreModule fill:#EEEDFE,stroke:#534AB7,color:#26215C
     classDef icebergModule fill:#D9F2C4,stroke:#534AB7,color:#26215C
 
-    RAW["Raw table reference<br/>(--table arg, SQL FROM-clause name,<br/>or Flight request's &quot;table&quot; field)"]
+    RAW["Raw table reference<br/>(--table arg, SQL FROM-clause name,<br/>or Flight request's 'table' field)"]
 
     subgraph CATPKG["catalog/ (labukdb-core)"]
         CAT["TableCatalog<br/>(name → location string only —<br/>NO format field; ~/.labukdb/catalog.json,<br/>Jackson-backed, rewritten on every<br/>register/unregister)"]
@@ -25,7 +25,7 @@ flowchart TB
     class STORAGEPKG coreModule
 
     subgraph FORMATPKG["format/ (labukdb-core)"]
-        DF["DetectedFormat<br/>(probes exists(&quot;_delta_log&quot;)<br/>vs exists(&quot;metadata&quot;) at the<br/>table root — lazy, not stored<br/>in the catalog)"]
+        DF["DetectedFormat<br/>(probes exists('_delta_log')<br/>vs exists('metadata') at the<br/>table root — lazy, not stored<br/>in the catalog)"]
         TF["TableFormat<br/>(interface: latest/atVersion/<br/>atTimestamp → NormalizedSnapshot)"]
         DTF["DeltaTableFormat"]
     end

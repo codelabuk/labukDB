@@ -18,7 +18,7 @@ flowchart TB
     IVAC["IcebergVacuum<br/>(thin wrapper over Iceberg's own<br/>native Table.expireSnapshots())"]:::icebergModule
 
     IDDBL["DynamoDbLockManager<br/>(implements Iceberg's own<br/>LockManager extension point —<br/>lease-based acquire/release)"]:::icebergModule
-    ILMC["IcebergLockManagerConfig<br/>(opt-in: sets Configuration's<br/>&quot;lock-impl&quot; property when<br/>ICEBERG_LOCK_DYNAMODB_TABLE is set)"]:::icebergModule
+    ILMC["IcebergLockManagerConfig<br/>(opt-in: sets Configuration's<br/>'lock-impl' property when<br/>ICEBERG_LOCK_DYNAMODB_TABLE is set)"]:::icebergModule
     RWSW["RemoteWriteSafetyWarning<br/>(shared with Delta's write path)"]:::icebergModule
 
     IRC["IcebergRestConfiguration<br/>(ICEBERG_REST_* env vars → RESTCatalog)"]:::icebergModule
@@ -40,7 +40,7 @@ flowchart TB
     IVAC -- "locationOf() — resolve an<br/>expired DataFile's path for deletion" --> IDFW
     IVAC -- "table.expireSnapshots()" --> IT
 
-    ILMC -. "sets Configuration's<br/>&quot;lock-impl&quot; property" .-> IDDBL
+    ILMC -. "sets Configuration's<br/>'lock-impl' property" .-> IDDBL
     IRC -. "Catalog passed to<br/>new (Catalog, TableIdentifier) ctor" .-> ITW
 ```
 
