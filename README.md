@@ -28,8 +28,9 @@ fixed with an opt-in external lock, and proven fixed against the same
 live cluster. A second stress test found Iceberg's own upstream
 `HadoopTables` writer has the *identical class* of bug, also root-caused
 down to the exact library code and the exact storage-layer assumption
-that doesn't hold on object storage. Both findings — and the fixes — are
-documented in detail, not hidden: see [Status at a glance](#status-at-a-glance).
+that doesn't hold on object storage. Both findings, and the fixes, are
+documented in full in `docs/ARCHITECTURE.md`'s concurrency section —
+not papered over.
 
 Companion project to `local-lakehouse-lab` (not part of it): that project
 is a Spark/Flink + DuckDB stack. This one is the from-scratch story —
@@ -42,12 +43,9 @@ CLI `--sql`, and now a basic two-table `INNER` equi-join are real; no
 — different scope, even though it now reads/writes real tables Spark can
 also read.
 
-For the full guided tour, see **[ARCHITECTURE.md](ARCHITECTURE.md)** (the
-original read-path walkthrough) and
-**[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md)**
-(current module design, every write-path decision, and the full
-root-cause writeups referenced below). For every CLI flag, SQL subset,
-and Flight wire-format field, see **[USAGE.md](USAGE.md)**.
+For the full guided tour, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+For every CLI flag, SQL subset, and Flight wire-format field, see
+**[docs/USAGE.md](docs/USAGE.md)**.
 
 ---
 
@@ -129,7 +127,7 @@ Iceberg both implement, auto-detected by probing for `_delta_log/` vs.
 embeddable like DuckDB), `labukdb-flight` (Flight serving),
 `labukdb-format-iceberg` (Iceberg support), `labukdb-server-app` (the
 runnable server jar), `labukdb-cli` (the `labukdb` binary). See
-[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for
 the full module design and every write-path decision.
 
 ---
@@ -137,9 +135,9 @@ the full module design and every write-path decision.
 ## Usage
 
 Four ways to ask the same engine a question — see
-**[USAGE.md](USAGE.md)** for the full reference (every CLI flag, every
-`FlightQueryRequest`/`FlightWriteRequest` field, the embedded library's
-write path).
+**[docs/USAGE.md](docs/USAGE.md)** for the full reference (every CLI
+flag, every `FlightQueryRequest`/`FlightWriteRequest` field, the
+embedded library's write path).
 
 **CLI, flag-based:**
 ```
@@ -199,46 +197,11 @@ CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", "ERROR"));
 
 `TableMerger.merge(...)` (upsert/delete by key), `Compactor`, and
 `Vacuum` all have matching `TableLocation` overloads, local or remote.
-For genuinely concurrent remote writers, see the OCC row in
-[Status at a glance](#status-at-a-glance) before relying on this against
-object storage.
-
----
-
-## Status at a glance
-
-| Area | Status | Notes |
-|---|---|---|
-| Delta read (local, MinIO) | ✅ Done, live-verified | Remote fully `TableLocation`-dispatched |
-| Delta write — append/MERGE/compact/vacuum/create (local, MinIO) | ✅ Done, live-verified | Including `Vacuum`'s real remote delete, confirmed via a live `FileSystem.exists()` check |
-| Delta multi-writer OCC, remote, no lock | 🔴 **Confirmed broken** on at least one real MinIO deployment | Silent lost updates under genuine concurrency, for plain appends **and** for `TableMerger`/`Compactor` (confirmed separately — MERGE lost 7 of 8 concurrent inserts with zero exceptions, a worse failure mode than plain append since MERGE's commit unit replaces the whole partition). Constructing this configuration now logs a proportionate warning (`RemoteWriteSafetyWarning`) |
-| Delta multi-writer OCC, remote, with lock | ✅ Done, live-verified | Opt-in `LockProvider`/`DynamoDbLockProvider`; same failing scenarios pass with it engaged. `TableMerger`/`Compactor` gained their own lock-accepting overloads this round — previously had no way to opt in at all, unlike plain `appendBatch`. Scoped as a mitigation for non-compliant S3-compatible storage, not a universal requirement |
-| Delta CLI `--sql` (local, MinIO) | ✅ Done, live-verified | `GROUP BY`, `ORDER BY`/`LIMIT`, `WHERE` |
-| Iceberg read + REST catalog (local, MinIO) | ✅ Done, live-verified | REST catalog proven against a real `tabulario/iceberg-rest` server, including a full data write-then-read round trip through REST catalog + real S3-compatible storage together (not just the wire protocol in isolation) |
-| Iceberg SQL query layer / `GROUP BY` (MinIO) | ✅ Done, live-verified | CLI `--sql` against a real MinIO-backed Iceberg table — Delta-vs-Iceberg and local-vs-remote dispatch are orthogonal in `QueryCommand`/`TableResolver`/`DetectedFormat`, confirmed by direct trace, not assumed |
-| Iceberg write — append/MERGE, no lock | 🔴 **Confirmed broken** under genuine concurrent writers on real MinIO | Single-writer safe. Root cause traced into `iceberg-core`'s own `HadoopTableOperations`, same class of bug as the Delta finding above. MERGE confirmed separately broken too (4 of 8 concurrent inserts lost, zero exceptions). Also now warns on construction (`RemoteWriteSafetyWarning`) |
-| Iceberg write — append/MERGE, with lock | ✅ Done, live-verified | Opt-in `DynamoDbLockManager` via Iceberg's own `LockManager` extension point; same failing scenarios pass with it engaged. Full write lifecycle (create → append → merge → compact → vacuum) now live-verified end-to-end against real MinIO |
-| Iceberg CREATE TABLE | ✅ Done | `IcebergTableCreator`, path-based and catalog-based; identity-only partitioning |
-| Iceberg MERGE/upsert | ✅ Done | `IcebergTableMerger`, path-based and catalog-based; reuses Delta's exact merge semantics via shared `PartitionRowMerger` |
-| Iceberg compaction | ✅ Done | `IcebergCompactor`, path-based and catalog-based; commits via `Table.newRewrite()`, Iceberg's dedicated non-data-changing commit type |
-| Iceberg vacuum | ✅ Done | `IcebergVacuum`, path-based and catalog-based; thin wrapper over Iceberg's own native `Table.expireSnapshots()` — Delta's `Vacuum` had to hand-roll this, Iceberg ships it |
-| Type support | ✅ Done, incl. nested `LIST<LIST<...>>`/MAP/STRUCT of any depth (read + write, local + MinIO) | Most primitives, DECIMAL (Decimal128), and the four leaf primitive kinds (float/double/int32/int64/string) at any nesting depth across List/Map/Struct — `Types.StructType`/`Types.MapType` on the Iceberg side, self-similar nested JSON on the Delta side. Decimal/timestamp/boolean leaves inside nested positions are a separate, not-yet-wired expansion |
-| SQL engine architecture | ✅ Phase 1 + 2 + 3 (increments 1 & 2) done | Phase 1: new `core.logical` package — a real `LogicalPlan` tree + a rule-based optimizer (`PushFilterIntoScan`, `PushProjectIntoScan`), replacing the flat `SqlQuery` record + 3-way duplicated branching. One resolution path now serves Delta, Iceberg, and REST-catalog Iceberg alike. Phase 2: a bare `LIMIT` with no `ORDER BY`/`GROUP BY` now stops scanning early instead of materializing every surviving file first. Phase 3 increment 1: real two-table `INNER` equi-joins — `SqlQueryTranslator` actually walks `JOIN`/`ON` now (jsqlparser already parsed it; the translator was the only blocker), a new `HashJoinOperator`, each side resolved completely independently (a Delta table can join an Iceberg table as a free consequence, proven by a real test, not just asserted). Phase 3 increment 2: `GROUP BY`/aggregates/`ORDER BY`/`LIMIT` now combine with a `JOIN` — `AggregateOperator`/`SortLimitOperator` run on the join's combined output unchanged, with every column qualified the same way `SELECT`/`WHERE`/`ON` already require. Found and fixed a real bug along the way: `PushProjectIntoScan` could silently drop the final column projection when `ORDER BY`/`LIMIT` sat between it and a `JOIN`. Scoped deliberately: still `INNER`/equi-join/two-table only, no `LEFT`/`RIGHT`/`FULL`, no 3+-way joins, no cost-based join-side selection. All increments manually verified against local tables and real MinIO (including `GROUP BY`/`ORDER BY`/`LIMIT` combined with a join, over the network). Subqueries are Phase 4, not started |
-| Checkpoints | 🟡 Parsing tested against a self-built fixture | Not yet proven against a real Spark-produced checkpoint — highest-risk, least-verified code in the project |
-| Real AWS S3 / Azure ADLS (not MinIO) | 🟡 Implemented, not independently verified | MinIO is the only remote backend actually stress-tested live |
-| Flight surface | 🟡 `GetFlightInfo`/`DoGet`/`DoPut`/`ListFlights` done | `DoAction`/`DoExchange` unimplemented — no CREATE TABLE RPC, no push-based tailing |
-| Caching | ✅ Snapshot reuse (`TableCache`), Parquet schema caching (`ParquetFooterCache`) | A decoded-row-batch LRU for hot files is not yet implemented |
-
-Three findings below have full root-cause writeups in
-[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) rather
-than duplicated here — each is the kind of thing worth reading in full:
-**the Delta remote-OCC lock story** (what actually fails on non-compliant
-S3-compatible storage, and why the fix is a DynamoDB-backed lock, not a
-smarter retry), **the Iceberg `HadoopTables` root cause** (traced through
-real `iceberg-core` source to the exact line where the atomicity
-assumption breaks), and **a known, pre-existing `FlightIntegrationTest`
-flake** (confirmed *not* the Arrow issue once blamed for it — the real
-cause is still open).
+For genuinely concurrent remote writers, see `docs/ARCHITECTURE.md`'s
+concurrency section before relying on this against object storage —
+optimistic concurrency control needs an atomic create-if-absent write
+from the underlying storage, and not every S3-compatible deployment
+actually provides that.
 
 ---
 
@@ -285,18 +248,6 @@ TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
 
 ---
 
-## Python client & RAG demo
-
-- `python/query_demo.py` — a plain `pyarrow.flight` client against a
-  running `labukdb-server-app`. Proof any Flight-capable client in any
-  language works against this server unmodified.
-- `python/rag_demo.py` — a small grounded-QA demo using two local Ollama
-  calls: one turns a plain-English question into the JSON query
-  `query_demo.py` sends by hand, the other answers using the actual
-  retrieved rows. Fully local, no paid API.
-
----
-
 ## Built on
 
 | Library | Used for |
@@ -304,7 +255,7 @@ TableLocation location = TableLocation.forRemote("s3a://bucket/path", conf);
 | [Apache Parquet](https://parquet.apache.org/) | Footer statistics, row-group reads, the `Group` record API |
 | [Apache Arrow](https://arrow.apache.org/) | The in-memory columnar format every decoded row lands in |
 | [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) | The gRPC-based wire protocol `flight/` serves over |
-| [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction — no MapReduce/YARN/HDFS daemons, see [HADOOP_USAGE.md](HADOOP_USAGE.md) |
+| [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction — no MapReduce/YARN/HDFS daemons |
 | [Jackson](https://github.com/FasterXML/jackson) | Parsing/writing `_delta_log` JSON commits |
 
 ## Inspired by, deliberately not depending on
@@ -326,22 +277,5 @@ as references, not pulled in as dependencies:
 
 ---
 
-## Roadmap
-
-Full backlog (every item, every status) lives in
-[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md)'s
-"Build order" and "Phase roadmap" sections — this is the short version.
-
-| Area | Next up |
-|---|---|
-| Write path | Iceberg write-lifecycle parity with Delta is now complete (CREATE TABLE + MERGE + compaction + vacuum); CLI write subcommands (`ingest`/`compact`/`vacuum`/`create-table`); Flight `DoAction` for CREATE TABLE; orphan-file detection in `Vacuum`; read-path proactive recovery for the remote OCC lock |
-| Core engine | SQL engine Phase 1-3 done through increment 2 (IR + optimizer shell, LIMIT early-termination, two-table INNER equi-join, join + GROUP BY/ORDER BY/LIMIT); Phase 3's remaining increment (LEFT/RIGHT/FULL joins, 3+-way joins, cost-based join-side selection), Phase 4 (subqueries) next; boxing-reduction in `AggregateOperator`/`HashJoinOperator` done (single-column primitive keys); checkpoint writing (reads only today); row-data LRU cache; SQL-over-Flight; `DoExchange` streaming/tailing |
-| Multi-format | Hive Metastore/Glue/Nessie catalogs; Parquet-only (no-log) tables |
-| AI / LLM | MCP tool wrapper; catalog semantic descriptions; case-insensitive filters |
-| Observability | Grafana as a Flight client; Prometheus metrics; InfluxDB → Delta pipeline |
-| Infrastructure | Distributed Flight/read scale-out; distributed ingestion fleet (planned, not designed — the largest remaining piece); distributed query execution (planned, not designed); auth; Docker/Helm |
-
----
-
-*Copyright 2026 Afzal and lakehouse-flight contributors.
+*Copyright 2026 Afzal and labukDB (lakehouse-flight) contributors.
 Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE).*

@@ -23,10 +23,10 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
- * The memtable/WAL layer in front of {@link CommitWriter} — build-order
- * step 2. Buffers incoming batches durably before they become a Parquet
- * file + commit, so frequent small writes don't turn into one tiny file
- * and one log entry per call. See {@code docs/labukdb-v2-architecture.md}'s
+ * The memtable/WAL layer in front of {@link CommitWriter}. Buffers
+ * incoming batches durably before they become a Parquet file + commit,
+ * so frequent small writes don't turn into one tiny file and one log
+ * entry per call. See {@code docs/ARCHITECTURE.md}'s
  * "Write path: it's an LSM tree" section for the design motivation.
  *
  * <b>Scope, stated plainly:</b> one instance buffers for one table AND

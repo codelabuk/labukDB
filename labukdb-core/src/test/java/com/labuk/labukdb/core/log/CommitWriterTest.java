@@ -34,11 +34,10 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Proves build-order step 1 end to end: {@link CommitWriter#appendBatch}
+ * Proves the basic write path end to end: {@link CommitWriter#appendBatch}
  * encodes a real Parquet file, commits it atomically, and
- * {@link SnapshotManager} reads the new state back correctly — the exact
- * "append one commit atomically, read it back correctly" bar from
- * {@code docs/labukdb-v2-architecture.md}'s build order.
+ * {@link SnapshotManager} reads the new state back correctly — "append
+ * one commit atomically, read it back correctly."
  */
 class CommitWriterTest {
 

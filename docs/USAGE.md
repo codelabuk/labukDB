@@ -13,10 +13,9 @@ or "limited" version of another.
 | [Flight server](#3-flight-server-remote-clients) | Yes | ✅ | ✅ | Remote clients, any language, multiple concurrent readers/writers |
 | [Embedded library](#4-embedded-library-labukdb-core-directly) | No | ✅ | ✅ | Embedding inside your own JVM app, no IPC/network hop (DuckDB-style) |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for how the layers underneath
-these four modes actually work, and
-[docs/labukdb-v2-architecture.md](docs/labukdb-v2-architecture.md) for
-what's built vs. still planned.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how the layers
+underneath these four modes actually work, and what's built vs. still
+planned.
 
 ### Delta vs. Iceberg
 
@@ -392,11 +391,9 @@ for endpoint in info.endpoints:
     print(table)
 ```
 
-See `python/query_demo.py` for a complete, runnable version (including a
-`--schema`-only mode for discovering column names) and
-`python/rag_demo.py` for a small local-Ollama RAG demo built on top of
-it — proof any Flight client in any language works against this server
-unmodified, since Flight *is* gRPC.
+This is proof any Flight client in any language works against this
+server unmodified, since Flight *is* gRPC — the example above is the
+whole client, not a trimmed excerpt of a larger one.
 
 ---
 

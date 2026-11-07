@@ -23,14 +23,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * {@link TableFormat} for Iceberg — the second implementation
- * {@code format/TableFormat} was deliberately left unwired for, until one
- * existed to validate its shape against. Path-based only
- * ({@link HadoopTables#load}, no Hive/REST catalog service), read-only.
+ * {@link TableFormat} for Iceberg — the second implementation that
+ * validated {@code format/TableFormat}'s shape. Supports both path-based
+ * ({@link HadoopTables#load}) and catalog-based access (including a REST
+ * catalog, via {@code IcebergRestConfiguration}), and both reads and
+ * writes (append, upsert/MERGE, compaction, vacuum — see the sibling
+ * writer/merger/compactor/vacuum classes in this package).
  *
- * <b>Two real shape mismatches this implementation surfaced — see
- * {@code docs/labukdb-v2-architecture.md} for the full writeup, not
- * silently worked around here:</b>
+ * <b>Two real shape mismatches this implementation surfaced, worked
+ * around rather than silently papered over:</b>
  * <ul>
  *   <li>{@link #atVersion}'s {@code long} parameter was shaped around
  *       Delta's sequential version numbers; here it's Iceberg's
@@ -42,11 +43,6 @@ import java.util.Map;
  *       caller treating this field as format-neutral today would be
  *       wrong to assume that.</li>
  * </ul>
- *
- * Deliberately not wired into {@code planner}/{@code flight}/{@code cli}
- * yet — same as {@code DeltaTableFormat}, that migration happens once
- * both implementations have actually informed what the interface should
- * look like.
  */
 public final class IcebergTableFormat implements TableFormat {
 

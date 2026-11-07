@@ -39,12 +39,12 @@ import static org.junit.jupiter.api.Assertions.*;
 
 /**
  * Proves {@link IcebergTableWriter}'s concurrency story under real
- * contention, not just functionally — {@code docs/labukdb-v2-architecture.md}
- * states {@code iceberg-core}'s own {@code SnapshotProducer.commit()} already
- * runs a bounded, exponential-backoff optimistic-concurrency retry
- * internally (confirmed via {@code javap -c} on real bytecode), but that
- * confirmation was never exercised by genuinely concurrent writers in this
- * project before — only single-writer, sequential {@code appendBatch} calls
+ * contention, not just functionally. {@code iceberg-core}'s own
+ * {@code SnapshotProducer.commit()} already runs a bounded,
+ * exponential-backoff optimistic-concurrency retry internally (confirmed
+ * via {@code javap -c} on real bytecode), but that confirmation was never
+ * exercised by genuinely concurrent writers in this project before —
+ * only single-writer, sequential {@code appendBatch} calls
  * ({@link IcebergTableWriterTest}).
  *
  * Same N-independent-writer-instances shape as {@code CommitWriter}'s own

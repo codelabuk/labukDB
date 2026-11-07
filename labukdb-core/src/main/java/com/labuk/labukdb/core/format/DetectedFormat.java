@@ -12,11 +12,9 @@ import java.io.IOException;
  * at query time rather than stored alongside the location.
  *
  * This is the first real caller of {@link TableFormat}'s shape beyond its
- * own standalone tests — see {@code docs/labukdb-v2-architecture.md} for
- * why it was left unwired until now, and the two real shape mismatches
- * (Iceberg's non-sequential {@code snapshotId} vs. Delta's sequential
- * version; Iceberg's {@code Schema.toString()} vs. Delta's JSON
- * {@code schemaString}) that validated it.
+ * own standalone tests. Two real shape mismatches validated it: Iceberg's
+ * non-sequential {@code snapshotId} vs. Delta's sequential version;
+ * Iceberg's {@code Schema.toString()} vs. Delta's JSON {@code schemaString}.
  */
 public enum DetectedFormat {
     DELTA,

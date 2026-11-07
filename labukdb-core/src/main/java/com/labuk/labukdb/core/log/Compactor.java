@@ -16,7 +16,7 @@ import java.util.Map;
  * Merges every currently-active file for one table + partition into a
  * single new file, via one atomic {@link CommitWriter#replaceFiles} call
  * — the periodic bin-packing step in the file-level LSM design (see
- * {@code docs/labukdb-v2-architecture.md}'s "Write path: it's an LSM
+ * {@code docs/ARCHITECTURE.md}'s "Write path: it's an LSM
  * tree" section). {@link WriteBuffer}'s auto-flush bounds file count per
  * buffering cycle; this is what addresses file count accumulated
  * <em>across</em> cycles, over time.

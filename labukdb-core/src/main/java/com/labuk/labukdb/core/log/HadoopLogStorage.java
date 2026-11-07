@@ -68,10 +68,10 @@ import java.util.List;
  *       support "may not be supported on third party stores" and "can't
  *       be confirmed without testing" — this is exactly that case. See
  *       {@code CommitWriterConcurrentMinioIntegrationTest}, which fails on
- *       purpose as a standing proof of this gap, and
- *       {@code docs/labukdb-v2-architecture.md}'s OCC table for the fix
- *       this implies (an out-of-band lock, not a retry-loop change —
- *       not yet designed).</li>
+ *       purpose as a standing proof of this gap. The fix is an opt-in
+ *       out-of-band lock ({@link DynamoDbLockProvider}), not a
+ *       retry-loop change — see {@code docs/ARCHITECTURE.md}'s
+ *       "Concurrent writes" section.</li>
  *   <li><b>ADLS Gen2:</b> protected by Hadoop's create-without-overwrite-first
  *       pattern since Hadoop 3.3.0 (<a href="https://issues.apache.org/jira/browse/HADOOP-17215">HADOOP-17215</a>)
  *       — plausibly safe given ADLS's API has a real create-vs-overwrite

@@ -57,7 +57,7 @@ public final class HashJoinOperator {
         // fast path already makes -- java.util.HashMap's own internals beat
         // a hand-rolled open-addressing table at the row counts measured
         // here, so this reuses a standard Map rather than a bespoke one;
-        // see docs/labukdb-v2-architecture.md for the benchmark that showed
+        // see docs/ARCHITECTURE.md for the benchmark that showed
         // this). Composite keys and VARCHAR keys fall through to the boxed
         // List<Object> path below unchanged. Requiring the *same* vector
         // class on both sides mirrors the boxed path's own existing

@@ -34,7 +34,7 @@ import java.util.stream.Collectors;
  * MinIO-verified; multi-writer OCC itself (the retry logic below) is
  * only exercised there the same way the local-disk primitive is, not
  * separately stress-tested against concurrent remote writers — see
- * {@code docs/labukdb-v2-architecture.md}'s "Concurrent writes" section.
+ * {@code docs/ARCHITECTURE.md}'s "Concurrent writes" section.
  *
  * <b>Multi-writer concurrency:</b> both write methods retry
  * under optimistic concurrency control when {@link LogStorage#createCommitFile}'s

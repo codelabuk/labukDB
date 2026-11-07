@@ -26,7 +26,7 @@ import java.util.Map;
  * {@code GROUP BY} + {@code SUM}/{@code COUNT}/{@code MIN}/{@code MAX}/
  * {@code AVG} over one or more already-decoded, already-filtered Arrow
  * batches — see this class's package javadoc-equivalent in
- * {@code docs/labukdb-v2-architecture.md} for why it's scoped this way:
+ * {@code docs/ARCHITECTURE.md} for why it's scoped this way:
  * assumes all input fits in memory on one process (same assumption
  * {@code WriteBuffer.flush()} already makes combining buffered batches),
  * and is deliberately not wired into {@code flight}'s per-file-endpoint
