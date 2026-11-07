@@ -5,8 +5,8 @@
 <h4 align="center">A from-scratch Delta Lake &amp; Iceberg database — reads and writes, embeddable or served over Apache Arrow Flight.</h4>
 
 <p align="center">
-  <a href="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/codelabuk/labukDB/ci.yml?style=for-the-badge&label=CI"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-14B8A6?style=for-the-badge"></a>
+  <a href="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/codelabuk/labukDB/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache%202.0-14B8A6"></a>
 </p>
 
 labukDB reads and writes both **Delta Lake** and **Apache Iceberg**
@@ -71,8 +71,6 @@ field.
 | [Apache Parquet](https://parquet.apache.org/) | Footer statistics, row-group reads, the `Group` record API |
 | [Apache Arrow](https://arrow.apache.org/) | The in-memory columnar format every decoded row lands in |
 | [Apache Arrow Flight](https://arrow.apache.org/docs/format/Flight.html) | The gRPC-based wire protocol `flight/` serves over |
-| [Apache Hadoop](https://hadoop.apache.org/) (`FileSystem` API only) | Storage abstraction — no MapReduce/YARN/HDFS daemons |
-| [Jackson](https://github.com/FasterXML/jackson) | Parsing/writing `_delta_log` JSON commits |
 
 ---
 

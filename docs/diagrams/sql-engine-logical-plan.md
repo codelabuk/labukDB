@@ -35,6 +35,8 @@ flowchart TB
     STREAM --> OUT2
 ```
 
+**The flow**: `SqlQueryTranslator` parses the raw SQL text into a `SqlQuery` record — not yet a tree, just the parsed pieces (table, columns, predicate, `groupBy`, aggregates, `orderBy`, limit, and a join clause if there is one). `LogicalPlanBuilder` turns that into an actual `LogicalPlan` tree (shown below, before optimization), and `RuleBasedOptimizer` rewrites it into a leaner shape (also shown below) by absorbing filters onto their scan and pruning columns down to what's actually needed. `LogicalPlanExecutor` resolves that optimized plan into the files that actually need to be scanned, returning a `ResolvedScan` (single table) or `JoinExecution` (two tables). From there, `QueryCommand` decides how to run it: a query that needs aggregation, sorting, a limit, or a join goes through `CombinedQueryExecutor`/`HashJoinOperator`, which fully materializes what it needs before producing one combined result; a plain filtered scan with nothing to combine streams straight through `scanAndPrintAllFiles`, one file at a time, without ever loading the whole result into memory.
+
 **Tree shape before optimization** (`LogicalPlanBuilder`'s output — one `Project` always wraps the whole thing, and `Join` adds a second `TableScan` branch when the query joins two tables):
 
 ```mermaid
