@@ -16,6 +16,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
@@ -75,10 +76,22 @@ class IcebergTableWriterConcurrentTest {
 
     @Test
     void appendBatch_concurrentWriters_allCommitsLandWithNoLostUpdates(@TempDir Path tableRoot) throws Exception {
-        new HadoopTables(new Configuration())
-                .create(ICEBERG_SCHEMA, PartitionSpec.unpartitioned(), SortOrder.unsorted(), Map.of(), tableRoot.toString());
-
         int writerCount = 10;
+        // iceberg-core's own SnapshotProducer.commit() retry is bounded
+        // (TableProperties.COMMIT_NUM_RETRIES defaults to 4) -- fine for
+        // modest contention, but this test deliberately releases all
+        // writerCount writers at the exact same instant to force genuine
+        // simultaneous collisions, which can need more than 4 retries for
+        // the last writer to land under real scheduling variance (seen
+        // failing on a more heavily loaded CI runner: "Version 6 already
+        // exists" after exhausting the default budget). Raised to comfortably
+        // exceed the theoretical worst case (writerCount - 1 collisions) --
+        // the same tuning a real deployment expecting this level of write
+        // concurrency would need, not a test-only workaround.
+        new HadoopTables(new Configuration())
+                .create(ICEBERG_SCHEMA, PartitionSpec.unpartitioned(), SortOrder.unsorted(),
+                        Map.of(TableProperties.COMMIT_NUM_RETRIES, String.valueOf(writerCount * 3)),
+                        tableRoot.toString());
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
             ExecutorService pool = Executors.newFixedThreadPool(writerCount);
             CountDownLatch startGate = new CountDownLatch(1);
