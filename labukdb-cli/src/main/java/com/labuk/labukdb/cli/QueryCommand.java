@@ -7,6 +7,7 @@ import com.labuk.labukdb.core.execution.AggregateSpec;
 import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.HashJoinOperator;
+import com.labuk.labukdb.core.execution.JoinType;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.execution.SortLimitOperator;
 import com.labuk.labukdb.core.format.DataFileRef;
@@ -135,7 +136,7 @@ final class QueryCommand {
         TableCatalog catalog = TableCatalog.atDefaultLocation();
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-            if (query.join() != null) {
+            if (!query.joins().isEmpty()) {
                 runSqlJoin(query, plan, catalog, parsed, allocator);
                 return;
             }
@@ -206,94 +207,143 @@ final class QueryCommand {
     }
 
     /**
-     * SQL engine Phase 3, increment 1 — a two-table {@code INNER}
-     * equi-join. Each side is resolved and fully materialized completely
-     * independently (reusing {@link CombinedQueryExecutor} with empty
-     * {@code groupBy}/{@code aggregates}/{@code sortKeys} and
-     * {@code limit=-1}, which reduces to exactly "decode every surviving
-     * file and concatenate" — a join inherently needs to see every row
-     * of both sides anyway, the same assumption {@code GROUP BY}/
-     * {@code ORDER BY} already make), then {@link HashJoinOperator}
-     * combines them.
+     * A left-deep chain of one or more equi-joins ({@code INNER}/{@code
+     * LEFT}/{@code RIGHT}/{@code FULL}). Every table is resolved and
+     * fully materialized completely independently (reusing {@link
+     * CombinedQueryExecutor} with empty {@code groupBy}/{@code
+     * aggregates}/{@code sortKeys} and {@code limit=-1}, which reduces to
+     * exactly "decode every surviving file and concatenate" — a join
+     * inherently needs to see every row of at least one side anyway, the
+     * same assumption {@code GROUP BY}/{@code ORDER BY} already make),
+     * then {@link HashJoinOperator} folds them together one step at a
+     * time, left to right, feeding each step's combined output back in
+     * as the next step's "accumulated" side.
      *
-     * Increment 2 adds optional {@code GROUP BY}/aggregates/{@code ORDER
-     * BY}/{@code LIMIT} on top of the joined result — the exact same
-     * {@code AggregateOperator}/{@code SortLimitOperator} calls {@link
+     * <b>Cost-based build/probe side, {@code INNER} steps only:</b> compares
+     * the running accumulated side's total file bytes (summed across every
+     * table joined so far) against the new table's own total bytes (both
+     * from {@link ResolvedScan#totalBytes()}) and builds {@code
+     * HashJoinOperator}'s hash table from whichever is smaller — a byte-size
+     * heuristic, not real cardinality-based costing (no uniform row-count
+     * signal exists across both formats yet), and applied greedily per step,
+     * not as join-order reordering. {@code LEFT}/{@code RIGHT}/{@code FULL}
+     * steps keep the fixed non-preserved-side-builds convention — see
+     * {@code HashJoinOperator}'s own javadoc for why that stays decoupled
+     * from this heuristic.
+     *
+     * <b>Empty-table short-circuit, and its one known narrow gap:</b> any
+     * table with zero surviving files prints "0 row(s)" unconditionally,
+     * matching {@code INNER}'s always-correct behavior. For {@code LEFT}/
+     * {@code FULL}, this is technically incomplete — a *wholly empty*
+     * non-preserved table should still null-pad every preserved row rather
+     * than produce zero rows. Not fixed here: {@code CombinedQueryExecutor}
+     * returns {@code null} for zero files (confirmed by reading it), since
+     * it has no file to read a schema from and nothing else here carries
+     * one — synthesizing a correctly-typed empty root without that would
+     * need new schema-sourcing plumbing, out of scope for this phase. This
+     * is narrow and distinct from the *common* unmatched-row case (a table
+     * with >=1 file whose rows simply don't match the join key), which
+     * {@code HashJoinOperator} already handles correctly as a natural
+     * consequence of its own zero-match loop bounds — that's the normal
+     * path this short-circuit does NOT affect.
+     *
+     * Optional {@code GROUP BY}/aggregates/{@code ORDER BY}/{@code LIMIT}
+     * on top of the joined result reuse the exact same {@code
+     * AggregateOperator}/{@code SortLimitOperator} calls {@link
      * CombinedQueryExecutor#execute} already makes for the single-table
-     * path, just applied here to the join's combined output instead.
-     * When nothing aggregated, the final {@code SELECT} list (already
-     * the alias-qualified names {@code HashJoinOperator}'s own output
-     * uses, e.g. {@code "a.service"}) selects the printed columns via a
-     * zero-copy {@link VectorSchemaRoot} view over the last root's own
-     * vectors — never closed itself, since it shares (not copies) that
-     * root's buffers, which the surrounding {@code finally} closes.
+     * path. When nothing aggregated, the final {@code SELECT} list
+     * (already the alias-qualified names {@code HashJoinOperator}'s own
+     * output uses, e.g. {@code "a.service"}) selects the printed columns
+     * via a zero-copy {@link VectorSchemaRoot} view over the last root's
+     * own vectors — never closed itself, since it shares (not copies)
+     * that root's buffers, which the surrounding {@code finally} closes.
      */
     private static void runSqlJoin(SqlQuery query, LogicalPlan plan, TableCatalog catalog, CliArgs parsed,
                                      BufferAllocator allocator) throws Exception {
-        SqlQuery.JoinClause join = query.join();
-        ResolvedTable leftTable = resolveTableFormat(query.table(), catalog);
-        ResolvedTable rightTable = resolveTableFormat(join.rightTable(), catalog);
+        List<ResolvedTable> tables = new ArrayList<>();
+        tables.add(resolveTableFormat(query.table(), catalog));
+        for (SqlQuery.JoinStep step : query.joins()) {
+            tables.add(resolveTableFormat(step.rightTable(), catalog));
+        }
 
         JoinExecution execution = new LogicalPlanExecutor().resolveJoin(plan,
-                leftTable.format(), leftTable.dataFileRoot(), rightTable.format(), rightTable.dataFileRoot(),
+                tables.stream().map(ResolvedTable::format).toList(),
+                tables.stream().map(ResolvedTable::dataFileRoot).toList(),
                 parsed.version, parsed.asOf);
 
-        System.out.println("Left:  " + leftTable.displayName() + " (" + leftTable.versionLabel() + " "
-                + execution.left().snapshotVersion() + ") -- " + execution.left().files().size() + " / "
-                + execution.left().totalFilesInSnapshot() + " files");
-        System.out.println("Right: " + rightTable.displayName() + " (" + rightTable.versionLabel() + " "
-                + execution.right().snapshotVersion() + ") -- " + execution.right().files().size() + " / "
-                + execution.right().totalFilesInSnapshot() + " files");
+        System.out.println(tables.get(0).displayName() + " (" + tables.get(0).versionLabel() + " "
+                + execution.base().snapshotVersion() + ") -- " + execution.base().files().size() + " / "
+                + execution.base().totalFilesInSnapshot() + " files");
+        for (int i = 0; i < execution.steps().size(); i++) {
+            ResolvedTable table = tables.get(i + 1);
+            ResolvedScan resolved = execution.steps().get(i).table();
+            System.out.println("+ " + table.displayName() + " (" + table.versionLabel() + " "
+                    + resolved.snapshotVersion() + ") -- " + resolved.files().size() + " / "
+                    + resolved.totalFilesInSnapshot() + " files");
+        }
         System.out.println();
 
-        if (execution.left().files().isEmpty() || execution.right().files().isEmpty()) {
+        boolean anyEmpty = execution.base().files().isEmpty()
+                || execution.steps().stream().anyMatch(s -> s.table().files().isEmpty());
+        if (anyEmpty) {
             System.out.println("0 row(s)");
             return;
         }
 
-        try (VectorSchemaRoot leftRoot = new CombinedQueryExecutor().execute(execution.left().files(),
-                execution.left().columns(), List.of(), List.of(), List.of(), -1, allocator);
-             VectorSchemaRoot rightRoot = new CombinedQueryExecutor().execute(execution.right().files(),
-                     execution.right().columns(), List.of(), List.of(), List.of(), -1, allocator)) {
+        VectorSchemaRoot current = new CombinedQueryExecutor().execute(execution.base().files(),
+                execution.base().columns(), List.of(), List.of(), List.of(), -1, allocator);
+        try {
+            String currentAlias = query.baseAlias();
+            long accumulatedBytes = execution.base().totalBytes();
 
-            // Can't stay a single try-with-resources on one fixed variable --
-            // SQL engine Phase 3 increment 2's optional aggregate/sort steps
-            // each produce a fresh root, so this follows the same
-            // nullable-local-plus-finally idiom CombinedQueryExecutor.execute
-            // already uses, to guarantee every intermediate root still closes.
-            VectorSchemaRoot current = new HashJoinOperator().innerJoin(
-                    leftRoot, execution.leftKeys(), join.leftAlias(),
-                    rightRoot, execution.rightKeys(), join.rightAlias(), allocator);
-            try {
-                if (execution.aggregate() != null) {
-                    VectorSchemaRoot aggregated = new AggregateOperator().aggregate(
-                            List.of(current), execution.aggregate().groupByColumns(),
-                            execution.aggregate().aggregates(), allocator);
-                    current.close();
-                    current = aggregated;
-                }
-                if (execution.sort() != null || execution.limit() != null) {
-                    List<SortKey> sortKeys = execution.sort() != null ? execution.sort().sortKeys() : List.of();
-                    long limitValue = execution.limit() != null ? execution.limit().limit() : -1;
-                    VectorSchemaRoot sorted = new SortLimitOperator().sortAndLimit(current, sortKeys, limitValue, allocator);
-                    current.close();
-                    current = sorted;
-                }
+            for (int i = 0; i < execution.steps().size(); i++) {
+                JoinExecution.Step step = execution.steps().get(i);
+                SqlQuery.JoinStep sqlStep = query.joins().get(i);
 
-                // An aggregate's own output (groupByColumns ++ aggregate
-                // outputs) is already the final shape -- same reasoning as
-                // the single-table path, so this zero-copy trim only runs
-                // when nothing aggregated the join's wider combined columns.
-                VectorSchemaRoot toPrint = execution.aggregate() == null
-                        ? new VectorSchemaRoot(query.columns().stream().map(current::getVector).toList())
-                        : current;
-                printHeader(toPrint);
-                printRows(toPrint, toPrint.getRowCount());
-                System.out.println();
-                System.out.println(toPrint.getRowCount() + " row(s)");
-            } finally {
-                current.close();
+                try (VectorSchemaRoot newTableRoot = new CombinedQueryExecutor().execute(step.table().files(),
+                        step.table().columns(), List.of(), List.of(), List.of(), -1, allocator)) {
+
+                    boolean buildFromLeft = step.type() == JoinType.INNER && accumulatedBytes <= step.table().totalBytes();
+
+                    VectorSchemaRoot joined = new HashJoinOperator().join(step.type(),
+                            current, step.leftKeys(), currentAlias,
+                            newTableRoot, step.rightKeys(), sqlStep.rightAlias(),
+                            buildFromLeft, allocator);
+                    current.close();
+                    current = joined;
+                    currentAlias = null; // every later step's accumulated side is already alias-qualified
+                    accumulatedBytes += step.table().totalBytes();
+                }
             }
+
+            if (execution.aggregate() != null) {
+                VectorSchemaRoot aggregated = new AggregateOperator().aggregate(
+                        List.of(current), execution.aggregate().groupByColumns(),
+                        execution.aggregate().aggregates(), allocator);
+                current.close();
+                current = aggregated;
+            }
+            if (execution.sort() != null || execution.limit() != null) {
+                List<SortKey> sortKeys = execution.sort() != null ? execution.sort().sortKeys() : List.of();
+                long limitValue = execution.limit() != null ? execution.limit().limit() : -1;
+                VectorSchemaRoot sorted = new SortLimitOperator().sortAndLimit(current, sortKeys, limitValue, allocator);
+                current.close();
+                current = sorted;
+            }
+
+            // An aggregate's own output (groupByColumns ++ aggregate
+            // outputs) is already the final shape -- same reasoning as
+            // the single-table path, so this zero-copy trim only runs
+            // when nothing aggregated the join chain's wider combined columns.
+            VectorSchemaRoot toPrint = execution.aggregate() == null
+                    ? new VectorSchemaRoot(query.columns().stream().map(current::getVector).toList())
+                    : current;
+            printHeader(toPrint);
+            printRows(toPrint, toPrint.getRowCount());
+            System.out.println();
+            System.out.println(toPrint.getRowCount() + " row(s)");
+        } finally {
+            current.close();
         }
     }
 

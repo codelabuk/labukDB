@@ -74,8 +74,8 @@ public final class OperatorBenchmark {
             right.setRowCount(rows);
 
             long start = System.nanoTime();
-            try (VectorSchemaRoot result = new HashJoinOperator().innerJoin(
-                    left, List.of("key"), "a", right, List.of("key"), "b", allocator)) {
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    left, List.of("key"), "a", right, List.of("key"), "b", false, allocator)) {
                 long elapsedMs = (System.nanoTime() - start) / 1_000_000;
                 System.out.printf("HashJoinOperator  rows=%,d (1:1)    -> %,d ms (%,d result rows)%n",
                         rows, elapsedMs, result.getRowCount());

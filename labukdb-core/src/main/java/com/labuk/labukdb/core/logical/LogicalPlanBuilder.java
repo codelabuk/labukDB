@@ -18,7 +18,7 @@ public final class LogicalPlanBuilder {
     }
 
     public static LogicalPlan build(SqlQuery query) {
-        if (query.join() != null) {
+        if (!query.joins().isEmpty()) {
             return buildJoin(query);
         }
 
@@ -39,35 +39,58 @@ public final class LogicalPlanBuilder {
     }
 
     /**
-     * SQL engine Phase 3, increment 1. Each side's own {@code Filter} is
-     * placed directly on its own {@code TableScan} here, exactly like
-     * the single-table path above — {@link PushFilterIntoScan}'s
-     * existing recursive absorption needs no new logic to handle this,
-     * only a new case telling it to recurse into a {@link Join}'s two
-     * children (see that class).
+     * Folds {@code query.joins()} into a left-deep chain of {@link Join}
+     * nodes: the base table joins the first step's table, that combined
+     * result joins the second step's table, and so on. Each step's own
+     * {@code Filter} is placed directly on its own fresh {@code
+     * TableScan} — {@link PushFilterIntoScan}'s existing recursive
+     * absorption needs no new logic to handle this, since it already
+     * recurses into both of a {@link Join}'s children generically.
+     *
+     * {@code RIGHT} reaches this method and the {@link Join} node it
+     * builds completely unchanged — unlike an earlier design that
+     * considered canonicalizing it into a swapped {@code LEFT} here,
+     * {@code core.execution.HashJoinOperator} itself delegates {@code
+     * RIGHT} to its {@code LEFT} implementation at call time instead
+     * (see that class's javadoc), which keeps this tree's left/right
+     * shape a simple, unambiguous invariant: left is always
+     * "accumulated so far," right is always "this step's fresh table" —
+     * regardless of join type, at every step.
      */
     private static LogicalPlan buildJoin(SqlQuery query) {
-        SqlQuery.JoinClause join = query.join();
-
-        LogicalPlan left = new TableScan(query.table(), null, null);
-        if (join.leftPredicate() != null) {
-            left = new Filter(left, join.leftPredicate());
+        LogicalPlan accumulated = new TableScan(query.table(), null, null);
+        if (query.predicate() != null) {
+            accumulated = new Filter(accumulated, query.predicate());
         }
 
-        LogicalPlan right = new TableScan(join.rightTable(), null, null);
-        if (join.rightPredicate() != null) {
-            right = new Filter(right, join.rightPredicate());
+        List<SqlQuery.JoinStep> steps = query.joins();
+        for (int i = 0; i < steps.size(); i++) {
+            SqlQuery.JoinStep step = steps.get(i);
+
+            LogicalPlan newTable = new TableScan(step.rightTable(), null, null);
+            if (step.rightPredicate() != null) {
+                newTable = new Filter(newTable, step.rightPredicate());
+            }
+
+            List<JoinKey> keys = new ArrayList<>();
+            for (SqlQuery.JoinKeyPair pair : step.keys()) {
+                // The accumulated side's column is bare only for this
+                // chain's very first step (the base table hasn't been
+                // through any join yet, so it isn't alias-prefixed); every
+                // later step's accumulated side is already a
+                // HashJoinOperator output, whose columns are alias-prefixed.
+                String leftColumn = (i == 0) ? pair.leftColumn() : pair.leftTableAlias() + "." + pair.leftColumn();
+                keys.add(new JoinKey(leftColumn, pair.rightColumn()));
+            }
+
+            accumulated = new Join(accumulated, newTable, keys, step.type());
         }
 
-        List<JoinKey> keys = new ArrayList<>();
-        for (SqlQuery.JoinKeyPair pair : join.keys()) {
-            keys.add(new JoinKey(pair.leftColumn(), pair.rightColumn()));
-        }
-
-        // SQL engine Phase 3, increment 2: wraps Join exactly the way build()
-        // above wraps a single-table TableScan -- AggregateOperator/
-        // SortLimitOperator run on the join's combined output unchanged.
-        LogicalPlan plan = new Join(left, right, keys);
+        // SQL engine Phase 3, increment 2: wraps the join chain exactly the
+        // way build() above wraps a single-table TableScan --
+        // AggregateOperator/SortLimitOperator run on the combined output
+        // unchanged.
+        LogicalPlan plan = accumulated;
         if (!query.groupByColumns().isEmpty() || !query.aggregates().isEmpty()) {
             plan = new Aggregate(plan, query.groupByColumns(), query.aggregates());
         }

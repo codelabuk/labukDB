@@ -106,9 +106,10 @@ an Arrow `Schema` to each format's own schema representation
 plain filtered scan: `AggregateOperator` (`GROUP BY` plus `SUM`/`COUNT`/
 `MIN`/`MAX`/`AVG`), `SortLimitOperator` (`ORDER BY`/`LIMIT`, built on
 `arrow-algorithm`'s sort primitives rather than hand-rolled comparison
-logic), `HashJoinOperator` (a two-table `INNER` equi-join — classic hash
-build/probe, with a true fan-out on a duplicate build-side key and
-standard SQL null-key semantics), and `CombinedQueryExecutor` (decode,
+logic), `HashJoinOperator` (equi-joins — `INNER`/`LEFT`/`RIGHT`/`FULL`,
+any number of tables chained left-deep — classic hash build/probe, with
+a true fan-out on a duplicate build-side key and standard SQL null-key
+semantics), and `CombinedQueryExecutor` (decode,
 concatenate, then optionally aggregate and optionally sort/limit — what
 any query that can't be answered file-by-file needs, since a `GROUP BY`,
 a global `ORDER BY ... LIMIT`, and a join all need to see every
@@ -260,24 +261,39 @@ REST-catalog Iceberg alike.
 **Supported today**: `SELECT <col> | <AGGFUNC>(<col>) AS <alias> FROM
 <table> [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]`, with
 `=`/`!=`/`<`/`<=`/`>`/`>=`/`IN`/`LIKE`/`AND`/`OR` predicates and
-`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` aggregates — and a real two-table
-`INNER` equi-join, including combined with `GROUP BY`/`ORDER BY`/
-`LIMIT` on the joined result. Every column reference must be
-table-qualified once a join is present. Each side of a join resolves
-independently, through the same per-format detection a single-table
-query uses — which is why a Delta table can join an Iceberg table with
-no format-specific join code.
+`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` aggregates — and equi-joins across any
+number of tables, `INNER`/`LEFT`/`RIGHT`/`FULL`, each resolved as a
+left-deep chain, including combined with `GROUP BY`/`ORDER BY`/`LIMIT`
+on the joined result. Every column reference must be table-qualified
+once a join is present. Each table resolves independently, through the
+same per-format detection a single-table query uses — which is why a
+Delta table can join an Iceberg table with no format-specific join
+code, in any position in the chain. For an `INNER` step, the hash
+table is built from whichever side has fewer total file bytes (a cheap
+byte-size heuristic, not real cardinality-based costing); `LEFT`/
+`RIGHT`/`FULL` keep a fixed, correctness-driven build side instead
+(`RIGHT` itself is resolved by delegating to the `LEFT` implementation
+with every argument swapped, inside `HashJoinOperator` — the tree never
+needs to represent it specially).
 
-**Not supported**, stated as current scope boundaries: `LEFT`/`RIGHT`/
-`FULL`/`CROSS` joins, non-equi join conditions, three-or-more-table
-joins, cost-based build/probe side selection (the right table is always
-the hash-build side), subqueries, computed `SELECT` expressions (every
-item must be a bare column or one of the five aggregate functions — no
-`a + b`, no `CASE`, no scalar functions), window functions, `UNION`, and
-generic `NOT`/`IS NULL` (`Predicate` has no generic negation by design).
-`COUNT(*)` specifically is rejected in favor of `COUNT(column)`
-(non-null values of that column), matching the aggregate operator's own
-semantics rather than introducing a second meaning for `COUNT`.
+**Not supported**, stated as current scope boundaries: `CROSS`/
+`NATURAL`/`SEMI` joins, non-equi join conditions, cost-based join
+*order* (which tables join first is exactly what the SQL text said,
+never reordered — only the build/probe *side* within an already-fixed
+step is heuristic), a `WHERE` condition on the non-preserved side of
+`LEFT`/`RIGHT` or on either side of `FULL` (rejected with a clear error
+at translation time — pre-filtering it would silently change which rows
+get null-padded; a condition on the preserved side works normally),
+subqueries, computed `SELECT` expressions (every item must be a bare
+column or one of the five aggregate functions — no `a + b`, no `CASE`,
+no scalar functions), window functions, `UNION`, and generic `NOT`/
+`IS NULL` (`Predicate` has no generic negation by design). `COUNT(*)`
+specifically is rejected in favor of `COUNT(column)` (non-null values
+of that column), matching the aggregate operator's own semantics
+rather than introducing a second meaning for `COUNT`. `LEFT`/`RIGHT`/
+`FULL` and 3+-way chains are verified against local fixtures only, not
+yet against real MinIO (the existing MinIO join coverage predates this
+work and is `INNER`-only).
 
 ## Type system
 
@@ -327,4 +343,7 @@ prioritized backlog:
   Metastore, Glue, or Nessie integration.
 - **No cost-based query optimization** — two rule-based rewrites
   (filter pushdown, column pruning), nothing resembling a real
-  statistics-driven planner.
+  statistics-driven planner. The one exception is narrow: an `INNER`
+  join step picks its hash-build side by comparing total file bytes —
+  a cheap heuristic, not cardinality estimation, and it never reorders
+  *which* tables join first.

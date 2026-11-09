@@ -47,46 +47,88 @@ public final class LogicalPlanExecutor {
 
         ResolvedScan side = resolveSide(scan, format, dataFileRoot, version, asOf);
         return new ResolvedScan(side.files(), side.columns(), aggregate, sort, limit,
-                side.snapshotVersion(), side.totalFilesInSnapshot(), side.filesSkipped());
+                side.snapshotVersion(), side.totalFilesInSnapshot(), side.filesSkipped(), side.totalBytes());
     }
 
     /**
-     * SQL engine Phase 3, increment 1: finds the two-table {@link Join}
-     * in an optimized plan and resolves each side independently via
-     * {@link #resolveSide} — the exact same per-side logic the
-     * single-table {@link #resolve} uses, run twice. After optimization
-     * each side is guaranteed to be a bare {@link TableScan} ({@link
-     * PushFilterIntoScan} has already absorbed any {@link Filter}
-     * directly onto it), so each side can be resolved completely
-     * independently — including, as a free consequence rather than a
-     * specifically-built feature, against two different table formats
-     * (one Delta, one Iceberg).
+     * Finds the (possibly multi-step, left-deep) {@link Join} chain in an
+     * optimized plan and resolves every table independently via {@link
+     * #resolveSide} — the exact same per-side logic the single-table
+     * {@link #resolve} uses, run once per table. After optimization every
+     * table is guaranteed to be a bare {@link TableScan} ({@link
+     * PushFilterIntoScan} has already absorbed any {@link Filter} directly
+     * onto it), so each can be resolved completely independently —
+     * including, as a free consequence rather than a specifically-built
+     * feature, against a different table format per table (Delta mixed
+     * with Iceberg, in any position).
+     *
+     * @param formats, dataRoots one entry per joined table, in the same
+     *                 order the SQL introduced them (base table first,
+     *                 then each join step's new table) — size must be
+     *                 {@code chain length + 1}.
      */
-    public JoinExecution resolveJoin(LogicalPlan optimizedPlan, TableFormat leftFormat, TableLocation leftDataRoot,
-                                      TableFormat rightFormat, TableLocation rightDataRoot,
+    public JoinExecution resolveJoin(LogicalPlan optimizedPlan, List<TableFormat> formats, List<TableLocation> dataRoots,
                                       Long version, Instant asOf) throws Exception {
-        Join join = findJoin(optimizedPlan);
-        TableScan leftScan = (TableScan) join.left();
-        TableScan rightScan = (TableScan) join.right();
+        Join outermost = findJoin(optimizedPlan);
+        List<Join> chain = flattenJoinChain(outermost);
+        TableScan baseScan = baseScanOf(outermost);
 
-        ResolvedScan leftResolved = resolveSide(leftScan, leftFormat, leftDataRoot, version, asOf);
-        ResolvedScan rightResolved = resolveSide(rightScan, rightFormat, rightDataRoot, version, asOf);
+        if (formats.size() != chain.size() + 1 || dataRoots.size() != chain.size() + 1) {
+            throw new IllegalArgumentException("Expected " + (chain.size() + 1) + " format(s)/location(s) "
+                    + "(one per joined table), got " + formats.size() + " format(s) and " + dataRoots.size() + " location(s)");
+        }
 
-        List<String> leftKeys = new ArrayList<>();
-        List<String> rightKeys = new ArrayList<>();
-        for (JoinKey key : join.keys()) {
-            leftKeys.add(key.leftColumn());
-            rightKeys.add(key.rightColumn());
+        ResolvedScan baseResolved = resolveSide(baseScan, formats.get(0), dataRoots.get(0), version, asOf);
+
+        List<JoinExecution.Step> steps = new ArrayList<>();
+        for (int i = 0; i < chain.size(); i++) {
+            Join step = chain.get(i);
+            TableScan newTableScan = (TableScan) step.right();
+            ResolvedScan resolved = resolveSide(newTableScan, formats.get(i + 1), dataRoots.get(i + 1), version, asOf);
+
+            List<String> leftKeys = new ArrayList<>();
+            List<String> rightKeys = new ArrayList<>();
+            for (JoinKey key : step.keys()) {
+                leftKeys.add(key.leftColumn());
+                rightKeys.add(key.rightColumn());
+            }
+            steps.add(new JoinExecution.Step(step.type(), resolved, leftKeys, rightKeys));
         }
 
         Aggregate aggregate = findAggregate(optimizedPlan);
         Sort sort = findSort(optimizedPlan);
         Limit limit = findLimit(optimizedPlan);
 
-        return new JoinExecution(leftResolved, rightResolved, leftKeys, rightKeys, aggregate, sort, limit);
+        return new JoinExecution(baseResolved, steps, aggregate, sort, limit);
     }
 
-    /** One side's independently-resolved scan — shared building block for both {@link #resolve} and {@link #resolveJoin}. */
+    /**
+     * Unwinds a left-deep {@link Join} chain into first-to-last order —
+     * {@code outermost} is the chain's LAST join (its {@code left()} is
+     * either another {@code Join}, for an earlier step, or the base
+     * {@link TableScan}, if this is the chain's only join).
+     */
+    private static List<Join> flattenJoinChain(Join outermost) {
+        List<Join> reversed = new ArrayList<>();
+        LogicalPlan current = outermost;
+        while (current instanceof Join j) {
+            reversed.add(j);
+            current = j.left();
+        }
+        List<Join> inOrder = new ArrayList<>(reversed);
+        java.util.Collections.reverse(inOrder);
+        return inOrder;
+    }
+
+    private static TableScan baseScanOf(Join outermost) {
+        LogicalPlan current = outermost;
+        while (current instanceof Join j) {
+            current = j.left();
+        }
+        return (TableScan) current;
+    }
+
+    /** One table's independently-resolved scan — shared building block for both {@link #resolve} and {@link #resolveJoin}. */
     private ResolvedScan resolveSide(TableScan scan, TableFormat format, TableLocation dataFileRoot,
                                       Long version, Instant asOf) throws Exception {
         NormalizedSnapshot snapshot = version != null ? format.atVersion(version)
@@ -96,15 +138,17 @@ public final class LogicalPlanExecutor {
         NormalizedScanPlan scanPlan = new QueryPlanner().planNormalized(snapshot, scan.predicate(), scan.requestedColumns());
 
         List<FileScan> files = new ArrayList<>();
+        long totalBytes = 0;
         for (DataFileRef file : scanPlan.getFilesToScan()) {
             TableLocation dataFile = dataFileRoot.resolve(file.getPath());
             Predicate perFileResidual =
                     PartitionValueSubstituter.simplify(scanPlan.getResidualPredicate(), file.getPartitionValues());
             files.add(new FileScan(dataFile, perFileResidual, file.getPartitionValues()));
+            totalBytes += file.getSizeBytes();
         }
 
         return new ResolvedScan(files, scan.requestedColumns(), null, null, null,
-                snapshot.getVersion(), scanPlan.getTotalFilesInSnapshot(), scanPlan.getFilesSkipped());
+                snapshot.getVersion(), scanPlan.getTotalFilesInSnapshot(), scanPlan.getFilesSkipped(), totalBytes);
     }
 
     private TableScan findScan(LogicalPlan plan) {

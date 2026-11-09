@@ -2,6 +2,7 @@ package com.labuk.labukdb.core.query;
 
 import com.labuk.labukdb.core.execution.AggregateFunction;
 import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.JoinType;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.planner.ComparisonOp;
 import com.labuk.labukdb.core.planner.Predicate;
@@ -36,8 +37,10 @@ import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.statement.select.SelectItem;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -68,27 +71,36 @@ import java.util.Set;
  * pre-existing {@code COUNT(column)}-only semantics (counts non-null
  * values of a named column), not a new limitation introduced here.
  *
- * <b>{@code JOIN}, SQL engine Phase 3 increment 1 — two-table {@code
- * INNER} equi-join only:</b> exactly one {@code JOIN}, {@code INNER}
- * only (no {@code LEFT}/{@code RIGHT}/{@code FULL}/{@code CROSS}),
- * {@code ON} must be one or more {@code AND}-combined column-to-column
- * equalities (no non-equi conditions), every column referenced anywhere
- * ({@code SELECT}/{@code WHERE}/{@code ON}/{@code GROUP BY}/{@code ORDER BY}/
- * an aggregate's column argument) must be table-qualified. {@code GROUP BY}/
- * aggregates/{@code ORDER BY}/{@code LIMIT} combined with a join (SQL
- * engine Phase 3, increment 2) run exactly like the single-table path —
- * {@code AggregateOperator}/{@code SortLimitOperator} on the join's
- * combined output, unchanged — still no {@code LEFT}/{@code RIGHT}/
- * {@code FULL}, no 3+-way joins, no cost-based join-side selection.
- * {@code WHERE}
- * must be per-side-splittable — each top-level {@code AND}-ed condition
- * must reference columns from exactly one of the two joined tables; a
- * condition spanning both belongs in {@code JOIN ... ON}, not
- * {@code WHERE}, and is rejected with a clear error (see {@link
- * SqlQuery.JoinClause}'s own javadoc for why: evaluating a cross-table
- * {@code WHERE} condition after the join would need a "{@code Predicate}
- * against an already-decoded Arrow row" evaluator that doesn't exist
- * yet, a separate piece of work).
+ * <b>{@code JOIN}, SQL engine Phase 3 — {@code INNER}/{@code LEFT}/
+ * {@code RIGHT}/{@code FULL}, any number of tables:</b> {@code ON} must
+ * be one or more {@code AND}-combined column-to-column equalities (no
+ * non-equi conditions) relating the step's new table to some
+ * already-joined one; every column referenced anywhere ({@code SELECT}/
+ * {@code WHERE}/{@code ON}/{@code GROUP BY}/{@code ORDER BY}/an
+ * aggregate's column argument) must be table-qualified. {@code GROUP BY}/
+ * aggregates/{@code ORDER BY}/{@code LIMIT} combined with a join run
+ * exactly like the single-table path — {@code AggregateOperator}/
+ * {@code SortLimitOperator} on the join's combined output, unchanged.
+ * Still no {@code CROSS}/{@code NATURAL}/{@code SEMI} joins, no non-equi
+ * conditions, no cost-based *join order* (build/probe *side* selection
+ * within an already-fixed {@code INNER} step is a separate, implemented
+ * thing — see {@code HashJoinOperator}).
+ * <p>
+ * {@code WHERE} must be per-table-splittable — each top-level {@code
+ * AND}-ed condition must reference columns from exactly one joined
+ * table; a condition spanning multiple tables belongs in {@code JOIN
+ * ... ON}, not {@code WHERE} (rejected with a clear error: evaluating a
+ * cross-table {@code WHERE} condition after the join would need a
+ * "{@code Predicate} against an already-decoded Arrow row" evaluator
+ * that doesn't exist yet). A condition on a single table is also
+ * rejected, separately, if that table can't be safely pre-filtered
+ * before its own join — see {@link SqlQuery.JoinStep}'s javadoc and
+ * {@link #classifyPredicateSafety}: the non-preserved side of a
+ * {@code LEFT}/{@code RIGHT} join, or either side of a {@code FULL}
+ * join, would silently change which rows get null-padded if filtered
+ * first. This is a deliberate, named scope boundary, not a silent gap —
+ * the fix (evaluating such a predicate after the join, against the
+ * null-padded result) is deferred, not attempted incorrectly.
  *
  * <b>{@code IN} must be parenthesized when combined with {@code AND}/
  * {@code OR}:</b> confirmed against a real parse, {@code jsqlparser}'s
@@ -176,40 +188,57 @@ public final class SqlQueryTranslator {
         // own shape); plain SELECT items collected above are not otherwise used.
         List<String> effectiveColumns = (groupByColumns.isEmpty() && aggregates.isEmpty()) ? columns : List.of();
 
-        return new SqlQuery(table.getName(), effectiveColumns, predicate, groupByColumns, aggregates, orderBy, limit, null);
+        return new SqlQuery(table.getName(), null, effectiveColumns, predicate, groupByColumns, aggregates, orderBy, limit, List.of());
     }
 
     /**
-     * SQL engine Phase 3, increment 1 — see this class's own javadoc for
-     * the exact scope boundaries. Reached only once {@code translate}
-     * has already confirmed a non-empty {@code JOIN} list.
+     * SQL engine Phase 3 — see this class's own javadoc for the exact
+     * scope boundaries. Reached only once {@code translate} has already
+     * confirmed a non-empty {@code JOIN} list. Builds a left-deep chain:
+     * {@code baseTable} joins {@code joins.get(0)}'s table, that
+     * combined result joins {@code joins.get(1)}'s table, and so on —
+     * matching exactly how {@code core.logical.LogicalPlanBuilder} folds
+     * {@link SqlQuery#joins()} into nested {@code Join} nodes.
      */
-    private static SqlQuery translateJoin(PlainSelect plainSelect, Table leftTable, List<Join> joins) {
-        if (joins.size() != 1) {
-            throw new IllegalArgumentException(
-                    "Only a single JOIN (two tables) is supported, found " + joins.size());
+    private static SqlQuery translateJoin(PlainSelect plainSelect, Table baseTable, List<Join> joins) {
+        String baseAlias = aliasOrName(baseTable);
+
+        // The order tables are introduced in -- base first, then each
+        // step's new table -- is exactly the left-deep chain's own
+        // "already accumulated" sequence.
+        List<String> aliasesInOrder = new ArrayList<>();
+        aliasesInOrder.add(baseAlias);
+
+        List<JoinType> types = new ArrayList<>();
+        List<Table> rightTables = new ArrayList<>();
+        List<String> rightAliases = new ArrayList<>();
+        for (Join join : joins) {
+            JoinType type = joinType(join);
+            if (!(join.getRightItem() instanceof Table rightTable)) {
+                throw new IllegalArgumentException(
+                        "JOIN's right side must be a plain table reference, not a subquery: " + join.getRightItem());
+            }
+            String rightAlias = aliasOrName(rightTable);
+            types.add(type);
+            rightTables.add(rightTable);
+            rightAliases.add(rightAlias);
+            aliasesInOrder.add(rightAlias);
         }
-        Join join = joins.get(0);
-        if (!join.isInnerJoin()) {
-            throw new IllegalArgumentException(
-                    "Only INNER JOIN is supported (no LEFT/RIGHT/FULL/CROSS/OUTER): " + join);
-        }
-        if (!(join.getRightItem() instanceof Table rightTable)) {
-            throw new IllegalArgumentException(
-                    "JOIN's right side must be a plain table reference, not a subquery: " + join.getRightItem());
+        Set<String> allAliases = new LinkedHashSet<>(aliasesInOrder);
+        if (allAliases.size() != aliasesInOrder.size()) {
+            throw new IllegalArgumentException("Every joined table needs a distinct alias (duplicate found): " + aliasesInOrder);
         }
 
-        String leftAlias = aliasOrName(leftTable);
-        String rightAlias = aliasOrName(rightTable);
+        Set<String> unsafeForPredicatePushdown = classifyPredicateSafety(baseAlias, types, rightAliases);
 
         List<String> joinColumns = new ArrayList<>();
         List<AggregateSpec> aggregates = new ArrayList<>();
         for (SelectItem<?> item : plainSelect.getSelectItems()) {
             Expression expr = item.getExpression();
             if (expr instanceof Column column) {
-                joinColumns.add(requireQualifiedColumnName(column, leftAlias, rightAlias));
+                joinColumns.add(requireQualifiedColumnName(column, allAliases));
             } else if (expr instanceof Function function) {
-                aggregates.add(toJoinAggregateSpec(function, item, leftAlias, rightAlias));
+                aggregates.add(toJoinAggregateSpec(function, item, allAliases));
             } else {
                 throw new IllegalArgumentException("Unsupported SELECT item (only plain columns and "
                         + "aggregate functions are supported): " + expr);
@@ -222,7 +251,7 @@ public final class SqlQueryTranslator {
                 if (!(raw instanceof Column column)) {
                     throw new IllegalArgumentException("GROUP BY only supports plain columns: " + raw);
                 }
-                groupByColumns.add(requireQualifiedColumnName(column, leftAlias, rightAlias));
+                groupByColumns.add(requireQualifiedColumnName(column, allAliases));
             }
         }
 
@@ -233,7 +262,7 @@ public final class SqlQueryTranslator {
                 if (!(expr instanceof Column column)) {
                     throw new IllegalArgumentException("ORDER BY only supports plain columns, not expressions: " + expr);
                 }
-                orderBy.add(new SortKey(requireQualifiedColumnName(column, leftAlias, rightAlias), element.isAsc()));
+                orderBy.add(new SortKey(requireQualifiedColumnName(column, allAliases), element.isAsc()));
             }
         }
 
@@ -248,38 +277,100 @@ public final class SqlQueryTranslator {
         // so the plain SELECT columns collected above are irrelevant.
         List<String> effectiveColumns = (groupByColumns.isEmpty() && aggregates.isEmpty()) ? joinColumns : List.of();
 
-        List<SqlQuery.JoinKeyPair> keys = toJoinKeys(join.getOnExpression(), leftAlias, rightAlias);
-
-        Predicate leftPredicate = null;
-        Predicate rightPredicate = null;
+        // Per-table WHERE buckets, keyed by alias -- base's own bucket feeds
+        // SqlQuery.predicate; every other table's feeds its introducing
+        // JoinStep.rightPredicate (see assembly below).
+        Map<String, Predicate> perTablePredicate = new LinkedHashMap<>();
         if (plainSelect.getWhere() != null) {
-            Expression[] split = splitJoinWhere(plainSelect.getWhere(), leftAlias, rightAlias);
-            leftPredicate = split[0] == null ? null : toPredicate(split[0]);
-            rightPredicate = split[1] == null ? null : toPredicate(split[1]);
+            splitJoinWhere(plainSelect.getWhere(), allAliases, unsafeForPredicatePushdown, perTablePredicate);
         }
 
-        SqlQuery.JoinClause joinClause = new SqlQuery.JoinClause(
-                leftAlias, rightTable.getName(), rightAlias, keys, leftPredicate, rightPredicate);
-        return new SqlQuery(leftTable.getName(), effectiveColumns, null, groupByColumns, aggregates, orderBy, limit, joinClause);
+        List<SqlQuery.JoinStep> steps = new ArrayList<>();
+        for (int i = 0; i < joins.size(); i++) {
+            String rightAlias = rightAliases.get(i);
+            // Aliases introduced strictly before this step's own new table --
+            // base, plus every earlier step's right table.
+            Set<String> priorAliases = new LinkedHashSet<>(aliasesInOrder.subList(0, i + 1));
+            List<SqlQuery.JoinKeyPair> keys = toJoinKeys(joins.get(i).getOnExpression(), priorAliases, rightAlias);
+            steps.add(new SqlQuery.JoinStep(types.get(i), rightTables.get(i).getName(), rightAlias, keys,
+                    perTablePredicate.get(rightAlias)));
+        }
+
+        return new SqlQuery(baseTable.getName(), baseAlias, effectiveColumns, perTablePredicate.get(baseAlias),
+                groupByColumns, aggregates, orderBy, limit, steps);
+    }
+
+    private static JoinType joinType(Join join) {
+        if (join.isInnerJoin()) {
+            return JoinType.INNER;
+        }
+        if (join.isLeft()) {
+            return JoinType.LEFT;
+        }
+        if (join.isRight()) {
+            return JoinType.RIGHT;
+        }
+        if (join.isFull()) {
+            return JoinType.FULL;
+        }
+        throw new IllegalArgumentException(
+                "Only INNER/LEFT/RIGHT/FULL JOIN is supported (no CROSS/NATURAL/SEMI/OUTER without a side): " + join);
+    }
+
+    /**
+     * Which aliases can't be safely pre-filtered via {@code WHERE} before
+     * their own join — see {@link SqlQuery.JoinStep}'s javadoc for why.
+     * Walks the left-deep chain tracking {@code accumulated} (every alias
+     * introduced so far): a {@code LEFT} step taints only its own new
+     * table (the non-preserved side); a {@code RIGHT} step taints every
+     * already-accumulated table (the new table is the preserved side
+     * here); a {@code FULL} step taints its new table AND every
+     * already-accumulated one — {@code FULL} has no safely-preservable
+     * side at all, since pre-filtering either input can manufacture
+     * null-padded rows a correct post-join filter would have excluded
+     * (verified by hand-tracing a concrete {@code FULL JOIN ... WHERE}
+     * case, not assumed by analogy with {@code LEFT}). An {@code INNER}
+     * step taints nothing.
+     */
+    private static Set<String> classifyPredicateSafety(String baseAlias, List<JoinType> types, List<String> rightAliases) {
+        Set<String> unsafe = new LinkedHashSet<>();
+        Set<String> accumulated = new LinkedHashSet<>();
+        accumulated.add(baseAlias);
+        for (int i = 0; i < types.size(); i++) {
+            String newAlias = rightAliases.get(i);
+            switch (types.get(i)) {
+                case LEFT -> unsafe.add(newAlias);
+                case RIGHT -> unsafe.addAll(accumulated);
+                case FULL -> {
+                    unsafe.addAll(accumulated);
+                    unsafe.add(newAlias);
+                }
+                case INNER -> {
+                    // both sides remain safe
+                }
+            }
+            accumulated.add(newAlias);
+        }
+        return unsafe;
     }
 
     /** Same qualification rule {@link #toJoinKeys}/{@link #collectColumnTables} already enforce for ON/WHERE, reused for SELECT/GROUP BY/ORDER BY. */
-    private static String requireQualifiedColumnName(Column column, String leftAlias, String rightAlias) {
+    private static String requireQualifiedColumnName(Column column, Set<String> allAliases) {
         if (column.getTable() == null) {
             throw new IllegalArgumentException(
                     "Every column must be table-qualified when JOIN is present, e.g. "
-                            + leftAlias + ".col: " + column);
+                            + allAliases.iterator().next() + ".col: " + column);
         }
         String side = column.getTable().getName();
-        if (!leftAlias.equals(side) && !rightAlias.equals(side)) {
+        if (!allAliases.contains(side)) {
             throw new IllegalArgumentException("Column's table qualifier '" + side
-                    + "' doesn't match either joined table (" + leftAlias + ", " + rightAlias + "): " + column);
+                    + "' doesn't match any joined table " + allAliases + ": " + column);
         }
         return column.getFullyQualifiedName();
     }
 
     /** Same as {@link #toAggregateSpec}, except its column argument must be table-qualified (a join's combined output is alias-qualified). */
-    private static AggregateSpec toJoinAggregateSpec(Function function, SelectItem<?> item, String leftAlias, String rightAlias) {
+    private static AggregateSpec toJoinAggregateSpec(Function function, SelectItem<?> item, Set<String> allAliases) {
         if (item.getAlias() == null) {
             throw new IllegalArgumentException("Aggregate function requires an alias, e.g. "
                     + function.getName() + "(col) AS name: " + function);
@@ -299,21 +390,31 @@ public final class SqlQueryTranslator {
         if (params == null || params.size() != 1 || !(params.get(0) instanceof Column column)) {
             throw new IllegalArgumentException(aggFunction + " requires exactly one plain column argument: " + function);
         }
-        return new AggregateSpec(requireQualifiedColumnName(column, leftAlias, rightAlias), aggFunction, item.getUnquotedAliasName());
+        return new AggregateSpec(requireQualifiedColumnName(column, allAliases), aggFunction, item.getUnquotedAliasName());
     }
 
     private static String aliasOrName(Table table) {
         return table.getAlias() != null ? table.getAlias().getName() : table.getName();
     }
 
-    /** {@code ON a.x = b.y [AND a.y2 = b.y2 ...]} — no non-equi conditions, no OR. */
-    private static List<SqlQuery.JoinKeyPair> toJoinKeys(Expression onExpr, String leftAlias, String rightAlias) {
+    /**
+     * {@code ON a.x = b.y [AND a.y2 = b.y2 ...]} — no non-equi conditions,
+     * no OR. One side of each equality must be {@code rightAlias} (this
+     * step's own new table, bare column name); the other must be one of
+     * {@code priorAliases} (an already-joined table — the base table, or
+     * an earlier step's new table), recorded with its own alias so the
+     * executor knows whether to look that column up by its bare name
+     * (only true for the base table at the very first step) or by its
+     * already-alias-qualified name (every other case — see {@code
+     * QueryCommand.runSqlJoin}'s per-step key resolution).
+     */
+    private static List<SqlQuery.JoinKeyPair> toJoinKeys(Expression onExpr, Set<String> priorAliases, String rightAlias) {
         if (onExpr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
-            return toJoinKeys(grouped.get(0), leftAlias, rightAlias);
+            return toJoinKeys(grouped.get(0), priorAliases, rightAlias);
         }
         if (onExpr instanceof AndExpression and) {
-            List<SqlQuery.JoinKeyPair> result = new ArrayList<>(toJoinKeys(and.getLeftExpression(), leftAlias, rightAlias));
-            result.addAll(toJoinKeys(and.getRightExpression(), leftAlias, rightAlias));
+            List<SqlQuery.JoinKeyPair> result = new ArrayList<>(toJoinKeys(and.getLeftExpression(), priorAliases, rightAlias));
+            result.addAll(toJoinKeys(and.getRightExpression(), priorAliases, rightAlias));
             return result;
         }
         if (!(onExpr instanceof EqualsTo eq)) {
@@ -325,43 +426,41 @@ public final class SqlQueryTranslator {
         }
         String leftColTable = leftCol.getTable() == null ? null : leftCol.getTable().getName();
         String rightColTable = rightCol.getTable() == null ? null : rightCol.getTable().getName();
-        if (leftAlias.equals(leftColTable) && rightAlias.equals(rightColTable)) {
-            return List.of(new SqlQuery.JoinKeyPair(leftCol.getColumnName(), rightCol.getColumnName()));
+        if (priorAliases.contains(leftColTable) && rightAlias.equals(rightColTable)) {
+            return List.of(new SqlQuery.JoinKeyPair(leftColTable, leftCol.getColumnName(), rightCol.getColumnName()));
         }
-        if (rightAlias.equals(leftColTable) && leftAlias.equals(rightColTable)) {
-            return List.of(new SqlQuery.JoinKeyPair(rightCol.getColumnName(), leftCol.getColumnName()));
+        if (priorAliases.contains(rightColTable) && rightAlias.equals(leftColTable)) {
+            return List.of(new SqlQuery.JoinKeyPair(rightColTable, rightCol.getColumnName(), leftCol.getColumnName()));
         }
-        throw new IllegalArgumentException("JOIN ON columns must be qualified with the two joined tables ("
-                + leftAlias + ", " + rightAlias + "): " + eq);
+        throw new IllegalArgumentException("JOIN ON columns must relate this step's new table (" + rightAlias
+                + ") to an already-joined table " + priorAliases + ": " + eq);
     }
 
     /**
      * Splits a {@code WHERE} expression's top-level {@code AND} tree into
-     * each side's own share, operating on the raw {@code jsqlparser}
-     * {@link Expression} tree (not yet a {@link Predicate}) so each
-     * leaf's real table qualifier is still visible — {@link #toPredicate}
-     * (called separately on each half afterward) already strips
-     * qualifiers via {@code Column.getColumnName()}, which is exactly
-     * right for the physical column name but means routing must happen
-     * before that conversion, not after.
-     *
-     * @return a 2-element array, {@code [leftExpression, rightExpression]} — either may be {@code null}
+     * each table's own share, merging directly into {@code out} (keyed
+     * by alias) rather than returning anything — unlike the old two-table
+     * version, there's no fixed-size result to hand back once N tables
+     * are possible. Rejects (doesn't silently push) a condition on a
+     * table {@code unsafeAliases} names — see {@link #classifyPredicateSafety}.
      */
-    private static Expression[] splitJoinWhere(Expression expr, String leftAlias, String rightAlias) {
+    private static void splitJoinWhere(Expression expr, Set<String> allAliases, Set<String> unsafeAliases,
+                                        Map<String, Predicate> out) {
         if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
-            return splitJoinWhere(grouped.get(0), leftAlias, rightAlias);
+            splitJoinWhere(grouped.get(0), allAliases, unsafeAliases, out);
+            return;
         }
         if (expr instanceof AndExpression and) {
-            Expression[] left = splitJoinWhere(and.getLeftExpression(), leftAlias, rightAlias);
-            Expression[] right = splitJoinWhere(and.getRightExpression(), leftAlias, rightAlias);
-            return new Expression[] {andTogether(left[0], right[0]), andTogether(left[1], right[1])};
+            splitJoinWhere(and.getLeftExpression(), allAliases, unsafeAliases, out);
+            splitJoinWhere(and.getRightExpression(), allAliases, unsafeAliases, out);
+            return;
         }
 
         Set<String> tables = new LinkedHashSet<>();
         collectColumnTables(expr, tables);
         if (tables.size() != 1) {
             throw new IllegalArgumentException("WHERE condition must reference columns from exactly one joined "
-                    + "table (found " + tables + "); a condition spanning both tables belongs in JOIN ... ON, "
+                    + "table (found " + tables + "); a condition spanning multiple tables belongs in JOIN ... ON, "
                     + "not WHERE: " + expr);
         }
         String side = tables.iterator().next();
@@ -369,24 +468,17 @@ public final class SqlQueryTranslator {
             throw new IllegalArgumentException(
                     "Every WHERE column must be table-qualified when JOIN is present: " + expr);
         }
-        if (leftAlias.equals(side)) {
-            return new Expression[] {expr, null};
+        if (!allAliases.contains(side)) {
+            throw new IllegalArgumentException("WHERE column's table qualifier '" + side
+                    + "' doesn't match any joined table " + allAliases + ": " + expr);
         }
-        if (rightAlias.equals(side)) {
-            return new Expression[] {null, expr};
+        if (unsafeAliases.contains(side)) {
+            throw new IllegalArgumentException("WHERE condition on '" + side + "' can't be safely evaluated "
+                    + "before its own join (it's the non-preserved side of an outer join, or either side of a "
+                    + "FULL join) -- pre-filtering it would silently change which rows get null-padded. "
+                    + "Not supported yet: " + expr);
         }
-        throw new IllegalArgumentException("WHERE column's table qualifier '" + side
-                + "' doesn't match either joined table (" + leftAlias + ", " + rightAlias + "): " + expr);
-    }
-
-    private static Expression andTogether(Expression a, Expression b) {
-        if (a == null) {
-            return b;
-        }
-        if (b == null) {
-            return a;
-        }
-        return new AndExpression(a, b);
+        out.merge(side, toPredicate(expr), Predicate::and);
     }
 
     /** Walks the same expression shapes {@link #toPredicate} understands, collecting each leaf's table qualifier (or {@code null} if unqualified) instead of building a {@link Predicate}. */

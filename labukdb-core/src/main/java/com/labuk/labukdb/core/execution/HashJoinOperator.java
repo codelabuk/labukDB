@@ -15,41 +15,83 @@ import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Two-table {@code INNER} equi-join (SQL engine Phase 3, increment 1) —
- * both sides already fully decoded into memory (a join inherently needs
- * to see every row of at least the build side, the same assumption
- * {@code GROUP BY}/{@code ORDER BY} already make via {@code
- * CombinedQueryExecutor}). Classic hash build/probe: hashes {@code
- * right} by its key tuple, then probes with each {@code left} row —
- * {@code right} is always the build side in this increment, no
- * cost-based smaller-side selection yet (a stated simplification, not a
- * correctness issue). A duplicate key on the build side correctly
- * produces multiple emitted rows (true fan-out), and any row with a
- * {@code null} key component never matches anything, on either side —
- * standard SQL join-key null semantics.
+ * Hash-based equi-join — {@code INNER}, {@code LEFT}, {@code RIGHT}, and
+ * {@code FULL} — both sides already fully decoded into memory (a join
+ * inherently needs to see every row of at least the build side, the same
+ * assumption {@code GROUP BY}/{@code ORDER BY} already make via {@code
+ * CombinedQueryExecutor}).
  *
- * Output columns are every left column followed by every right column,
- * each renamed {@code "<alias>.<originalName>"} — the one place a SQL-
- * level table alias becomes a physical Arrow field name, purely so two
- * same-named columns from each side (e.g. both tables having an
- * {@code id} column) don't collide in the combined output.
+ * <b>{@code RIGHT} is not a real algorithm here</b> — {@code RIGHT(left,
+ * right)} is exactly {@code LEFT(right, left)} with every argument
+ * swapped (roots, keys, aliases), so {@link #join} delegates to the
+ * {@code LEFT} case rather than duplicating it. Output column order
+ * becomes right-then-left for that one call, which is safe: every
+ * caller looks columns up by their alias-qualified name, never by
+ * position (see {@code core.query.SqlQueryTranslator}'s own javadoc).
+ *
+ * <b>{@code FULL} is {@code LEFT}'s unmatched-left-row pass plus a
+ * second pass for unmatched build-side rows</b> — a {@link BitSet}
+ * tracks which build-side rows matched at least once during probing;
+ * anything left unset gets emitted afterward with the probe side's
+ * columns null. {@code INNER} keeps unmatched rows on either side
+ * dropped, same as before.
+ *
+ * <b>Build side:</b> hashes one side by its key tuple, then probes with
+ * the other. For {@code LEFT}/{@code FULL}, the non-preserved side is
+ * always the build side (unchanged, fixed convention — the correctness-
+ * critical null-padding logic stays simple, not entangled with a
+ * performance heuristic). For {@code INNER} only, {@code buildFromLeft}
+ * lets the caller pick the smaller side as the build side (a byte-size
+ * heuristic — see {@code core.cli.QueryCommand} — not real cost-based
+ * optimization); ignored for every other join type. A duplicate key on
+ * the build side correctly produces multiple emitted rows (true
+ * fan-out), and any row with a {@code null} key component never matches
+ * anything, on either side — standard SQL join-key null semantics.
+ *
+ * Output columns are every left column followed by every right column
+ * (by declared parameter order, regardless of which side was the build
+ * side), each renamed {@code "<alias>.<originalName>"} — the one place
+ * a SQL-level table alias becomes a physical Arrow field name, purely
+ * so two same-named columns from each side don't collide in the
+ * combined output. {@code leftAlias}/{@code rightAlias} may each be
+ * {@code null} instead, meaning that side's columns are already in
+ * their final, alias-qualified form and must be passed through
+ * unrenamed — needed for a 3+-way join's later steps, whose "left" is
+ * itself a previous call's already-renamed combined output (see {@code
+ * core.logical.LogicalPlanBuilder}'s own javadoc for the bare-vs-
+ * qualified key-name convention this pairs with).
  */
 public final class HashJoinOperator {
 
-    public VectorSchemaRoot innerJoin(VectorSchemaRoot left, List<String> leftKeys, String leftAlias,
-                                       VectorSchemaRoot right, List<String> rightKeys, String rightAlias,
-                                       BufferAllocator allocator) {
+    public VectorSchemaRoot join(JoinType type,
+                                  VectorSchemaRoot left, List<String> leftKeys, String leftAlias,
+                                  VectorSchemaRoot right, List<String> rightKeys, String rightAlias,
+                                  boolean buildFromLeft, BufferAllocator allocator) {
+        if (type == JoinType.RIGHT) {
+            return join(JoinType.LEFT, right, rightKeys, rightAlias, left, leftKeys, leftAlias, false, allocator);
+        }
         if (leftKeys.isEmpty() || leftKeys.size() != rightKeys.size()) {
             throw new IllegalArgumentException("Join requires at least one key pair, with equal counts on each side");
         }
 
-        List<FieldVector> leftKeyVectors = leftKeys.stream().map(left::getVector).toList();
-        List<FieldVector> rightKeyVectors = rightKeys.stream().map(right::getVector).toList();
+        // LEFT/FULL always build from the non-preserved side (right) --
+        // fixed, not cost-based. INNER is symmetric (no preserved side),
+        // so buildFromLeft may pick left instead.
+        boolean buildIsRight = !(type == JoinType.INNER && buildFromLeft);
+
+        VectorSchemaRoot buildRoot = buildIsRight ? right : left;
+        VectorSchemaRoot probeRoot = buildIsRight ? left : right;
+        List<String> buildKeyNames = buildIsRight ? rightKeys : leftKeys;
+        List<String> probeKeyNames = buildIsRight ? leftKeys : rightKeys;
+
+        List<FieldVector> buildKeyVectors = buildKeyNames.stream().map(buildRoot::getVector).toList();
+        List<FieldVector> probeKeyVectors = probeKeyNames.stream().map(probeRoot::getVector).toList();
 
         // Single primitive-typed key column on both sides -> hash/compare as
         // a raw long, no per-row boxed List<Object> composite key (just one
@@ -65,25 +107,25 @@ public final class HashJoinOperator {
         // to Long, which never .equals() each other either -- so this fast
         // path introduces no new cross-type matching behavior, just a
         // faster version of what already matches.
-        boolean fastPath = leftKeyVectors.size() == 1
-                && isLongEncodable(leftKeyVectors.get(0))
-                && leftKeyVectors.get(0).getClass() == rightKeyVectors.get(0).getClass();
+        boolean fastPath = buildKeyVectors.size() == 1
+                && isLongEncodable(buildKeyVectors.get(0))
+                && buildKeyVectors.get(0).getClass() == probeKeyVectors.get(0).getClass();
 
         Map<Long, List<Integer>> longIndex = null;
         Map<List<Object>, List<Integer>> boxedIndex = null;
         if (fastPath) {
-            FieldVector rightKey = rightKeyVectors.get(0);
+            FieldVector buildKey = buildKeyVectors.get(0);
             longIndex = new LinkedHashMap<>();
-            for (int row = 0; row < right.getRowCount(); row++) {
-                if (rightKey.isNull(row)) {
+            for (int row = 0; row < buildRoot.getRowCount(); row++) {
+                if (buildKey.isNull(row)) {
                     continue; // a null key component never matches -- standard SQL join semantics
                 }
-                longIndex.computeIfAbsent(encodeLong(rightKey, row), k -> new ArrayList<>()).add(row);
+                longIndex.computeIfAbsent(encodeLong(buildKey, row), k -> new ArrayList<>()).add(row);
             }
         } else {
             boxedIndex = new LinkedHashMap<>();
-            for (int row = 0; row < right.getRowCount(); row++) {
-                List<Object> key = keyTuple(rightKeyVectors, row);
+            for (int row = 0; row < buildRoot.getRowCount(); row++) {
+                List<Object> key = keyTuple(buildKeyVectors, row);
                 if (key == null) {
                     continue;
                 }
@@ -93,54 +135,106 @@ public final class HashJoinOperator {
 
         List<Field> outputFields = new ArrayList<>();
         for (Field field : left.getSchema().getFields()) {
-            outputFields.add(renamed(field, leftAlias));
+            outputFields.add(leftAlias == null ? field : renamed(field, leftAlias));
         }
         for (Field field : right.getSchema().getFields()) {
-            outputFields.add(renamed(field, rightAlias));
+            outputFields.add(rightAlias == null ? field : renamed(field, rightAlias));
         }
         VectorSchemaRoot result = VectorSchemaRoot.create(new Schema(outputFields), allocator);
         result.allocateNew();
 
         List<FieldVector> leftAllVectors = left.getFieldVectors();
         List<FieldVector> rightAllVectors = right.getFieldVectors();
+        int leftFieldCount = leftAllVectors.size();
+        int rightFieldCount = rightAllVectors.size();
+
+        // Only FULL needs this -- it's the only type with a second,
+        // unmatched-build-side pass.
+        BitSet matchedBuildRows = type == JoinType.FULL ? new BitSet(buildRoot.getRowCount()) : null;
 
         int outRow = 0;
-        if (fastPath) {
-            FieldVector leftKey = leftKeyVectors.get(0);
-            for (int l = 0; l < left.getRowCount(); l++) {
-                if (leftKey.isNull(l)) {
-                    continue;
-                }
-                List<Integer> matches = longIndex.get(encodeLong(leftKey, l));
-                outRow = emitMatches(matches, l, leftAllVectors, rightAllVectors, result, outRow);
+        for (int p = 0; p < probeRoot.getRowCount(); p++) {
+            List<Integer> matches;
+            if (fastPath) {
+                FieldVector probeKey = probeKeyVectors.get(0);
+                matches = probeKey.isNull(p) ? null : longIndex.get(encodeLong(probeKey, p));
+            } else {
+                List<Object> key = keyTuple(probeKeyVectors, p);
+                matches = key == null ? null : boxedIndex.get(key);
             }
-        } else {
-            for (int l = 0; l < left.getRowCount(); l++) {
-                List<Object> key = keyTuple(leftKeyVectors, l);
-                List<Integer> matches = key == null ? null : boxedIndex.get(key);
-                outRow = emitMatches(matches, l, leftAllVectors, rightAllVectors, result, outRow);
+
+            if (matches == null) {
+                if (type == JoinType.INNER) {
+                    continue; // dropped, standard inner-join semantics
+                }
+                // LEFT/FULL: buildIsRight is always true here (see above),
+                // so the probe side is always "left" -- preserve it,
+                // null-pad the right side.
+                outRow = emitProbeOnlyNullPadded(p, leftAllVectors, rightFieldCount, result, outRow);
+                continue;
+            }
+
+            for (int buildMatchRow : matches) {
+                if (matchedBuildRows != null) {
+                    matchedBuildRows.set(buildMatchRow);
+                }
+                int leftRow = buildIsRight ? p : buildMatchRow;
+                int rightRow = buildIsRight ? buildMatchRow : p;
+                outRow = emitMatchedPair(leftRow, rightRow, leftAllVectors, rightAllVectors, result, outRow);
             }
         }
+
+        if (type == JoinType.FULL) {
+            // Unmatched build-side (right) rows -- preserve them, null-pad
+            // the left side. buildRoot == right whenever type == FULL (see
+            // buildIsRight above), so buildMatchRows indexes right's rows.
+            for (int r = 0; r < buildRoot.getRowCount(); r++) {
+                if (!matchedBuildRows.get(r)) {
+                    outRow = emitBuildOnlyNullPadded(r, leftFieldCount, rightAllVectors, result, outRow);
+                }
+            }
+        }
+
         result.setRowCount(outRow);
         return result;
     }
 
-    private static int emitMatches(List<Integer> matches, int leftRow, List<FieldVector> leftAllVectors,
-                                     List<FieldVector> rightAllVectors, VectorSchemaRoot result, int outRow) {
-        if (matches == null) {
-            return outRow;
+    private static int emitMatchedPair(int leftRow, int rightRow, List<FieldVector> leftAllVectors,
+                                        List<FieldVector> rightAllVectors, VectorSchemaRoot result, int outRow) {
+        int col = 0;
+        for (FieldVector v : leftAllVectors) {
+            copyValue(v, leftRow, result.getVector(col++), outRow);
         }
-        for (int r : matches) {
-            int col = 0;
-            for (FieldVector v : leftAllVectors) {
-                copyValue(v, leftRow, result.getVector(col++), outRow);
-            }
-            for (FieldVector v : rightAllVectors) {
-                copyValue(v, r, result.getVector(col++), outRow);
-            }
-            outRow++;
+        for (FieldVector v : rightAllVectors) {
+            copyValue(v, rightRow, result.getVector(col++), outRow);
         }
-        return outRow;
+        return outRow + 1;
+    }
+
+    /** A probe-side (always left, for LEFT/FULL) row with no match -- its own columns copied, every right column null. */
+    private static int emitProbeOnlyNullPadded(int leftRow, List<FieldVector> leftAllVectors, int rightFieldCount,
+                                                 VectorSchemaRoot result, int outRow) {
+        int col = 0;
+        for (FieldVector v : leftAllVectors) {
+            copyValue(v, leftRow, result.getVector(col++), outRow);
+        }
+        for (int i = 0; i < rightFieldCount; i++) {
+            result.getVector(col++).setNull(outRow);
+        }
+        return outRow + 1;
+    }
+
+    /** An unmatched build-side (always right, for FULL) row -- every left column null, its own columns copied. */
+    private static int emitBuildOnlyNullPadded(int rightRow, int leftFieldCount, List<FieldVector> rightAllVectors,
+                                                VectorSchemaRoot result, int outRow) {
+        int col = 0;
+        for (int i = 0; i < leftFieldCount; i++) {
+            result.getVector(col++).setNull(outRow);
+        }
+        for (FieldVector v : rightAllVectors) {
+            copyValue(v, rightRow, result.getVector(col++), outRow);
+        }
+        return outRow + 1;
     }
 
     private static boolean isLongEncodable(FieldVector v) {
@@ -181,7 +275,7 @@ public final class HashJoinOperator {
      * fan-out), so boxing here is the first thing worth removing. {@code
      * getValue} below still exists for the key-extraction path, which only
      * avoids per-row composite-key boxing for a single primitive-typed key
-     * column (see the {@code fastPath} branch in {@link #innerJoin}) --
+     * column (see the {@code fastPath} branch in {@link #join}) --
      * composite and VARCHAR keys still need it.
      */
     private static void copyValue(FieldVector src, int srcIdx, FieldVector dest, int destIdx) {

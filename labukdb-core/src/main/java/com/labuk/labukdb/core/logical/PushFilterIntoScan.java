@@ -44,8 +44,10 @@ public final class PushFilterIntoScan implements OptimizerRule {
         if (plan instanceof Join join) {
             // Each side's own Filter already sits directly on its own TableScan
             // (see LogicalPlanBuilder.buildJoin) -- recursing into both children
-            // with this exact same method absorbs each independently, no new logic needed.
-            return new Join(apply(join.left()), apply(join.right()), join.keys());
+            // with this exact same method absorbs each independently, no new
+            // logic needed. join.left() may itself be a Join (a 3+-way chain's
+            // later step) -- this recursion already handles that for free.
+            return new Join(apply(join.left()), apply(join.right()), join.keys(), join.type());
         }
         return plan; // TableScan with nothing above it -- nothing to push
     }

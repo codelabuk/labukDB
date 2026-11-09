@@ -2,6 +2,7 @@ package com.labuk.labukdb.core.query;
 
 import com.labuk.labukdb.core.execution.AggregateFunction;
 import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.JoinType;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.planner.ComparisonOp;
 import com.labuk.labukdb.core.planner.Predicate;
@@ -156,20 +157,21 @@ class SqlQueryTranslatorTest {
     }
 
     @Test
-    void innerEquiJoin_parsesIntoJoinClause() {
+    void innerEquiJoin_parsesIntoJoinStep() {
         SqlQuery query = SqlQueryTranslator.translate(
                 "SELECT a.service, b.region FROM orders a JOIN customers b ON a.customer_id = b.id");
 
         assertEquals("orders", query.table());
+        assertEquals("a", query.baseAlias());
         assertEquals(List.of("a.service", "b.region"), query.columns());
-        assertNotNull(query.join());
-        SqlQuery.JoinClause join = query.join();
-        assertEquals("a", join.leftAlias());
-        assertEquals("customers", join.rightTable());
-        assertEquals("b", join.rightAlias());
-        assertEquals(List.of(new SqlQuery.JoinKeyPair("customer_id", "id")), join.keys());
-        assertNull(join.leftPredicate());
-        assertNull(join.rightPredicate());
+        assertEquals(1, query.joins().size());
+        SqlQuery.JoinStep step = query.joins().get(0);
+        assertEquals(JoinType.INNER, step.type());
+        assertEquals("customers", step.rightTable());
+        assertEquals("b", step.rightAlias());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("a", "customer_id", "id")), step.keys());
+        assertNull(query.predicate());
+        assertNull(step.rightPredicate());
     }
 
     @Test
@@ -179,19 +181,80 @@ class SqlQueryTranslatorTest {
                         + "ON a.customer_id = b.id AND a.region = b.region "
                         + "WHERE a.amount > 10 AND b.active = 'Y'");
 
-        SqlQuery.JoinClause join = query.join();
-        assertEquals(List.of(new SqlQuery.JoinKeyPair("customer_id", "id"),
-                new SqlQuery.JoinKeyPair("region", "region")), join.keys());
-        assertNotNull(join.leftPredicate(), "a.amount > 10 must route to the left side");
-        assertNotNull(join.rightPredicate(), "b.active = 'Y' must route to the right side");
+        SqlQuery.JoinStep step = query.joins().get(0);
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("a", "customer_id", "id"),
+                new SqlQuery.JoinKeyPair("a", "region", "region")), step.keys());
+        assertNotNull(query.predicate(), "a.amount > 10 must route to the base table");
+        assertNotNull(step.rightPredicate(), "b.active = 'Y' must route to the new table");
     }
 
     @Test
-    void leftJoin_rejectedWithClearError() {
+    void leftRightFullJoin_allParseWithTheirOwnType() {
+        assertEquals(JoinType.LEFT, SqlQueryTranslator.translate(
+                "SELECT a.x FROM a LEFT JOIN b ON a.id = b.id").joins().get(0).type());
+        assertEquals(JoinType.RIGHT, SqlQueryTranslator.translate(
+                "SELECT a.x FROM a RIGHT JOIN b ON a.id = b.id").joins().get(0).type());
+        assertEquals(JoinType.FULL, SqlQueryTranslator.translate(
+                "SELECT a.x FROM a FULL JOIN b ON a.id = b.id").joins().get(0).type());
+        assertEquals(JoinType.FULL, SqlQueryTranslator.translate(
+                "SELECT a.x FROM a FULL OUTER JOIN b ON a.id = b.id").joins().get(0).type());
+    }
+
+    @Test
+    void crossJoin_stillRejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate("SELECT a.x FROM a CROSS JOIN b"));
+        assertTrue(thrown.getMessage().contains("CROSS"), thrown.getMessage());
+    }
+
+    @Test
+    void threeWayJoin_parsesAsALeftDeepChain() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x, b.y, c.z FROM a JOIN b ON a.id = b.a_id JOIN c ON c.b_id = b.id");
+
+        assertEquals(2, query.joins().size());
+        SqlQuery.JoinStep first = query.joins().get(0);
+        assertEquals("b", first.rightAlias());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("a", "id", "a_id")), first.keys());
+
+        SqlQuery.JoinStep second = query.joins().get(1);
+        assertEquals("c", second.rightAlias());
+        // ON c.b_id = b.id -- b was introduced by the FIRST step, not the base
+        // table, so this proves a later step can key against any earlier one.
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("b", "id", "b_id")), second.keys());
+    }
+
+    @Test
+    void leftJoin_whereOnNonPreservedSide_rejectedWithClearError() {
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
                 () -> SqlQueryTranslator.translate(
-                        "SELECT a.x FROM a LEFT JOIN b ON a.id = b.id"));
-        assertTrue(thrown.getMessage().contains("INNER"), thrown.getMessage());
+                        "SELECT a.x FROM a LEFT JOIN b ON a.id = b.id WHERE b.active = 'Y'"));
+        assertTrue(thrown.getMessage().contains("null-padded") || thrown.getMessage().contains("safely"), thrown.getMessage());
+    }
+
+    @Test
+    void leftJoin_whereOnPreservedSide_isAccepted() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a LEFT JOIN b ON a.id = b.id WHERE a.active = 'Y'");
+        assertNotNull(query.predicate(), "a WHERE condition on the preserved (left) side is always safe to push");
+    }
+
+    @Test
+    void fullJoin_whereOnEitherSide_rejectedWithClearError() {
+        assertThrows(IllegalArgumentException.class, () -> SqlQueryTranslator.translate(
+                "SELECT a.x FROM a FULL JOIN b ON a.id = b.id WHERE a.active = 'Y'"));
+        assertThrows(IllegalArgumentException.class, () -> SqlQueryTranslator.translate(
+                "SELECT a.x FROM a FULL JOIN b ON a.id = b.id WHERE b.active = 'Y'"));
+    }
+
+    @Test
+    void rightJoin_taintsTheAccumulatedSideForALaterStepToo() {
+        // a RIGHT JOIN b makes 'a' (accumulated-so-far) the non-preserved
+        // side; a WHERE on 'a' must be rejected even though 'a' is the base table.
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a RIGHT JOIN b ON a.id = b.id WHERE a.active = 'Y'"));
+        assertTrue(thrown.getMessage().contains("null-padded") || thrown.getMessage().contains("safely"), thrown.getMessage());
     }
 
     @Test
@@ -225,7 +288,7 @@ class SqlQueryTranslatorTest {
                 "SELECT a.region, SUM(b.amount) AS total FROM orders a JOIN customers b "
                         + "ON a.customer_id = b.id GROUP BY a.region");
 
-        assertNotNull(query.join());
+        assertEquals(1, query.joins().size());
         assertEquals(List.of(), query.columns(), "plain SELECT columns are irrelevant once GROUP BY is present");
         assertEquals(List.of("a.region"), query.groupByColumns());
         assertEquals(List.of(new AggregateSpec("b.amount", AggregateFunction.SUM, "total")), query.aggregates());
@@ -238,7 +301,7 @@ class SqlQueryTranslatorTest {
                 "SELECT a.service, b.region FROM orders a JOIN customers b "
                         + "ON a.customer_id = b.id ORDER BY b.region DESC LIMIT 5");
 
-        assertNotNull(query.join());
+        assertEquals(1, query.joins().size());
         assertEquals(List.of("a.service", "b.region"), query.columns());
         assertEquals(List.of(new SortKey("b.region", false)), query.orderBy());
         assertEquals(5L, query.limit());

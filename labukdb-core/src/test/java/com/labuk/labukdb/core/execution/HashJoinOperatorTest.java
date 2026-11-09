@@ -68,8 +68,8 @@ class HashJoinOperatorTest {
         try (VectorSchemaRoot orders = ordersBatch(new long[] {1, 2}, new String[] {"auth-svc", "payments-svc"});
              VectorSchemaRoot customers = customersBatch(new long[] {1, 2}, new String[] {"us-east", "eu-west"})) {
 
-            try (VectorSchemaRoot result = new HashJoinOperator().innerJoin(
-                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", allocator)) {
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
 
                 assertEquals(2, result.getRowCount());
                 assertNotNull(result.getVector("a.customer_id"));
@@ -92,8 +92,8 @@ class HashJoinOperatorTest {
         try (VectorSchemaRoot orders = ordersBatch(new long[] {1, 999}, new String[] {"auth-svc", "orphan-svc"});
              VectorSchemaRoot customers = customersBatch(new long[] {1, 2}, new String[] {"us-east", "eu-west"})) {
 
-            try (VectorSchemaRoot result = new HashJoinOperator().innerJoin(
-                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", allocator)) {
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
                 assertEquals(1, result.getRowCount(), "customer_id=999 (left) and id=2 (right) have no match -- inner join drops both");
             }
         }
@@ -105,8 +105,8 @@ class HashJoinOperatorTest {
         try (VectorSchemaRoot orders = ordersBatch(new long[] {1}, new String[] {"auth-svc"});
              VectorSchemaRoot customers = customersBatch(new long[] {1, 1}, new String[] {"us-east", "us-west"})) {
 
-            try (VectorSchemaRoot result = new HashJoinOperator().innerJoin(
-                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", allocator)) {
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
                 assertEquals(2, result.getRowCount(), "a duplicate key on the build side must fan out, not match only the first");
             }
         }
@@ -118,8 +118,8 @@ class HashJoinOperatorTest {
              VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
             ((BigIntVector) customers.getVector("id")).setNull(0); // null key, same value otherwise
 
-            try (VectorSchemaRoot result = new HashJoinOperator().innerJoin(
-                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", allocator)) {
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
                 assertEquals(0, result.getRowCount(), "a null join key must never match, even a numerically-equal value");
             }
         }
@@ -142,9 +142,116 @@ class HashJoinOperatorTest {
             ((VarCharVector) right.getVector("region")).setSafe(0, "eu".getBytes(StandardCharsets.UTF_8)); // same id, different region
             right.setRowCount(1);
 
-            try (VectorSchemaRoot result = new HashJoinOperator().innerJoin(
-                    left, List.of("customer_id", "region"), "a", right, List.of("customer_id", "region"), "b", a)) {
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    left, List.of("customer_id", "region"), "a", right, List.of("customer_id", "region"), "b", false, a)) {
                 assertEquals(0, result.getRowCount(), "both key columns must match -- id matches but region doesn't");
+            }
+        }
+    }
+
+    @Test
+    void leftJoin_unmatchedLeftRow_isPreservedWithRightColumnsNull() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1, 999}, new String[] {"auth-svc", "orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.LEFT,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(2, result.getRowCount(), "LEFT JOIN preserves every left row, matched or not");
+
+                VarCharVector service = (VarCharVector) result.getVector("a.service");
+                assertEquals("auth-svc", new String(service.get(0), StandardCharsets.UTF_8));
+                assertEquals("orphan-svc", new String(service.get(1), StandardCharsets.UTF_8));
+
+                BigIntVector rightId = (BigIntVector) result.getVector("b.id");
+                assertFalse(rightId.isNull(0), "the matched row keeps its real right-side value");
+                assertTrue(rightId.isNull(1), "the unmatched left row's right-side columns are null, not dropped");
+            }
+        }
+    }
+
+    @Test
+    void rightJoin_delegatesToLeft_preservingTheRightSideInstead() {
+        // customer_id=999 only exists on the left (orders); id=2 only exists on the right (customers).
+        // RIGHT JOIN must preserve every *right* row, dropping the left-only orphan and null-padding the right-only one.
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1, 999}, new String[] {"auth-svc", "orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1, 2}, new String[] {"us-east", "eu-west"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.RIGHT,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(2, result.getRowCount(), "RIGHT JOIN preserves every right row -- id=1 (matched) and id=2 (unmatched)");
+
+                VarCharVector region = (VarCharVector) result.getVector("b.region");
+                assertEquals("us-east", new String(region.get(0), StandardCharsets.UTF_8));
+                assertEquals("eu-west", new String(region.get(1), StandardCharsets.UTF_8));
+
+                BigIntVector leftId = (BigIntVector) result.getVector("a.customer_id");
+                assertFalse(leftId.isNull(0), "the matched row keeps its real left-side value");
+                assertTrue(leftId.isNull(1), "the unmatched right row's left-side columns are null, not dropped");
+            }
+        }
+    }
+
+    @Test
+    void fullJoin_preservesUnmatchedRowsOnBothSides() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1, 999}, new String[] {"auth-svc", "orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1, 2}, new String[] {"us-east", "eu-west"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.FULL,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(3, result.getRowCount(), "1 match + 1 unmatched left + 1 unmatched right");
+
+                BigIntVector leftId = (BigIntVector) result.getVector("a.customer_id");
+                BigIntVector rightId = (BigIntVector) result.getVector("b.id");
+                // Row 0: the real match.
+                assertFalse(leftId.isNull(0));
+                assertFalse(rightId.isNull(0));
+                // Row 1: unmatched left (customer_id=999), from the main probe pass.
+                assertFalse(leftId.isNull(1));
+                assertTrue(rightId.isNull(1));
+                // Row 2: unmatched right (id=2), from the second pass.
+                assertTrue(leftId.isNull(2));
+                assertFalse(rightId.isNull(2));
+            }
+        }
+    }
+
+    @Test
+    void innerJoin_buildFromLeft_givesTheSameResultAsBuildFromRight() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1}, new String[] {"auth-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1, 1}, new String[] {"us-east", "us-west"})) {
+
+            try (VectorSchemaRoot buildRight = new HashJoinOperator().join(JoinType.INNER,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator);
+                 VectorSchemaRoot buildLeft = new HashJoinOperator().join(JoinType.INNER,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", true, allocator)) {
+                // buildFromLeft only picks which side gets hashed internally -- the
+                // declared left-then-right output order/content must be identical.
+                assertEquals(buildRight.getRowCount(), buildLeft.getRowCount());
+                assertEquals(2, buildLeft.getRowCount(), "fan-out must still happen when the smaller (left) side is probed, not built");
+            }
+        }
+    }
+
+    @Test
+    void nullLeftAlias_leavesLeftColumnNamesUnrenamed() {
+        // Simulates a 3+-way chain's later step: "left" is already a prior
+        // HashJoinOperator output (its columns already alias-qualified, e.g.
+        // "x.customer_id"), which must pass through unrenamed -- leftAlias=null.
+        Field alreadyQualifiedId = new Field("x.customer_id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field alreadyQualifiedService = new Field("x.service", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+
+        try (VectorSchemaRoot preRenamedOrders = VectorSchemaRoot.create(
+                new Schema(List.of(alreadyQualifiedId, alreadyQualifiedService)), allocator);
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+            preRenamedOrders.allocateNew();
+            ((BigIntVector) preRenamedOrders.getVector("x.customer_id")).setSafe(0, 1L);
+            ((VarCharVector) preRenamedOrders.getVector("x.service")).setSafe(0, "auth-svc".getBytes(StandardCharsets.UTF_8));
+            preRenamedOrders.setRowCount(1);
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.INNER,
+                    preRenamedOrders, List.of("x.customer_id"), null, customers, List.of("id"), "b", false, allocator)) {
+                assertNotNull(result.getVector("x.customer_id"), "left column name must pass through unchanged, not re-prefixed with \"null.\"");
+                assertNotNull(result.getVector("b.id"));
             }
         }
     }

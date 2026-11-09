@@ -267,4 +267,140 @@ class QueryCommandSqlJoinIntegrationTest {
         assertTrue(gatewayIndex >= 0 && paymentsIndex >= 0, output);
         assertTrue(gatewayIndex < paymentsIndex, "ORDER BY amount DESC must put gateway-svc (30) before payments-svc (20): " + output);
     }
+
+    @Test
+    void leftJoin_deltaToDelta_preservesUnmatchedLeftRowWithNulls(@TempDir Path root) throws Exception {
+        Path ordersRoot = root.resolve("orders");
+        Path customersRoot = root.resolve("customers");
+        buildDeltaOrders(ordersRoot); // customer_id 1, 2, 999 (999 unmatched)
+        buildDeltaCustomers(customersRoot);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersRoot.toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("customers", customersRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT a.service, b.region FROM orders a LEFT JOIN customers b ON a.customer_id = b.id"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("auth-svc | us-east"), output);
+        assertTrue(output.contains("payments-svc | eu-west"), output);
+        assertTrue(output.contains("orphan-svc | NULL"), "LEFT JOIN must keep the unmatched left row, null-padded: " + output);
+        assertTrue(output.contains("3 row(s)"), output);
+    }
+
+    /** customers (Delta): id(long), region(string), with an extra id that no order ever references -- the FULL JOIN's unmatched-right case. */
+    private void buildDeltaCustomersWithExtra(Path tableRoot) throws Exception {
+        Field id = new Field("id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field region = new Field("region", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Schema schema = new Schema(List.of(id, region));
+        TableLocation location = TableLocation.forLocal(tableRoot);
+        new TableCreator().createTable(location, schema, List.of(), null);
+
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = VectorSchemaRoot.create(schema, allocator)) {
+            batch.allocateNew();
+            BigIntVector idVector = (BigIntVector) batch.getVector("id");
+            VarCharVector regionVector = (VarCharVector) batch.getVector("region");
+            long[] ids = {1, 2, 3};
+            String[] regions = {"us-east", "eu-west", "fr-south"};
+            for (int i = 0; i < ids.length; i++) {
+                idVector.setSafe(i, ids[i]);
+                regionVector.setSafe(i, regions[i].getBytes(StandardCharsets.UTF_8));
+            }
+            batch.setRowCount(ids.length);
+            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+        }
+    }
+
+    @Test
+    void fullJoin_deltaToDelta_preservesUnmatchedRowsOnBothSides(@TempDir Path root) throws Exception {
+        Path ordersRoot = root.resolve("orders");
+        Path customersRoot = root.resolve("customers");
+        buildDeltaOrders(ordersRoot); // customer_id 1, 2, 999 (999 unmatched)
+        buildDeltaCustomersWithExtra(customersRoot); // id 1, 2, 3 (3 unmatched)
+
+        TableCatalog.atDefaultLocation().register("orders", ordersRoot.toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("customers", customersRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT a.service, b.region FROM orders a FULL JOIN customers b ON a.customer_id = b.id"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("auth-svc | us-east"), output);
+        assertTrue(output.contains("payments-svc | eu-west"), output);
+        assertTrue(output.contains("orphan-svc | NULL"), "unmatched left (customer_id=999) must be preserved, null-padded: " + output);
+        assertTrue(output.contains("NULL | fr-south"), "unmatched right (id=3) must be preserved, null-padded: " + output);
+        assertTrue(output.contains("4 row(s)"), output);
+    }
+
+    private static final org.apache.iceberg.Schema ICEBERG_REGIONS_SCHEMA = new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "name", Types.StringType.get()),
+            Types.NestedField.required(2, "manager", Types.StringType.get()));
+
+    /** regions (Iceberg, unpartitioned): name(string), manager(string) -- keyed by the SAME region names buildDeltaCustomers produces. */
+    private void buildIcebergRegions(Path tableRoot) throws Exception {
+        Table table = new HadoopTables(new Configuration())
+                .create(ICEBERG_REGIONS_SCHEMA, PartitionSpec.unpartitioned(), SortOrder.unsorted(), Map.of(),
+                        tableRoot.toString());
+
+        Field name = new Field("name", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Field manager = new Field("manager", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VectorSchemaRoot batch = VectorSchemaRoot.create(new Schema(List.of(name, manager)), allocator)) {
+            batch.allocateNew();
+            VarCharVector nameVector = (VarCharVector) batch.getVector("name");
+            VarCharVector managerVector = (VarCharVector) batch.getVector("manager");
+            String[] names = {"us-east", "eu-west"};
+            String[] managers = {"Alice", "Bob"};
+            for (int i = 0; i < names.length; i++) {
+                nameVector.setSafe(i, names[i].getBytes(StandardCharsets.UTF_8));
+                managerVector.setSafe(i, managers[i].getBytes(StandardCharsets.UTF_8));
+            }
+            batch.setRowCount(names.length);
+
+            Path dataFile = tableRoot.resolve("part-0.parquet");
+            new ArrowToParquetWriter().write(dataFile.toFile(), batch);
+
+            DataFile icebergFile = DataFiles.builder(PartitionSpec.unpartitioned())
+                    .withPath(dataFile.toAbsolutePath().toString())
+                    .withFileSizeInBytes(dataFile.toFile().length())
+                    .withRecordCount(names.length)
+                    .build();
+            table.newAppend().appendFile(icebergFile).commit();
+        }
+    }
+
+    /**
+     * A real 3-way left-deep chain, Delta -> Delta -> Iceberg, where the
+     * SECOND step's ON condition keys against {@code b.region} -- a column
+     * introduced by the FIRST step, not the base table -- proving a later
+     * step can key against any earlier one, not just the base table
+     * (exercises {@code SqlQueryTranslator}'s {@code priorAliases} set and
+     * {@code LogicalPlanBuilder}'s alias-qualified key-naming convention
+     * for a chain's non-first step, not just its parsing).
+     */
+    @Test
+    void threeWayJoin_deltaToDeltaToIceberg_keysTheSecondStepOffTheFirstStepsTable(@TempDir Path root) throws Exception {
+        Path ordersRoot = root.resolve("orders");
+        Path customersRoot = root.resolve("customers");
+        Path regionsRoot = root.resolve("regions");
+        buildDeltaOrders(ordersRoot); // customer_id 1, 2, 999 (999 unmatched -> dropped by the first INNER step)
+        buildDeltaCustomers(customersRoot);
+        buildIcebergRegions(regionsRoot);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersRoot.toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("customers", customersRoot.toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("regions", regionsRoot.toAbsolutePath().toString());
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT a.service, b.region, c.manager FROM orders a "
+                        + "JOIN customers b ON a.customer_id = b.id "
+                        + "JOIN regions c ON b.region = c.name"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("auth-svc | us-east | Alice"), output);
+        assertTrue(output.contains("payments-svc | eu-west | Bob"), output);
+        assertFalse(output.contains("orphan-svc"), output);
+        assertTrue(output.contains("2 row(s)"), output);
+    }
 }

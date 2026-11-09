@@ -2,6 +2,7 @@ package com.labuk.labukdb.core.logical;
 
 import com.labuk.labukdb.core.execution.AggregateFunction;
 import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.JoinType;
 import com.labuk.labukdb.core.execution.SortKey;
 import org.junit.jupiter.api.Test;
 
@@ -65,7 +66,7 @@ class PushProjectIntoScanTest {
     @Test
     void joinWithOrderByAndLimit_keepsProjectEvenThoughJoinIsNotTheImmediateChild() {
         LogicalPlan join = new Join(new TableScan("orders", null, null), new TableScan("customers", null, null),
-                List.of(new JoinKey("customer_id", "id")));
+                List.of(new JoinKey("customer_id", "id")), JoinType.INNER);
         LogicalPlan plan = new Project(
                 new Limit(new Sort(join, List.of(new SortKey("b.region", false))), 5),
                 List.of("a.service", "b.region"));
@@ -84,7 +85,7 @@ class PushProjectIntoScanTest {
     @Test
     void joinWithGroupByAndAggregate_stillEliminatesProject() {
         LogicalPlan join = new Join(new TableScan("orders", null, null), new TableScan("customers", null, null),
-                List.of(new JoinKey("customer_id", "id")));
+                List.of(new JoinKey("customer_id", "id")), JoinType.INNER);
         LogicalPlan plan = new Project(
                 new Aggregate(join, List.of("a.region"), List.of(new AggregateSpec("b.amount", AggregateFunction.SUM, "total"))),
                 List.of()); // SqlQueryTranslator leaves columns() empty once aggregating, join or not

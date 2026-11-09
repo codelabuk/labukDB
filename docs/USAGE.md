@@ -204,6 +204,7 @@ bin/labukdb query --sql "SELECT * FROM logs" --as-of 2026-07-17T00:00:00Z
 ```
 SELECT <col> | <AGGFUNC>(<col>) AS <alias> [, ...]
 FROM <table>
+[[INNER|LEFT|RIGHT|FULL] JOIN <table> ON <col> = <col> [AND ...]] [, ...]
 [WHERE <predicate>]
 [GROUP BY <col> [, ...]]
 [ORDER BY <col> [ASC|DESC] [, ...]]
@@ -223,6 +224,13 @@ FROM <table>
   would be silently wrong). Unlike the flag-based path, a bare SQL
   `SELECT` with no `LIMIT` clause prints **every** matching row — that's
   what "no `LIMIT`" means in SQL, so it isn't silently capped at 50.
+- `JOIN` — any number of tables, `INNER`/`LEFT`/`RIGHT`/`FULL`, equi-join
+  only (`ON` must be `AND`-combined column-to-column equalities). Each
+  table may be a different format — a Delta table can join an Iceberg
+  table with no format-specific code. Every column anywhere in the query
+  must be table-qualified (`a.service`, not `service`) once a `JOIN` is
+  present. `GROUP BY`/aggregates/`ORDER BY`/`LIMIT` all combine with a
+  `JOIN` normally, applied to the joined result.
 
 **Rejected with a specific error, not silently mishandled:**
 
@@ -230,7 +238,9 @@ FROM <table>
 |---|---|
 | `NOT`, `NOT IN`, `NOT LIKE` | `Predicate` has no generic negation — see its javadoc |
 | `IS NULL` | not a supported predicate shape |
-| Joins, subqueries | single-table only |
+| Subqueries | not implemented yet |
+| `CROSS`/`NATURAL`/`SEMI` join, non-equi `ON` conditions | not implemented yet |
+| A `WHERE` condition on the non-preserved side of `LEFT`/`RIGHT`, or on either side of `FULL` | pre-filtering it before the join would silently change which rows get null-padded — a condition on the preserved side is fine |
 | `COUNT(*)` | matches `AggregateOperator`'s pre-existing `COUNT(column)`-only semantics (non-null values of a named column) |
 | `IN` combined with `AND`/`OR` **without parentheses** | see below |
 

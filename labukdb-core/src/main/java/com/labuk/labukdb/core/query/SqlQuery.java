@@ -1,6 +1,7 @@
 package com.labuk.labukdb.core.query;
 
 import com.labuk.labukdb.core.execution.AggregateSpec;
+import com.labuk.labukdb.core.execution.JoinType;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.planner.Predicate;
 
@@ -18,44 +19,70 @@ import java.util.List;
  * this translator's, matching how {@code --table} already works on the
  * CLI.
  *
+ * @param baseAlias the base ({@code table}) table's own alias — its own
+ *                   name when no explicit {@code AS} alias was written,
+ *                   matching real SQL semantics. Only meaningful when
+ *                   {@code joins} is non-empty (unqualified single-table
+ *                   queries have no alias concept); {@code null} otherwise.
  * @param limit {@code -1} means no {@code LIMIT} clause was present.
- * @param join {@code null} for every non-join query (every field above
- *             keeps meaning exactly what it already did). Non-null only
- *             for a two-table {@code INNER} equi-join (SQL engine Phase
- *             3, increment 1) — see {@link JoinClause}'s own javadoc for
- *             the real scope boundaries. When non-null, {@code columns}
- *             holds fully-qualified output column names (e.g.
- *             {@code "a.service"}, matching {@link
- *             net.sf.jsqlparser.schema.Column#getFullyQualifiedName()})
- *             rather than bare names, and {@code predicate}/
- *             {@code groupByColumns}/{@code aggregates}/{@code orderBy}/
- *             {@code limit} are always empty/{@code null}/{@code -1} —
- *             {@code GROUP BY}/aggregates/{@code ORDER BY}/{@code LIMIT}
- *             combined with a join are rejected by the translator, not
- *             silently dropped here.
+ * @param joins empty for every non-join query (every field above keeps
+ *              meaning exactly what it already did, and {@code predicate}
+ *              is the whole query's {@code WHERE}). Non-empty for a join
+ *              of two or more tables (SQL engine Phase 3) — see {@link
+ *              JoinStep}'s own javadoc for the real scope boundaries.
+ *              When non-empty: {@code columns} holds fully-qualified
+ *              output column names (e.g. {@code "a.service"}, matching
+ *              {@link net.sf.jsqlparser.schema.Column#getFullyQualifiedName()})
+ *              rather than bare names; {@code predicate} is specifically
+ *              the <em>base</em> table's own share of the {@code WHERE}
+ *              clause (each join step carries its own new table's share
+ *              on {@link JoinStep#rightPredicate()} instead) — {@code
+ *              null} when the base table had no applicable condition.
  */
-public record SqlQuery(String table, List<String> columns, Predicate predicate,
+public record SqlQuery(String table, String baseAlias, List<String> columns, Predicate predicate,
                         List<String> groupByColumns, List<AggregateSpec> aggregates,
-                        List<SortKey> orderBy, long limit, JoinClause join) {
+                        List<SortKey> orderBy, long limit, List<JoinStep> joins) {
 
     /**
-     * A two-table {@code INNER} equi-join — {@code leftAlias}/{@code
-     * rightAlias} are the table's own name when no explicit {@code AS}
-     * alias was written (matching real SQL semantics: the unaliased
-     * table name is itself the qualifier other columns reference it by).
-     * {@code keys} pairs are physical, unqualified column names (the
-     * alias is a SQL-level concept only — see {@code SqlQueryTranslator}
-     * and {@code core.logical}'s own javadoc for why it never reaches
-     * the physical reader). {@code leftPredicate}/{@code rightPredicate}
-     * are each side's own share of the {@code WHERE} clause, already
-     * split by which table's columns they reference — {@code null} when
-     * that side had no applicable condition.
+     * One step of a left-deep join chain: joins the table/alias
+     * accumulated by every prior step (or the base table, for the first
+     * step) against {@code rightTable}. {@code keys} pairs are physical,
+     * unqualified column names (the alias is a SQL-level concept only —
+     * see {@code SqlQueryTranslator} and {@code core.logical}'s own
+     * javadoc for why it never reaches the physical reader).
+     *
+     * {@code rightPredicate} is this step's new table's own share of the
+     * {@code WHERE} clause, already determined safe to evaluate before
+     * this join (see {@code SqlQueryTranslator#classifyPredicateSafety} for
+     * the exact rule — a predicate on the non-preserved side of an
+     * outer join, or on either side of a {@code FULL} join, is rejected
+     * at translation time instead, never silently pushed somewhere
+     * unsafe). {@code null} when that table had no applicable condition.
+     *
+     * {@code type} is exactly as parsed — {@code RIGHT} included. It
+     * reaches {@code core.logical.Join#type()} unchanged, too; {@code
+     * RIGHT} is only ever resolved at the very end, inside {@code
+     * core.execution.HashJoinOperator} (which delegates it to its {@code
+     * LEFT} implementation with every argument swapped) — see that
+     * class's own javadoc for why keeping the tree's left/right shape a
+     * simple, unambiguous invariant was worth not canonicalizing earlier.
      */
-    public record JoinClause(String leftAlias, String rightTable, String rightAlias,
-                              List<JoinKeyPair> keys, Predicate leftPredicate, Predicate rightPredicate) {
+    public record JoinStep(JoinType type, String rightTable, String rightAlias,
+                            List<JoinKeyPair> keys, Predicate rightPredicate) {
     }
 
-    /** One {@code ON a.x = b.y} equality — physical, unqualified column names. */
-    public record JoinKeyPair(String leftColumn, String rightColumn) {
+    /**
+     * One {@code ON a.x = b.y} equality. {@code rightColumn} is always a
+     * bare physical column name (this step's new table has never been
+     * joined before). {@code leftColumn} is also bare, but {@code
+     * leftTableAlias} names which already-known table (the base table,
+     * or any earlier step's new table) it actually belongs to — needed
+     * because a 3+-way join's step can key against any table introduced
+     * so far, not just the one immediately before it. See {@code
+     * core.logical.LogicalPlanBuilder}'s own javadoc for how this
+     * resolves into the bare-vs-alias-qualified name {@code
+     * core.execution.HashJoinOperator} actually looks up.
+     */
+    public record JoinKeyPair(String leftTableAlias, String leftColumn, String rightColumn) {
     }
 }
