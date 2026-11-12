@@ -290,10 +290,10 @@ no scalar functions), window functions, `UNION`, and generic `NOT`/
 `IS NULL` (`Predicate` has no generic negation by design). `COUNT(*)`
 specifically is rejected in favor of `COUNT(column)` (non-null values
 of that column), matching the aggregate operator's own semantics
-rather than introducing a second meaning for `COUNT`. `LEFT`/`RIGHT`/
-`FULL` and 3+-way chains are verified against local fixtures only, not
-yet against real MinIO (the existing MinIO join coverage predates this
-work and is `INNER`-only).
+rather than introducing a second meaning for `COUNT`. `LEFT`/`FULL` and
+3+-way chains (including a Delta→Delta→Iceberg mixed-format chain,
+keying a later step off an earlier step's table rather than the base
+table) are live-verified against real MinIO, same as `INNER`.
 
 ## Type system
 
