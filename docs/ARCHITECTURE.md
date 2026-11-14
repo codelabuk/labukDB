@@ -291,6 +291,22 @@ subquery); correlation to an outer table must be a plain `AND`-combined
 every column in the query must be table-qualified, same as a real
 `JOIN` already requires — one consistency rule, not two.
 
+A scalar subquery used as a comparison operand (`WHERE x OP (SELECT
+...)`) runs once, before the outer plan is built, and its single value
+is substituted into an ordinary `Predicate.Comparison` —
+`QueryCommand.resolveScalarSubqueries`'s job, not `SqlQueryTranslator`'s
+(no `TableFormat`/`TableLocation` access there). The inner query is
+translated by recursing straight back into the same top-level logic a
+normal query uses, so a group-by-less aggregate
+(`(SELECT MAX(y) FROM b)`, the most common real-world shape) works for
+free, and correlation to the outer query is rejected as a side effect
+of that reuse — no special-casing needed. Nesting is handled the same
+way: a scalar subquery's own inner query is itself resolved
+recursively before its plan is built. A subquery resolving to zero
+rows, or whose one cell is `NULL`, makes the whole outer query zero
+rows (`x OP NULL` is never `true`, for any operator); more than one row
+is a genuine runtime error, not resolved by taking the first.
+
 **Not supported**, stated as current scope boundaries: `CROSS`/
 `NATURAL` joins, non-equi join conditions, cost-based join *order*
 (which tables join first is exactly what the SQL text said, never
@@ -299,14 +315,20 @@ is heuristic), a `WHERE` condition on the non-preserved side of
 `LEFT`/`RIGHT` or on either side of `FULL` (rejected with a clear error
 at translation time — pre-filtering it would silently change which rows
 get null-padded; a condition on the preserved side works normally), a
-scalar subquery used as a comparison operand (`WHERE x = (SELECT ...)`
-— needs genuinely different machinery than `IN`/`EXISTS`, since
-`SqlQueryTranslator` has no access to `TableFormat`/`TableLocation` to
-actually run one), a derived table in `FROM`, a wholly uncorrelated
-`EXISTS`/`NOT EXISTS` with no shared column to any outer table at all
-(`HashJoinOperator` always needs at least one key), computed `SELECT`
-expressions (every item must be a bare column or one of the five
-aggregate functions — no `a + b`, no `CASE`, no scalar functions),
+derived table in `FROM`, a wholly uncorrelated `EXISTS`/`NOT EXISTS`
+with no shared column to any outer table at all (`HashJoinOperator`
+always needs at least one key), a scalar subquery with its own `JOIN`
+or `GROUP BY` inside it, a group-by-less aggregate scalar subquery over
+zero matching files (would need a real `NULL`/zero aggregate result —
+`SUM`/`COUNT` of nothing — which `CombinedQueryExecutor` can't produce
+without at least one file to read a schema from; rejected with a clear
+error rather than silently treated as "zero rows," which is only
+correct for a *plain-column* scalar subquery's zero-files case), a
+scalar subquery nested inside an `IN`/`EXISTS` subquery's own filter
+(that filter is translated through a narrower path that doesn't share
+this detection pass — a real, named gap, not a silent one), computed
+`SELECT` expressions (every item must be a bare column or one of the
+five aggregate functions — no `a + b`, no `CASE`, no scalar functions),
 window functions, `UNION`, and generic `NOT`/`IS NULL` (`Predicate` has
 no generic negation by design). `COUNT(*)` specifically is rejected in
 favor of `COUNT(column)` (non-null values of that column), matching

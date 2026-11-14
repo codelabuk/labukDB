@@ -3,6 +3,7 @@ package com.labuk.labukdb.core.query;
 import com.labuk.labukdb.core.execution.AggregateSpec;
 import com.labuk.labukdb.core.execution.JoinType;
 import com.labuk.labukdb.core.execution.SortKey;
+import com.labuk.labukdb.core.planner.ComparisonOp;
 import com.labuk.labukdb.core.planner.Predicate;
 
 import java.util.List;
@@ -38,10 +39,21 @@ import java.util.List;
  *              clause (each join step carries its own new table's share
  *              on {@link JoinStep#rightPredicate()} instead) — {@code
  *              null} when the base table had no applicable condition.
+ * @param scalarSubqueries SQL engine Phase 4, increment 2: a {@code WHERE
+ *              x OP (SELECT ...)} comparison against a subquery that must
+ *              be run and its single value substituted before the outer
+ *              plan can be built — {@code core.cli.QueryCommand}'s job,
+ *              not this translator's (no {@code TableFormat} access
+ *              here). Always empty by the time anything downstream of
+ *              {@code QueryCommand.resolveScalarSubqueries} sees this
+ *              record; every resolved value ends up merged into {@code
+ *              predicate} or the matching {@link JoinStep#rightPredicate()}
+ *              instead.
  */
 public record SqlQuery(String table, String baseAlias, List<String> columns, Predicate predicate,
                         List<String> groupByColumns, List<AggregateSpec> aggregates,
-                        List<SortKey> orderBy, long limit, List<JoinStep> joins) {
+                        List<SortKey> orderBy, long limit, List<JoinStep> joins,
+                        List<ScalarSubquery> scalarSubqueries) {
 
     /**
      * One step of a left-deep join chain: joins the table/alias
@@ -84,5 +96,20 @@ public record SqlQuery(String table, String baseAlias, List<String> columns, Pre
      * core.execution.HashJoinOperator} actually looks up.
      */
     public record JoinKeyPair(String leftTableAlias, String leftColumn, String rightColumn) {
+    }
+
+    /**
+     * {@code outerTableAlias.outerColumn OP (SELECT ...)}. {@code
+     * innerQuery} is a fully ordinary, already-translated {@link
+     * SqlQuery} — translated with zero awareness of the outer query's
+     * aliases, so a correlated reference (a column that doesn't belong
+     * to the subquery's own table) fails {@code innerQuery}'s own
+     * translation with the same "doesn't match any known table" error
+     * every other path already throws, not a special case here.
+     * {@code innerQuery} may itself have {@code scalarSubqueries} of its
+     * own (arbitrary nesting) — {@code QueryCommand.resolveScalarSubqueries}
+     * handles that recursively, not this record.
+     */
+    public record ScalarSubquery(String outerTableAlias, String outerColumn, ComparisonOp op, SqlQuery innerQuery) {
     }
 }

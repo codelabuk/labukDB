@@ -243,6 +243,15 @@ FROM <table>
   supported yet. `NOT IN (SELECT ...)` doesn't replicate standard SQL's
   NULL-poisoning rule for a nullable subquery result column — a stated,
   known gap, not silently assumed correct.
+- `WHERE x OP (SELECT ...)` (a scalar subquery used as a comparison
+  operand) — runs once, before the rest of the query, substituting its
+  single value. The inner query can be anything a top-level query can
+  (including a group-by-less aggregate, e.g. `(SELECT MAX(y) FROM b)`
+  — the most common real shape) except its own `JOIN` or `GROUP BY`.
+  Correlation to the outer query isn't supported (rejected as a side
+  effect of translating the inner query independently). A subquery
+  returning zero rows, or whose one value is `NULL`, makes the whole
+  query return zero rows; more than one row is a runtime error.
 
 **Rejected with a specific error, not silently mishandled:**
 
@@ -250,7 +259,9 @@ FROM <table>
 |---|---|
 | `NOT`, `NOT LIKE`, `NOT IN (<literal list>)` | `Predicate` has no generic negation — see its javadoc. `NOT IN (SELECT ...)` *is* supported (see above); only the literal-list form is rejected. |
 | `IS NULL` | not a supported predicate shape |
-| A scalar subquery as a comparison operand (`WHERE x = (SELECT ...)`) | needs different machinery than `IN`/`EXISTS`; not implemented yet |
+| A scalar subquery with its own `JOIN` or `GROUP BY` inside it | not implemented yet |
+| A group-by-less aggregate scalar subquery over zero matching files | would need a real `NULL`/zero aggregate result, which can't be produced without a file to read a schema from |
+| A scalar subquery nested inside an `IN`/`EXISTS` subquery's own filter | that filter uses a narrower translation path that doesn't share this detection pass |
 | A derived table in `FROM` (`FROM (SELECT ...) AS t`) | not implemented yet |
 | `CROSS`/`NATURAL` join, non-equi `ON` conditions | not implemented yet |
 | A `WHERE` condition on the non-preserved side of `LEFT`/`RIGHT`, or on either side of `FULL` | pre-filtering it before the join would silently change which rows get null-padded — a condition on the preserved side is fine |

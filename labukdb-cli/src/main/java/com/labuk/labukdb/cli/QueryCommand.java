@@ -24,6 +24,7 @@ import com.labuk.labukdb.core.logical.LogicalPlanExecutor;
 import com.labuk.labukdb.core.logical.JoinExecution;
 import com.labuk.labukdb.core.logical.ResolvedScan;
 import com.labuk.labukdb.core.logical.RuleBasedOptimizer;
+import com.labuk.labukdb.core.planner.ComparisonOp;
 import com.labuk.labukdb.core.planner.NormalizedScanPlan;
 import com.labuk.labukdb.core.planner.PartitionValueSubstituter;
 import com.labuk.labukdb.core.planner.Predicate;
@@ -45,8 +46,11 @@ import org.apache.iceberg.catalog.TableIdentifier;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -131,11 +135,23 @@ final class QueryCommand {
      * would misrepresent the result.
      */
     private static void runSql(CliArgs parsed) throws Exception {
-        SqlQuery query = SqlQueryTranslator.translate(parsed.sql);
-        LogicalPlan plan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(query));
+        SqlQuery rawQuery = SqlQueryTranslator.translate(parsed.sql);
         TableCatalog catalog = TableCatalog.atDefaultLocation();
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            Optional<SqlQuery> resolvedQuery = resolveScalarSubqueries(rawQuery, catalog, parsed, allocator);
+            if (resolvedQuery.isEmpty()) {
+                // SQL engine Phase 4 increment 2: a scalar subquery resolved
+                // to zero rows (or a NULL value) -- "x OP NULL" is never
+                // true for any comparison operator, so the whole outer
+                // query is unconditionally zero rows, same observable
+                // result standard SQL's three-valued logic produces.
+                System.out.println("0 row(s)");
+                return;
+            }
+            SqlQuery query = resolvedQuery.get();
+            LogicalPlan plan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(query));
+
             if (!query.joins().isEmpty()) {
                 runSqlJoin(query, plan, catalog, parsed, allocator);
                 return;
@@ -204,6 +220,205 @@ final class QueryCommand {
                     tableRoot.toString(), "Iceberg snapshot");
         }
         return new ResolvedTable(new DeltaTableFormat(tableRoot), tableRoot, tableRoot.toString(), "version");
+    }
+
+    /**
+     * SQL engine Phase 4 increment 2: resolves every {@code
+     * query.scalarSubqueries()} once, merging each one's single resulting
+     * value into an ordinary {@code Predicate.Comparison} on the right
+     * table's own predicate bucket, before the outer {@code LogicalPlan}
+     * is ever built -- {@code SqlQueryTranslator} parsed these but
+     * couldn't run them (no {@code TableFormat} access there). Returns
+     * {@link Optional#empty()} when any subquery resolves to zero rows or
+     * a {@code NULL} value -- {@code x OP NULL} is never {@code true} for
+     * any comparison operator, so the whole outer query is unconditionally
+     * zero rows regardless of which subquery produced it.
+     */
+    private static Optional<SqlQuery> resolveScalarSubqueries(SqlQuery query, TableCatalog catalog, CliArgs parsed,
+                                                                 BufferAllocator allocator) throws Exception {
+        if (query.scalarSubqueries().isEmpty()) {
+            return Optional.of(query);
+        }
+
+        Map<String, Predicate> extraPerAlias = new LinkedHashMap<>();
+        for (SqlQuery.ScalarSubquery sub : query.scalarSubqueries()) {
+            Comparable<?> value = resolveScalarSubqueryValue(sub.innerQuery(), catalog, parsed, allocator);
+            if (value == null) {
+                return Optional.empty();
+            }
+            Predicate cmp = Predicate.compare(sub.outerColumn(), sub.op(), value);
+            extraPerAlias.merge(sub.outerTableAlias(), cmp, Predicate::and);
+        }
+
+        Predicate newBasePredicate = query.predicate();
+        Predicate baseExtra = extraPerAlias.remove(query.baseAlias());
+        if (baseExtra != null) {
+            newBasePredicate = newBasePredicate == null ? baseExtra : Predicate.and(newBasePredicate, baseExtra);
+        }
+
+        List<SqlQuery.JoinStep> newSteps = new ArrayList<>();
+        for (SqlQuery.JoinStep step : query.joins()) {
+            Predicate stepExtra = extraPerAlias.remove(step.rightAlias());
+            Predicate newRightPredicate = stepExtra == null ? step.rightPredicate()
+                    : step.rightPredicate() == null ? stepExtra : Predicate.and(step.rightPredicate(), stepExtra);
+            newSteps.add(new SqlQuery.JoinStep(step.type(), step.rightTable(), step.rightAlias(), step.keys(), newRightPredicate));
+        }
+
+        if (!extraPerAlias.isEmpty()) {
+            // Shouldn't happen -- every ScalarSubquery.outerTableAlias() came
+            // from an alias SqlQueryTranslator already validated against this
+            // same query's base/joins. Defensive, not a reachable user error.
+            throw new IllegalStateException("Scalar subquery referenced an unknown table alias: " + extraPerAlias.keySet());
+        }
+
+        List<String> finalColumns = query.columns();
+        List<String> finalGroupBy = query.groupByColumns();
+        List<AggregateSpec> finalAggregates = query.aggregates();
+        List<SortKey> finalOrderBy = query.orderBy();
+        String finalBaseAlias = query.baseAlias();
+        if (newSteps.isEmpty()) {
+            // This query only took the alias-qualified, join-shaped
+            // translation path because of a scalar subquery (not a real
+            // JOIN/IN/EXISTS) -- with no JoinStep surviving, no
+            // HashJoinOperator call will ever run to actually produce
+            // those alias-qualified names, so SqlQueryTranslator's
+            // "a.col"-style names must be stripped back to bare ones here,
+            // matching what the single-table execution path (which this
+            // query is about to fall into) has always expected. Predicate
+            // itself never needed this -- its own column references were
+            // already bare (toPredicate/columnName use Column.getColumnName(),
+            // not getFullyQualifiedName()); only the SELECT/GROUP BY/
+            // ORDER BY/aggregate column *lists* were ever qualified.
+            finalColumns = stripAliases(query.columns());
+            finalGroupBy = stripAliases(query.groupByColumns());
+            finalAggregates = query.aggregates().stream()
+                    .map(a -> new AggregateSpec(stripAlias(a.column()), a.function(), a.outputName()))
+                    .toList();
+            finalOrderBy = query.orderBy().stream()
+                    .map(k -> new SortKey(stripAlias(k.column()), k.ascending()))
+                    .toList();
+            finalBaseAlias = null;
+        }
+
+        return Optional.of(new SqlQuery(query.table(), finalBaseAlias, finalColumns, newBasePredicate,
+                finalGroupBy, finalAggregates, finalOrderBy, query.limit(), newSteps, List.of()));
+    }
+
+    private static List<String> stripAliases(List<String> qualifiedNames) {
+        return qualifiedNames.stream().map(QueryCommand::stripAlias).toList();
+    }
+
+    private static String stripAlias(String qualifiedName) {
+        int dot = qualifiedName.indexOf('.');
+        return dot < 0 ? qualifiedName : qualifiedName.substring(dot + 1);
+    }
+
+    /**
+     * Resolves one scalar subquery to its single value, reusing the exact
+     * same single-table primitives {@link #runSql} itself uses for a
+     * top-level query ({@link #resolveTableFormat}, {@link
+     * LogicalPlanExecutor#resolve}, {@link CombinedQueryExecutor}) -- no
+     * new execution primitive, just without the printing. Recurses via
+     * {@link #resolveScalarSubqueries} first so an arbitrarily-nested
+     * scalar subquery resolves correctly instead of being silently
+     * dropped ({@code LogicalPlanBuilder} never looks at {@code
+     * scalarSubqueries()} itself -- skipping this recursive call would be
+     * a real, silent correctness bug for a doubly-nested case, not
+     * attempted).
+     *
+     * @return the single resolved value, or {@code null} if the subquery
+     *         resolved to zero rows or its one cell is itself {@code NULL}
+     *         (both cases mean "the comparison can never be true" --
+     *         handled identically by the caller).
+     */
+    private static Comparable<?> resolveScalarSubqueryValue(SqlQuery innerQueryRaw, TableCatalog catalog, CliArgs parsed,
+                                                               BufferAllocator allocator) throws Exception {
+        Optional<SqlQuery> resolvedInner = resolveScalarSubqueries(innerQueryRaw, catalog, parsed, allocator);
+        if (resolvedInner.isEmpty()) {
+            return null;
+        }
+        SqlQuery innerQuery = resolvedInner.get();
+
+        if (!innerQuery.joins().isEmpty()) {
+            throw new IllegalArgumentException("A scalar subquery with its own JOIN is not supported yet: " + innerQuery.table());
+        }
+        if (!innerQuery.groupByColumns().isEmpty()) {
+            throw new IllegalArgumentException("A scalar subquery with GROUP BY is not supported yet "
+                    + "(could produce more than one row): " + innerQuery.table());
+        }
+        boolean singlePlainColumn = innerQuery.aggregates().isEmpty() && innerQuery.columns().size() == 1;
+        boolean singleAggregate = innerQuery.aggregates().size() == 1 && innerQuery.columns().isEmpty();
+        if (!singlePlainColumn && !singleAggregate) {
+            throw new IllegalArgumentException("A scalar subquery must produce exactly one column: " + innerQuery.table());
+        }
+
+        LogicalPlan innerPlan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(innerQuery));
+        ResolvedTable resolvedTable = resolveTableFormat(innerQuery.table(), catalog);
+        ResolvedScan resolved = new LogicalPlanExecutor().resolve(innerPlan, resolvedTable.format(),
+                resolvedTable.dataFileRoot(), parsed.version, parsed.asOf);
+
+        if (resolved.files().isEmpty()) {
+            if (singleAggregate) {
+                // Per SQL, a group-by-less aggregate over zero matching rows
+                // still produces exactly one row with a NULL/zero result
+                // (SUM->NULL, COUNT->0) -- not "zero rows". CombinedQueryExecutor.execute([])
+                // returns null for zero files (confirmed earlier this session), so
+                // there's no file to materialize that correct single row from here.
+                // Named plainly rather than silently treated as "zero rows", which
+                // would be wrong for this specific case (though correct for the
+                // plain-column case just below).
+                throw new IllegalArgumentException("A scalar subquery using an aggregate with no matching "
+                        + "files/rows isn't supported yet (would need its NULL/zero aggregate result, not "
+                        + "treated as 'no rows' the way a plain-column scalar subquery correctly is): " + innerQuery.table());
+            }
+            return null;
+        }
+
+        List<String> groupByColumns = resolved.aggregate() != null ? resolved.aggregate().groupByColumns() : List.of();
+        List<AggregateSpec> aggregates = resolved.aggregate() != null ? resolved.aggregate().aggregates() : List.of();
+        List<SortKey> sortKeys = resolved.sort() != null ? resolved.sort().sortKeys() : List.of();
+        long limitValue = resolved.limit() != null ? resolved.limit().limit() : -1;
+
+        try (VectorSchemaRoot result = new CombinedQueryExecutor().execute(resolved.files(), resolved.columns(),
+                groupByColumns, aggregates, sortKeys, limitValue, allocator)) {
+            if (result.getRowCount() == 0) {
+                return null;
+            }
+            if (result.getRowCount() > 1) {
+                throw new IllegalArgumentException("Scalar subquery returned more than one row ("
+                        + result.getRowCount() + ") -- expected exactly one: " + innerQuery.table());
+            }
+            List<FieldVector> vectors = result.getFieldVectors();
+            if (vectors.size() != 1) {
+                throw new IllegalArgumentException("Scalar subquery must produce exactly one column, got "
+                        + vectors.size() + ": " + innerQuery.table());
+            }
+            return scalarCellValue(vectors.get(0));
+        }
+    }
+
+    /** Same boxed-value pattern {@code HashJoinOperator}/{@code AggregateOperator} already use for their own key/value extraction -- a null cell returns null, same "never matches" meaning the caller already handles for zero rows. */
+    private static Comparable<?> scalarCellValue(FieldVector vector) {
+        if (vector.isNull(0)) {
+            return null;
+        }
+        if (vector instanceof org.apache.arrow.vector.IntVector v) {
+            return (long) v.get(0);
+        }
+        if (vector instanceof org.apache.arrow.vector.BigIntVector v) {
+            return v.get(0);
+        }
+        if (vector instanceof org.apache.arrow.vector.Float4Vector v) {
+            return (double) v.get(0);
+        }
+        if (vector instanceof org.apache.arrow.vector.Float8Vector v) {
+            return v.get(0);
+        }
+        if (vector instanceof org.apache.arrow.vector.VarCharVector v) {
+            return new String(v.get(0), java.nio.charset.StandardCharsets.UTF_8);
+        }
+        throw new IllegalArgumentException("Scalar subquery's result column type isn't supported as a comparison literal yet: "
+                + vector.getClass().getSimpleName());
     }
 
     /**

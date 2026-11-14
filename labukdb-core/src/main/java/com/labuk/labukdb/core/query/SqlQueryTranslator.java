@@ -15,6 +15,7 @@ import net.sf.jsqlparser.expression.NotExpression;
 import net.sf.jsqlparser.expression.StringValue;
 import net.sf.jsqlparser.expression.operators.conditional.AndExpression;
 import net.sf.jsqlparser.expression.operators.conditional.OrExpression;
+import net.sf.jsqlparser.expression.operators.relational.ComparisonOperator;
 import net.sf.jsqlparser.expression.operators.relational.EqualsTo;
 import net.sf.jsqlparser.expression.operators.relational.ExistsExpression;
 import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
@@ -70,13 +71,32 @@ import java.util.Set;
  * {@code NOT}/{@code NOT LIKE} ({@link Predicate} has no generic
  * negation outside {@code NOT IN}/{@code NOT EXISTS}'s own dedicated
  * handling below), {@code IS NULL}, a derived table in {@code FROM}
- * (e.g. {@code FROM (SELECT ...) AS t}), a scalar subquery used as a
- * comparison operand (e.g. {@code WHERE x = (SELECT ...)} — a different,
- * later increment, not this one), anything other than a plain
+ * (e.g. {@code FROM (SELECT ...) AS t}), anything other than a plain
  * {@code SELECT} (no {@code UNION} etc.), and {@code COUNT(*)} —
  * matches {@code AggregateOperator}'s existing, pre-existing
  * {@code COUNT(column)}-only semantics (counts non-null values of a
  * named column), not a new limitation introduced here.
+ *
+ * <b>Scalar subqueries, SQL engine Phase 4 increment 2:</b> {@code WHERE
+ * x OP (SELECT ...)} is parsed into a {@link SqlQuery.ScalarSubquery} —
+ * see {@link #buildScalarSubquery} — but this translator never *runs*
+ * one; it has no {@code TableFormat}/{@code TableLocation} access.
+ * {@code core.cli.QueryCommand.resolveScalarSubqueries} does that, once,
+ * before the outer plan is built, substituting the single resulting
+ * value into an ordinary {@code Predicate.Comparison}. The subquery
+ * itself is translated by recursing straight back into {@link
+ * #translateStatement} — the exact same logic a top-level query uses,
+ * so a group-by-less aggregate (<code>(SELECT MAX(y) FROM b)</code>)
+ * works for free, with zero extra validation here. Correlation to the
+ * outer query is rejected as a side effect of that reuse: the inner
+ * translation has no awareness of outer aliases at all, so a column
+ * that doesn't belong to the subquery's own table hits the same
+ * "doesn't match any known table" error every other path already
+ * throws. A scalar subquery nested inside an {@code OR} isn't detected
+ * by {@link #extractSubqueryConditions} (same {@code AND}-only scope
+ * every subquery form in this class shares) and falls through to
+ * {@link #literal}'s own dedicated rejection instead — still a clear
+ * error, just a narrower one than the top-level case gets.
  *
  * <b>{@code IN}/{@code NOT IN}/{@code EXISTS}/{@code NOT EXISTS}
  * subqueries, SQL engine Phase 4 increment 1:</b> decorrelated into an
@@ -164,7 +184,18 @@ public final class SqlQueryTranslator {
             throw new IllegalArgumentException(
                     "Only a plain SELECT statement is supported (no UNION, INSERT, UPDATE, etc.): " + sql);
         }
+        return translateStatement(plainSelect);
+    }
 
+    /**
+     * The body {@link #translate} always ran, extracted so a scalar
+     * subquery's own already-parsed {@code PlainSelect} (see {@link
+     * #buildScalarSubquery}) can be translated by recursing straight back
+     * into this same logic — the exact same validation a top-level query
+     * gets, zero new code — instead of re-serializing it to text and
+     * re-parsing.
+     */
+    private static SqlQuery translateStatement(PlainSelect plainSelect) {
         FromItem fromItem = plainSelect.getFromItem();
         if (!(fromItem instanceof Table table)) {
             throw new IllegalArgumentException("FROM must be a plain table reference, not a subquery: " + fromItem);
@@ -232,7 +263,7 @@ public final class SqlQueryTranslator {
         // own shape); plain SELECT items collected above are not otherwise used.
         List<String> effectiveColumns = (groupByColumns.isEmpty() && aggregates.isEmpty()) ? columns : List.of();
 
-        return new SqlQuery(table.getName(), null, effectiveColumns, predicate, groupByColumns, aggregates, orderBy, limit, List.of());
+        return new SqlQuery(table.getName(), null, effectiveColumns, predicate, groupByColumns, aggregates, orderBy, limit, List.of(), List.of());
     }
 
     /**
@@ -327,8 +358,9 @@ public final class SqlQueryTranslator {
         // extractSubqueryConditions), appended after every explicit JOIN so
         // every alias it might correlate against is already in scope.
         List<SqlQuery.JoinStep> subquerySteps = new ArrayList<>();
+        List<SqlQuery.ScalarSubquery> scalarSubqueries = new ArrayList<>();
         Expression remainingWhere = plainSelect.getWhere() == null ? null
-                : extractSubqueryConditions(plainSelect.getWhere(), allAliases, subquerySteps);
+                : extractSubqueryConditions(plainSelect.getWhere(), allAliases, subquerySteps, scalarSubqueries);
 
         // Per-table WHERE buckets, keyed by alias -- base's own bucket feeds
         // SqlQuery.predicate; every other table's feeds its introducing
@@ -363,7 +395,7 @@ public final class SqlQueryTranslator {
         steps.addAll(subquerySteps);
 
         return new SqlQuery(baseTable.getName(), baseAlias, effectiveColumns, perTablePredicate.get(baseAlias),
-                groupByColumns, aggregates, orderBy, limit, steps);
+                groupByColumns, aggregates, orderBy, limit, steps, scalarSubqueries);
     }
 
     private static JoinType joinType(Join join) {
@@ -561,7 +593,11 @@ public final class SqlQueryTranslator {
         if (expr instanceof ExistsExpression) {
             return true;
         }
-        return expr instanceof NotExpression not && not.getExpression() instanceof ExistsExpression;
+        if (expr instanceof NotExpression not && not.getExpression() instanceof ExistsExpression) {
+            return true;
+        }
+        return expr instanceof ComparisonOperator cmp
+                && (cmp.getLeftExpression() instanceof Select || cmp.getRightExpression() instanceof Select);
     }
 
     /**
@@ -580,13 +616,14 @@ public final class SqlQueryTranslator {
      * silent miss.
      */
     private static Expression extractSubqueryConditions(Expression expr, Set<String> outerAliases,
-                                                          List<SqlQuery.JoinStep> outSteps) {
+                                                          List<SqlQuery.JoinStep> outSteps,
+                                                          List<SqlQuery.ScalarSubquery> outScalars) {
         if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
-            return extractSubqueryConditions(grouped.get(0), outerAliases, outSteps);
+            return extractSubqueryConditions(grouped.get(0), outerAliases, outSteps, outScalars);
         }
         if (expr instanceof AndExpression and) {
-            Expression left = extractSubqueryConditions(and.getLeftExpression(), outerAliases, outSteps);
-            Expression right = extractSubqueryConditions(and.getRightExpression(), outerAliases, outSteps);
+            Expression left = extractSubqueryConditions(and.getLeftExpression(), outerAliases, outSteps, outScalars);
+            Expression right = extractSubqueryConditions(and.getRightExpression(), outerAliases, outSteps, outScalars);
             if (left == null) {
                 return right;
             }
@@ -607,7 +644,95 @@ public final class SqlQueryTranslator {
             outSteps.add(buildExistsSubqueryStep(exists, outerAliases, true));
             return null;
         }
+        if (expr instanceof ComparisonOperator cmp
+                && (cmp.getLeftExpression() instanceof Select || cmp.getRightExpression() instanceof Select)) {
+            outScalars.add(buildScalarSubquery(cmp, outerAliases));
+            return null;
+        }
         return expr;
+    }
+
+    /**
+     * {@code outer.col OP (SELECT ...)} — the subquery may be on either
+     * side (jsqlparser allows {@code (SELECT ...) = outer.col} too, not
+     * just the conventional column-first form; {@code effectiveOp} flips
+     * the four ordered comparisons accordingly — {@code (SELECT x) > y}
+     * means {@code y < (SELECT x)}, not {@code y > (SELECT x)}). The
+     * other side must be a column qualified with an already-known outer
+     * alias, same requirement every other comparison in this class
+     * already enforces once a join-shaped query is in play. See this
+     * class's own javadoc for why the inner query needs no shape
+     * validation here at all.
+     */
+    private static SqlQuery.ScalarSubquery buildScalarSubquery(ComparisonOperator cmp, Set<String> outerAliases) {
+        ComparisonOp op = comparisonOpFor(cmp);
+        Expression left = cmp.getLeftExpression();
+        Expression right = cmp.getRightExpression();
+
+        Select innerSelect;
+        Column outerColumn;
+        boolean swapped;
+        if (left instanceof Select sel) {
+            innerSelect = sel;
+            swapped = true;
+            if (!(right instanceof Column col)) {
+                throw new IllegalArgumentException("A scalar subquery comparison's other side must be a plain column: " + cmp);
+            }
+            outerColumn = col;
+        } else if (right instanceof Select sel) {
+            innerSelect = sel;
+            swapped = false;
+            if (!(left instanceof Column col)) {
+                throw new IllegalArgumentException("A scalar subquery comparison's other side must be a plain column: " + cmp);
+            }
+            outerColumn = col;
+        } else {
+            throw new IllegalArgumentException("Expected a scalar subquery comparison: " + cmp);
+        }
+
+        if (outerColumn.getTable() == null || !outerAliases.contains(outerColumn.getTable().getName())) {
+            throw new IllegalArgumentException(
+                    "A scalar subquery comparison's column must be qualified with an already-known table: " + cmp);
+        }
+
+        PlainSelect inner = innerPlainSelect(innerSelect, cmp);
+        SqlQuery innerQuery = translateStatement(inner);
+
+        return new SqlQuery.ScalarSubquery(outerColumn.getTable().getName(), outerColumn.getColumnName(),
+                swapped ? flip(op) : op, innerQuery);
+    }
+
+    private static ComparisonOp comparisonOpFor(ComparisonOperator cmp) {
+        if (cmp instanceof EqualsTo) {
+            return ComparisonOp.EQ;
+        }
+        if (cmp instanceof NotEqualsTo) {
+            return ComparisonOp.NEQ;
+        }
+        if (cmp instanceof GreaterThan) {
+            return ComparisonOp.GT;
+        }
+        if (cmp instanceof GreaterThanEquals) {
+            return ComparisonOp.GTE;
+        }
+        if (cmp instanceof MinorThan) {
+            return ComparisonOp.LT;
+        }
+        if (cmp instanceof MinorThanEquals) {
+            return ComparisonOp.LTE;
+        }
+        throw new IllegalArgumentException("Unsupported comparison operator: " + cmp);
+    }
+
+    private static ComparisonOp flip(ComparisonOp op) {
+        return switch (op) {
+            case EQ -> ComparisonOp.EQ;
+            case NEQ -> ComparisonOp.NEQ;
+            case GT -> ComparisonOp.LT;
+            case GTE -> ComparisonOp.LTE;
+            case LT -> ComparisonOp.GT;
+            case LTE -> ComparisonOp.GTE;
+        };
     }
 
     /** Unwraps a subquery operand's {@code ParenthesedSelect} into its inner {@code PlainSelect} -- confirmed via a real parse, not the jsqlparser default assumption. */
@@ -931,14 +1056,13 @@ public final class SqlQueryTranslator {
             return v.getValue();
         }
         if (expr instanceof Select) {
-            // e.g. WHERE x = (SELECT ...) -- a scalar subquery used as a
-            // comparison operand. SQL engine Phase 4 increment 1 only
-            // covers IN/EXISTS/NOT IN/NOT EXISTS (decorrelated into a
-            // SEMI/ANTI join); a scalar subquery needs genuinely different
-            // machinery (evaluate it once, substitute its single value --
-            // SqlQueryTranslator has no access to TableFormat/TableLocation
-            // to actually run it) and is a later increment, not this one.
-            throw new IllegalArgumentException("Scalar subqueries (e.g. WHERE x = (SELECT ...)) are not supported yet: " + expr);
+            // The common top-level-AND case never reaches here -- extractSubqueryConditions
+            // already peels it off into a SqlQuery.ScalarSubquery before toPredicate/literal
+            // ever sees it (see buildScalarSubquery). This still fires for one narrower case:
+            // a scalar subquery nested inside an OR, same AND-only scope every subquery form
+            // in this class shares -- a clear, if less specific, rejection rather than a silent miss.
+            throw new IllegalArgumentException("Scalar subqueries (e.g. WHERE x = (SELECT ...)) are not supported "
+                    + "inside OR -- must be a top-level AND-combined condition: " + expr);
         }
         throw new IllegalArgumentException("Unsupported literal (expected a number or string): " + expr);
     }

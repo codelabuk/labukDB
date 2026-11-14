@@ -411,9 +411,60 @@ class SqlQueryTranslatorTest {
     }
 
     @Test
-    void scalarSubqueryAsComparisonOperand_rejectedWithDedicatedError_notUnsupportedLiteral() {
+    void scalarSubqueryAsComparisonOperand_nowSupported_parsesIntoAScalarSubquery() {
+        // SQL engine Phase 4 increment 2: this used to be rejected; now it
+        // parses into SqlQuery.ScalarSubquery -- QueryCommand runs it.
+        SqlQuery query = SqlQueryTranslator.translate("SELECT a.x FROM a WHERE a.y = (SELECT b.z FROM b)");
+
+        assertEquals(1, query.scalarSubqueries().size());
+        SqlQuery.ScalarSubquery sub = query.scalarSubqueries().get(0);
+        assertEquals("a", sub.outerTableAlias());
+        assertEquals("y", sub.outerColumn());
+        assertEquals(ComparisonOp.EQ, sub.op());
+        assertEquals("b", sub.innerQuery().table());
+        assertEquals(List.of("z"), sub.innerQuery().columns());
+        assertTrue(query.joins().isEmpty(), "a scalar subquery alone doesn't produce a JoinStep, unlike IN/EXISTS");
+    }
+
+    @Test
+    void scalarSubqueryComparison_subqueryOnTheLeftSide_flipsOrderedOperators() {
+        // (SELECT ...) > a.y means a.y < (SELECT ...), not a.y > (SELECT ...).
+        SqlQuery query = SqlQueryTranslator.translate("SELECT a.x FROM a WHERE (SELECT b.z FROM b) > a.y");
+        assertEquals(ComparisonOp.LT, query.scalarSubqueries().get(0).op());
+    }
+
+    @Test
+    void scalarSubqueryWithAggregate_parsesTheInnerQueryWithItsAggregateIntact() {
+        // The single most common real-world scalar subquery shape -- SELECT
+        // MAX(y) FROM b, no GROUP BY -- always produces exactly one row,
+        // which is exactly what a scalar context needs; translateStatement
+        // handles this with zero new validation, reused unchanged.
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE a.y = (SELECT MAX(b.z) AS m FROM b)");
+
+        SqlQuery inner = query.scalarSubqueries().get(0).innerQuery();
+        assertTrue(inner.columns().isEmpty());
+        assertEquals(1, inner.aggregates().size());
+        assertEquals(AggregateFunction.MAX, inner.aggregates().get(0).function());
+    }
+
+    @Test
+    void scalarSubquery_correlatedReference_rejectedByItsOwnIndependentTranslation() {
+        // No special-casing needed: the inner query is translated with zero
+        // outer-alias awareness, via the plain single-table path, whose
+        // comparison() always expects a literal on the right -- "a.w" is a
+        // Column, not one, so this fails exactly the way "WHERE b.w = c.z"
+        // would in a real top-level query, not via any subquery-specific check.
         IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
-                () -> SqlQueryTranslator.translate("SELECT a.x FROM a WHERE a.y = (SELECT b.z FROM b)"));
+                () -> SqlQueryTranslator.translate("SELECT a.x FROM a WHERE a.y = (SELECT b.z FROM b WHERE b.w = a.w)"));
+        assertTrue(thrown.getMessage().contains("Unsupported literal"), thrown.getMessage());
+    }
+
+    @Test
+    void scalarSubquery_insideOr_fallsThroughToTheDedicatedOrNotSupportedError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a WHERE a.y = (SELECT b.z FROM b) OR a.w = 1"));
         assertTrue(thrown.getMessage().contains("Scalar subquer"), thrown.getMessage());
     }
 
