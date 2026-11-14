@@ -11,10 +11,12 @@ import net.sf.jsqlparser.expression.DoubleValue;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.expression.Function;
 import net.sf.jsqlparser.expression.LongValue;
+import net.sf.jsqlparser.expression.NotExpression;
 import net.sf.jsqlparser.expression.StringValue;
 import net.sf.jsqlparser.expression.operators.conditional.AndExpression;
 import net.sf.jsqlparser.expression.operators.conditional.OrExpression;
 import net.sf.jsqlparser.expression.operators.relational.EqualsTo;
+import net.sf.jsqlparser.expression.operators.relational.ExistsExpression;
 import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
 import net.sf.jsqlparser.expression.operators.relational.GreaterThan;
 import net.sf.jsqlparser.expression.operators.relational.GreaterThanEquals;
@@ -32,6 +34,7 @@ import net.sf.jsqlparser.statement.select.AllColumns;
 import net.sf.jsqlparser.statement.select.FromItem;
 import net.sf.jsqlparser.statement.select.Join;
 import net.sf.jsqlparser.statement.select.OrderByElement;
+import net.sf.jsqlparser.statement.select.ParenthesedSelect;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.statement.select.SelectItem;
@@ -64,12 +67,46 @@ import java.util.Set;
  * item requires an alias.
  *
  * <b>Rejected with a clear error, not silently mishandled:</b>
- * {@code NOT}/{@code NOT IN}/{@code NOT LIKE} ({@link Predicate} has no
- * generic negation), {@code IS NULL}, subqueries, anything other
- * than a plain {@code SELECT} (no {@code UNION} etc.), and
- * {@code COUNT(*)} — matches {@code AggregateOperator}'s existing,
- * pre-existing {@code COUNT(column)}-only semantics (counts non-null
- * values of a named column), not a new limitation introduced here.
+ * {@code NOT}/{@code NOT LIKE} ({@link Predicate} has no generic
+ * negation outside {@code NOT IN}/{@code NOT EXISTS}'s own dedicated
+ * handling below), {@code IS NULL}, a derived table in {@code FROM}
+ * (e.g. {@code FROM (SELECT ...) AS t}), a scalar subquery used as a
+ * comparison operand (e.g. {@code WHERE x = (SELECT ...)} — a different,
+ * later increment, not this one), anything other than a plain
+ * {@code SELECT} (no {@code UNION} etc.), and {@code COUNT(*)} —
+ * matches {@code AggregateOperator}'s existing, pre-existing
+ * {@code COUNT(column)}-only semantics (counts non-null values of a
+ * named column), not a new limitation introduced here.
+ *
+ * <b>{@code IN}/{@code NOT IN}/{@code EXISTS}/{@code NOT EXISTS}
+ * subqueries, SQL engine Phase 4 increment 1:</b> decorrelated into an
+ * ordinary {@code JoinType.SEMI}/{@code ANTI} step appended after every
+ * explicit {@code JOIN} — see {@link #extractSubqueryConditions},
+ * {@link #buildInSubqueryStep}, {@link #buildExistsSubqueryStep}. The
+ * subquery itself must be a single plain table (no {@code JOIN},
+ * {@code GROUP BY}, {@code ORDER BY}, or {@code LIMIT} inside it, no
+ * further nested subquery); correlation to an outer table must be a
+ * plain {@code AND}-combined {@code inner.col = outer.col} equality,
+ * same shape discipline a real {@code JOIN ... ON} already enforces — a
+ * non-equality correlation, or one inside an {@code OR}, falls through
+ * to this class's ordinary (generic) rejection. A key-less, wholly
+ * uncorrelated {@code EXISTS}/{@code NOT EXISTS} (no shared column with
+ * any outer table at all) is rejected with a clear error — {@code
+ * HashJoinOperator} always needs at least one key; {@code IN}/
+ * {@code NOT IN} never hit this, since the {@code IN} comparison's own
+ * column match is always itself a key. Once any such subquery (or an
+ * explicit {@code JOIN}) is present, every column anywhere in the query
+ * must be table-qualified, same as a real multi-table join already
+ * requires — a deliberate consistency choice, not a new restriction
+ * specific to subqueries. <b>Known, stated gap:</b> {@code NOT IN
+ * (SELECT ...)} does not replicate standard SQL's NULL-poisoning rule
+ * (a {@code NULL} in the subquery's result column should make the
+ * whole {@code NOT IN} unknown for every outer row); this
+ * implementation's {@code ANTI} join instead just treats a {@code NULL}
+ * subquery row as absent, which can differ from standard SQL when the
+ * subquery's result column is nullable and actually contains a
+ * {@code NULL} — not fixed here, named plainly rather than silently
+ * shipped as correct.
  *
  * <b>{@code JOIN}, SQL engine Phase 3 — {@code INNER}/{@code LEFT}/
  * {@code RIGHT}/{@code FULL}, any number of tables:</b> {@code ON} must
@@ -134,8 +171,15 @@ public final class SqlQueryTranslator {
         }
 
         List<Join> joins = plainSelect.getJoins();
-        if (joins != null && !joins.isEmpty()) {
-            return translateJoin(plainSelect, table, joins);
+        boolean hasExplicitJoins = joins != null && !joins.isEmpty();
+        // A WHERE-clause IN/EXISTS/NOT IN/NOT EXISTS subquery decorrelates
+        // into a SEMI/ANTI join step even when there's no explicit JOIN
+        // keyword at all -- route it through the same join-shaped path,
+        // with an empty explicit-joins list, rather than duplicating that
+        // path's alias/qualification machinery here.
+        boolean hasSubqueryCondition = plainSelect.getWhere() != null && containsSubqueryCondition(plainSelect.getWhere());
+        if (hasExplicitJoins || hasSubqueryCondition) {
+            return translateJoin(plainSelect, table, hasExplicitJoins ? joins : List.of());
         }
 
         List<String> columns = new ArrayList<>();
@@ -277,12 +321,21 @@ public final class SqlQueryTranslator {
         // so the plain SELECT columns collected above are irrelevant.
         List<String> effectiveColumns = (groupByColumns.isEmpty() && aggregates.isEmpty()) ? joinColumns : List.of();
 
+        // SQL engine Phase 4: peel off any IN/EXISTS/NOT IN/NOT EXISTS
+        // subquery conditions BEFORE the normal per-table WHERE split below
+        // ever sees them -- each becomes its own SEMI/ANTI JoinStep (see
+        // extractSubqueryConditions), appended after every explicit JOIN so
+        // every alias it might correlate against is already in scope.
+        List<SqlQuery.JoinStep> subquerySteps = new ArrayList<>();
+        Expression remainingWhere = plainSelect.getWhere() == null ? null
+                : extractSubqueryConditions(plainSelect.getWhere(), allAliases, subquerySteps);
+
         // Per-table WHERE buckets, keyed by alias -- base's own bucket feeds
         // SqlQuery.predicate; every other table's feeds its introducing
         // JoinStep.rightPredicate (see assembly below).
         Map<String, Predicate> perTablePredicate = new LinkedHashMap<>();
-        if (plainSelect.getWhere() != null) {
-            splitJoinWhere(plainSelect.getWhere(), allAliases, unsafeForPredicatePushdown, perTablePredicate);
+        if (remainingWhere != null) {
+            splitJoinWhere(remainingWhere, allAliases, unsafeForPredicatePushdown, perTablePredicate);
         }
 
         List<SqlQuery.JoinStep> steps = new ArrayList<>();
@@ -295,6 +348,19 @@ public final class SqlQueryTranslator {
             steps.add(new SqlQuery.JoinStep(types.get(i), rightTables.get(i).getName(), rightAlias, keys,
                     perTablePredicate.get(rightAlias)));
         }
+
+        // Every subquery-derived step's own alias must be distinct, both from
+        // each other and from every explicit table -- the explicit-only check
+        // above (allAliases.size() != aliasesInOrder.size()) can't see these,
+        // since they're discovered later, from WHERE, not FROM/JOIN.
+        Set<String> allAliasesIncludingSubqueries = new LinkedHashSet<>(aliasesInOrder);
+        for (SqlQuery.JoinStep subqueryStep : subquerySteps) {
+            if (!allAliasesIncludingSubqueries.add(subqueryStep.rightAlias())) {
+                throw new IllegalArgumentException("A subquery's table alias '" + subqueryStep.rightAlias()
+                        + "' collides with another table's alias in this query: " + allAliasesIncludingSubqueries);
+            }
+        }
+        steps.addAll(subquerySteps);
 
         return new SqlQuery(baseTable.getName(), baseAlias, effectiveColumns, perTablePredicate.get(baseAlias),
                 groupByColumns, aggregates, orderBy, limit, steps);
@@ -481,6 +547,224 @@ public final class SqlQueryTranslator {
         out.merge(side, toPredicate(expr), Predicate::and);
     }
 
+    /** Cheap, shallow pre-check so {@link #translate} can route to the join-shaped path without fully extracting anything yet -- same top-level-AND-only scope {@link #extractSubqueryConditions} itself enforces. */
+    private static boolean containsSubqueryCondition(Expression expr) {
+        if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
+            return containsSubqueryCondition(grouped.get(0));
+        }
+        if (expr instanceof AndExpression and) {
+            return containsSubqueryCondition(and.getLeftExpression()) || containsSubqueryCondition(and.getRightExpression());
+        }
+        if (expr instanceof InExpression in) {
+            return in.getRightExpression() instanceof Select;
+        }
+        if (expr instanceof ExistsExpression) {
+            return true;
+        }
+        return expr instanceof NotExpression not && not.getExpression() instanceof ExistsExpression;
+    }
+
+    /**
+     * SQL engine Phase 4: walks the same top-level {@code AND} tree {@link
+     * #splitJoinWhere} walks, but peels off {@code IN}/{@code NOT IN}/
+     * {@code EXISTS}/{@code NOT EXISTS} subquery conditions into {@code
+     * outSteps} (one {@link SqlQuery.JoinStep} each, {@code JoinType.SEMI}/
+     * {@code ANTI}) instead of leaving them for {@link #toPredicate}, which
+     * has no way to represent one. Returns the remaining expression tree
+     * (everything that wasn't a subquery condition), or {@code null} if
+     * nothing is left -- {@link #splitJoinWhere} processes that normally,
+     * unaware any extraction happened. A subquery condition nested inside
+     * an {@code OR} is deliberately not found here (same AND-only scope
+     * every other WHERE/ON splitter in this class already enforces) --
+     * it falls through to the ordinary rejection paths instead, not a
+     * silent miss.
+     */
+    private static Expression extractSubqueryConditions(Expression expr, Set<String> outerAliases,
+                                                          List<SqlQuery.JoinStep> outSteps) {
+        if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
+            return extractSubqueryConditions(grouped.get(0), outerAliases, outSteps);
+        }
+        if (expr instanceof AndExpression and) {
+            Expression left = extractSubqueryConditions(and.getLeftExpression(), outerAliases, outSteps);
+            Expression right = extractSubqueryConditions(and.getRightExpression(), outerAliases, outSteps);
+            if (left == null) {
+                return right;
+            }
+            if (right == null) {
+                return left;
+            }
+            return new AndExpression(left, right);
+        }
+        if (expr instanceof InExpression in && in.getRightExpression() instanceof Select) {
+            outSteps.add(buildInSubqueryStep(in, outerAliases));
+            return null;
+        }
+        if (expr instanceof ExistsExpression exists) {
+            outSteps.add(buildExistsSubqueryStep(exists, outerAliases, false));
+            return null;
+        }
+        if (expr instanceof NotExpression not && not.getExpression() instanceof ExistsExpression exists) {
+            outSteps.add(buildExistsSubqueryStep(exists, outerAliases, true));
+            return null;
+        }
+        return expr;
+    }
+
+    /** Unwraps a subquery operand's {@code ParenthesedSelect} into its inner {@code PlainSelect} -- confirmed via a real parse, not the jsqlparser default assumption. */
+    private static PlainSelect innerPlainSelect(Select select, Expression context) {
+        if (!(select instanceof ParenthesedSelect parenthesed)) {
+            throw new IllegalArgumentException("Subquery must be a plain SELECT: " + context);
+        }
+        try {
+            return parenthesed.getPlainSelect();
+        } catch (ClassCastException e) {
+            throw new IllegalArgumentException("Subquery must be a plain SELECT, not UNION/etc.: " + context);
+        }
+    }
+
+    /**
+     * {@code outer.col IN (SELECT inner.resultCol FROM inner [WHERE ...])} →
+     * a {@code JoinType.SEMI} step ({@code ANTI} for {@code NOT IN}) whose
+     * keys are the {@code IN}'s own column match plus any correlation
+     * equalities found inside the subquery's own {@code WHERE} (see {@link
+     * #splitSubqueryWhere}). The {@code IN}'s own match is always present,
+     * so (unlike {@code EXISTS}) a key-less {@code IN (SELECT...)} can't
+     * happen. The subquery itself must be a single plain table, exactly one
+     * plain-column {@code SELECT} item, no {@code JOIN}/{@code GROUP BY}/
+     * {@code ORDER BY}/{@code LIMIT} inside it, no further nested subquery.
+     */
+    private static SqlQuery.JoinStep buildInSubqueryStep(InExpression in, Set<String> outerAliases) {
+        PlainSelect inner = innerPlainSelect((Select) in.getRightExpression(), in);
+        if (inner.getJoins() != null && !inner.getJoins().isEmpty()) {
+            throw new IllegalArgumentException("IN (SELECT ...) subquery with its own JOIN is not supported yet: " + in);
+        }
+        if (!(inner.getFromItem() instanceof Table innerTable)) {
+            throw new IllegalArgumentException("IN (SELECT ...) subquery's FROM must be a plain table, not a nested subquery: " + in);
+        }
+        if (inner.getGroupBy() != null || !emptyOrNull(inner.getOrderByElements()) || inner.getLimit() != null) {
+            throw new IllegalArgumentException("IN (SELECT ...) subquery with GROUP BY/ORDER BY/LIMIT is not supported yet: " + in);
+        }
+        String innerAlias = aliasOrName(innerTable);
+        if (outerAliases.contains(innerAlias)) {
+            throw new IllegalArgumentException("Subquery's table alias '" + innerAlias + "' collides with an outer table alias: " + in);
+        }
+
+        List<SelectItem<?>> items = inner.getSelectItems();
+        if (items.size() != 1 || !(items.get(0).getExpression() instanceof Column resultColumn)) {
+            throw new IllegalArgumentException("IN (SELECT ...) subquery must select exactly one plain column: " + in);
+        }
+
+        if (!(in.getLeftExpression() instanceof Column outerColumn) || outerColumn.getTable() == null
+                || !outerAliases.contains(outerColumn.getTable().getName())) {
+            throw new IllegalArgumentException(
+                    "IN (SELECT ...)'s left side must be a column qualified with an already-known table: " + in);
+        }
+        String outerAlias = outerColumn.getTable().getName();
+
+        List<SqlQuery.JoinKeyPair> keys = new ArrayList<>();
+        keys.add(new SqlQuery.JoinKeyPair(outerAlias, outerColumn.getColumnName(), resultColumn.getColumnName()));
+
+        List<Expression> ownFilterConjuncts = new ArrayList<>();
+        if (inner.getWhere() != null) {
+            splitSubqueryWhere(inner.getWhere(), innerAlias, outerAliases, keys, ownFilterConjuncts);
+        }
+
+        JoinType type = in.isNot() ? JoinType.ANTI : JoinType.SEMI;
+        return new SqlQuery.JoinStep(type, innerTable.getName(), innerAlias, keys, buildConjunctionPredicate(ownFilterConjuncts));
+    }
+
+    /**
+     * {@code EXISTS (SELECT ... FROM inner WHERE inner.x = outer.y [AND ...])}
+     * → a {@code JoinType.SEMI} step ({@code ANTI} for {@code NOT EXISTS})
+     * keyed purely on whatever equality correlations {@link
+     * #splitSubqueryWhere} finds — {@code EXISTS} never looks at the
+     * subquery's own {@code SELECT} list at all (existence only), unlike
+     * {@code IN}. Rejected if no correlation equality is found at all: a
+     * truly key-less existence check doesn't fit {@code HashJoinOperator}'s
+     * build/probe model (it always needs at least one key) and isn't
+     * attempted here.
+     */
+    private static SqlQuery.JoinStep buildExistsSubqueryStep(ExistsExpression exists, Set<String> outerAliases, boolean negated) {
+        PlainSelect inner = innerPlainSelect((Select) exists.getRightExpression(), exists);
+        if (inner.getJoins() != null && !inner.getJoins().isEmpty()) {
+            throw new IllegalArgumentException("EXISTS (SELECT ...) subquery with its own JOIN is not supported yet: " + exists);
+        }
+        if (!(inner.getFromItem() instanceof Table innerTable)) {
+            throw new IllegalArgumentException("EXISTS (SELECT ...) subquery's FROM must be a plain table, not a nested subquery: " + exists);
+        }
+        String innerAlias = aliasOrName(innerTable);
+        if (outerAliases.contains(innerAlias)) {
+            throw new IllegalArgumentException("Subquery's table alias '" + innerAlias + "' collides with an outer table alias: " + exists);
+        }
+
+        List<SqlQuery.JoinKeyPair> keys = new ArrayList<>();
+        List<Expression> ownFilterConjuncts = new ArrayList<>();
+        if (inner.getWhere() != null) {
+            splitSubqueryWhere(inner.getWhere(), innerAlias, outerAliases, keys, ownFilterConjuncts);
+        }
+        if (keys.isEmpty()) {
+            throw new IllegalArgumentException("EXISTS (SELECT ...) with no correlation to an outer table is not "
+                    + "supported yet -- needs at least one 'inner.col = outer.col' condition in its WHERE: " + exists);
+        }
+
+        JoinType type = negated ? JoinType.ANTI : JoinType.SEMI;
+        return new SqlQuery.JoinStep(type, innerTable.getName(), innerAlias, keys, buildConjunctionPredicate(ownFilterConjuncts));
+    }
+
+    /**
+     * Splits a subquery's own top-level {@code AND}-combined {@code WHERE}
+     * into correlation equalities (one side qualified with {@code
+     * innerAlias}, the other with any {@code outerAliases} member) --
+     * appended to {@code correlationKeys} in the same {@code (outerAlias,
+     * outerColumn, innerColumn)} shape {@link #toJoinKeys} already uses for
+     * a real {@code JOIN ... ON} -- versus everything else, kept verbatim
+     * in {@code ownFilterConjuncts} as the subquery's own internal filter
+     * (translated via the ordinary {@link #toPredicate} by the caller). A
+     * non-equality or non-correlating condition is treated as the
+     * subquery's own filter, not an error here -- e.g. {@code inner.z = 5}
+     * is exactly as valid inside a subquery as it would be in a real
+     * table's own {@code WHERE}.
+     */
+    private static void splitSubqueryWhere(Expression expr, String innerAlias, Set<String> outerAliases,
+                                            List<SqlQuery.JoinKeyPair> correlationKeys, List<Expression> ownFilterConjuncts) {
+        if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
+            splitSubqueryWhere(grouped.get(0), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts);
+            return;
+        }
+        if (expr instanceof AndExpression and) {
+            splitSubqueryWhere(and.getLeftExpression(), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts);
+            splitSubqueryWhere(and.getRightExpression(), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts);
+            return;
+        }
+        if (expr instanceof EqualsTo eq
+                && eq.getLeftExpression() instanceof Column leftCol && eq.getRightExpression() instanceof Column rightCol) {
+            String leftColTable = leftCol.getTable() == null ? null : leftCol.getTable().getName();
+            String rightColTable = rightCol.getTable() == null ? null : rightCol.getTable().getName();
+            if (innerAlias.equals(leftColTable) && outerAliases.contains(rightColTable)) {
+                correlationKeys.add(new SqlQuery.JoinKeyPair(rightColTable, rightCol.getColumnName(), leftCol.getColumnName()));
+                return;
+            }
+            if (innerAlias.equals(rightColTable) && outerAliases.contains(leftColTable)) {
+                correlationKeys.add(new SqlQuery.JoinKeyPair(leftColTable, leftCol.getColumnName(), rightCol.getColumnName()));
+                return;
+            }
+        }
+        ownFilterConjuncts.add(expr);
+    }
+
+    private static Predicate buildConjunctionPredicate(List<Expression> conjuncts) {
+        Predicate result = null;
+        for (Expression e : conjuncts) {
+            Predicate p = toPredicate(e);
+            result = result == null ? p : Predicate.and(result, p);
+        }
+        return result;
+    }
+
+    private static boolean emptyOrNull(List<?> list) {
+        return list == null || list.isEmpty();
+    }
+
     /** Walks the same expression shapes {@link #toPredicate} understands, collecting each leaf's table qualifier (or {@code null} if unqualified) instead of building a {@link Predicate}. */
     private static void collectColumnTables(Expression expr, Set<String> out) {
         if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
@@ -508,7 +792,7 @@ public final class SqlQueryTranslator {
         } else if (expr instanceof MinorThanEquals cmp) {
             collectComparisonColumnTables(cmp.getLeftExpression(), cmp.getRightExpression(), out);
         } else {
-            throw new IllegalArgumentException("Unsupported WHERE expression (no NOT, no IS NULL, no subqueries): " + expr);
+            throw new IllegalArgumentException("Unsupported WHERE expression (no NOT, no IS NULL, no subquery here -- an IN/EXISTS/NOT IN/NOT EXISTS subquery must be top-level AND-combined, not inside OR): " + expr);
         }
     }
 
@@ -622,7 +906,7 @@ public final class SqlQueryTranslator {
         if (expr instanceof MinorThanEquals cmp) {
             return comparison(cmp.getLeftExpression(), ComparisonOp.LTE, cmp.getRightExpression());
         }
-        throw new IllegalArgumentException("Unsupported WHERE expression (no NOT, no IS NULL, no subqueries): " + expr);
+        throw new IllegalArgumentException("Unsupported WHERE expression (no NOT, no IS NULL, no subquery here -- an IN/EXISTS/NOT IN/NOT EXISTS subquery must be top-level AND-combined, not inside OR): " + expr);
     }
 
     private static Predicate comparison(Expression left, ComparisonOp op, Expression right) {
@@ -645,6 +929,16 @@ public final class SqlQueryTranslator {
         }
         if (expr instanceof StringValue v) {
             return v.getValue();
+        }
+        if (expr instanceof Select) {
+            // e.g. WHERE x = (SELECT ...) -- a scalar subquery used as a
+            // comparison operand. SQL engine Phase 4 increment 1 only
+            // covers IN/EXISTS/NOT IN/NOT EXISTS (decorrelated into a
+            // SEMI/ANTI join); a scalar subquery needs genuinely different
+            // machinery (evaluate it once, substitute its single value --
+            // SqlQueryTranslator has no access to TableFormat/TableLocation
+            // to actually run it) and is a later increment, not this one.
+            throw new IllegalArgumentException("Scalar subqueries (e.g. WHERE x = (SELECT ...)) are not supported yet: " + expr);
         }
         throw new IllegalArgumentException("Unsupported literal (expected a number or string): " + expr);
     }

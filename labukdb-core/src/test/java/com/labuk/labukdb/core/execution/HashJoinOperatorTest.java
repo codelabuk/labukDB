@@ -255,4 +255,75 @@ class HashJoinOperatorTest {
             }
         }
     }
+
+    // --- SQL engine Phase 4, increment 1: SEMI/ANTI (decorrelated IN/EXISTS subqueries) ---
+
+    @Test
+    void semiJoin_matchExists_emitsProbeRowOnce_noFanOut_leftColumnsOnly() {
+        // Two customers rows share id=1 -- a real INNER join would fan out
+        // to 2 rows; SEMI must emit the probe row exactly once regardless.
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1}, new String[] {"auth-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1, 1}, new String[] {"us-east", "us-west"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.SEMI,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(1, result.getRowCount(), "SEMI never fans out, even on a duplicate build-side key");
+                assertNotNull(result.getVector("a.customer_id"));
+                assertNotNull(result.getVector("a.service"));
+                assertNull(result.getVector("b.id"), "SEMI's output never includes the build (subquery) side's columns");
+                assertNull(result.getVector("b.region"));
+            }
+        }
+    }
+
+    @Test
+    void semiJoin_noMatch_dropsTheProbeRow() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {999}, new String[] {"orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.SEMI,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(0, result.getRowCount());
+            }
+        }
+    }
+
+    @Test
+    void antiJoin_noMatch_emitsTheProbeRowOnce() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {999}, new String[] {"orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.ANTI,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(1, result.getRowCount(), "ANTI asserts 'no match' -- the unmatched row qualifies");
+                VarCharVector service = (VarCharVector) result.getVector("a.service");
+                assertEquals("orphan-svc", new String(service.get(0), StandardCharsets.UTF_8));
+            }
+        }
+    }
+
+    @Test
+    void antiJoin_matchExists_dropsTheProbeRow() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1}, new String[] {"auth-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1, 1}, new String[] {"us-east", "us-west"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.ANTI,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(0, result.getRowCount(), "a match exists -- ANTI's condition fails for this row");
+            }
+        }
+    }
+
+    @Test
+    void semiJoin_nullProbeKey_neverMatches_evenAgainstANumericallyEqualBuildRow() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1}, new String[] {"auth-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+            ((BigIntVector) orders.getVector("customer_id")).setNull(0); // null probe key, same value otherwise
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.SEMI,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(0, result.getRowCount(), "a null join key must never match, standard SQL semantics");
+            }
+        }
+    }
 }

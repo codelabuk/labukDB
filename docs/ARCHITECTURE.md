@@ -276,24 +276,53 @@ byte-size heuristic, not real cardinality-based costing); `LEFT`/
 with every argument swapped, inside `HashJoinOperator` — the tree never
 needs to represent it specially).
 
+`IN (SELECT ...)`, `NOT IN (SELECT ...)`, `EXISTS (SELECT ...)`, and
+`NOT EXISTS (SELECT ...)` are decorrelated at translation time into an
+ordinary `JoinType.SEMI`/`ANTI` step, appended after every explicit
+`JOIN` — the same left-deep chain machinery runs it, no new execution
+concept. `SEMI` emits a probe row at most once if it has any match;
+`ANTI` emits it at most once if it has none; neither ever fans out on a
+duplicate build-side key, and neither includes the build (subquery)
+side's columns in the output. A subquery must be a single plain table
+(no `JOIN`/`GROUP BY`/`ORDER BY`/`LIMIT` inside it, no further nested
+subquery); correlation to an outer table must be a plain `AND`-combined
+`inner.col = outer.col` equality, the same shape discipline a real
+`JOIN ... ON` already enforces. Once any such subquery is present,
+every column in the query must be table-qualified, same as a real
+`JOIN` already requires — one consistency rule, not two.
+
 **Not supported**, stated as current scope boundaries: `CROSS`/
-`NATURAL`/`SEMI` joins, non-equi join conditions, cost-based join
-*order* (which tables join first is exactly what the SQL text said,
-never reordered — only the build/probe *side* within an already-fixed
-step is heuristic), a `WHERE` condition on the non-preserved side of
+`NATURAL` joins, non-equi join conditions, cost-based join *order*
+(which tables join first is exactly what the SQL text said, never
+reordered — only the build/probe *side* within an already-fixed step
+is heuristic), a `WHERE` condition on the non-preserved side of
 `LEFT`/`RIGHT` or on either side of `FULL` (rejected with a clear error
 at translation time — pre-filtering it would silently change which rows
-get null-padded; a condition on the preserved side works normally),
-subqueries, computed `SELECT` expressions (every item must be a bare
-column or one of the five aggregate functions — no `a + b`, no `CASE`,
-no scalar functions), window functions, `UNION`, and generic `NOT`/
-`IS NULL` (`Predicate` has no generic negation by design). `COUNT(*)`
-specifically is rejected in favor of `COUNT(column)` (non-null values
-of that column), matching the aggregate operator's own semantics
-rather than introducing a second meaning for `COUNT`. `LEFT`/`FULL` and
-3+-way chains (including a Delta→Delta→Iceberg mixed-format chain,
-keying a later step off an earlier step's table rather than the base
-table) are live-verified against real MinIO, same as `INNER`.
+get null-padded; a condition on the preserved side works normally), a
+scalar subquery used as a comparison operand (`WHERE x = (SELECT ...)`
+— needs genuinely different machinery than `IN`/`EXISTS`, since
+`SqlQueryTranslator` has no access to `TableFormat`/`TableLocation` to
+actually run one), a derived table in `FROM`, a wholly uncorrelated
+`EXISTS`/`NOT EXISTS` with no shared column to any outer table at all
+(`HashJoinOperator` always needs at least one key), computed `SELECT`
+expressions (every item must be a bare column or one of the five
+aggregate functions — no `a + b`, no `CASE`, no scalar functions),
+window functions, `UNION`, and generic `NOT`/`IS NULL` (`Predicate` has
+no generic negation by design). `COUNT(*)` specifically is rejected in
+favor of `COUNT(column)` (non-null values of that column), matching
+the aggregate operator's own semantics rather than introducing a
+second meaning for `COUNT`. **Known, stated gap:** `NOT IN (SELECT
+...)` does not replicate standard SQL's NULL-poisoning rule (a `NULL`
+in the subquery's result column should make the whole `NOT IN`
+unknown for every outer row) — this implementation's `ANTI` join
+instead just treats a `NULL` subquery row as absent, which can differ
+from standard SQL when the subquery's result column actually contains
+one. `LEFT`/`FULL` and 3+-way chains (including a Delta→Delta→Iceberg
+mixed-format chain, keying a later step off an earlier step's table
+rather than the base table) are live-verified against real MinIO, same
+as `INNER`; `IN`/`EXISTS`/`NOT IN`/`NOT EXISTS` subqueries are
+live-verified against real MinIO too (correlated `EXISTS`/
+`NOT EXISTS`, uncorrelated `IN`), same standard.
 
 ## Type system
 

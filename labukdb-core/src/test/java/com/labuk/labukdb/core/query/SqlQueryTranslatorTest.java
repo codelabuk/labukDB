@@ -327,4 +327,116 @@ class SqlQueryTranslatorTest {
     void unparseableSql_rejectedWithClearError() {
         assertThrows(IllegalArgumentException.class, () -> SqlQueryTranslator.translate("not even sql"));
     }
+
+    // --- SQL engine Phase 4, increment 1: IN/NOT IN/EXISTS/NOT EXISTS subqueries ---
+
+    @Test
+    void uncorrelatedInSubquery_noExplicitJoin_decorrelatesIntoASemiStep() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE a.y IN (SELECT b.z FROM b)");
+
+        assertEquals("a", query.baseAlias(), "a subquery condition routes through the join-shaped path even with no explicit JOIN");
+        assertEquals(1, query.joins().size());
+        SqlQuery.JoinStep step = query.joins().get(0);
+        assertEquals(JoinType.SEMI, step.type());
+        assertEquals("b", step.rightTable());
+        assertEquals("b", step.rightAlias());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("a", "y", "z")), step.keys());
+        assertNull(step.rightPredicate(), "no extra filter inside the subquery beyond the IN's own match");
+    }
+
+    @Test
+    void negatedInSubquery_decorrelatesIntoAnAntiStep() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE a.y NOT IN (SELECT b.z FROM b)");
+        assertEquals(JoinType.ANTI, query.joins().get(0).type());
+    }
+
+    @Test
+    void correlatedExistsSubquery_decorrelatesIntoASemiStepWithCorrelationKeyAndOwnFilter() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.aid = a.id AND b.active = 'Y')");
+
+        SqlQuery.JoinStep step = query.joins().get(0);
+        assertEquals(JoinType.SEMI, step.type());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("a", "id", "aid")), step.keys(),
+                "the correlation equality (b.aid = a.id) becomes the step's join key");
+        assertNotNull(step.rightPredicate(), "b.active = 'Y' is the subquery's own filter, not a correlation");
+    }
+
+    @Test
+    void negatedExistsSubquery_decorrelatesIntoAnAntiStep() {
+        // Confirmed via a real parse this session: "NOT EXISTS (...)" is a
+        // NotExpression wrapping an ExistsExpression, NOT ExistsExpression's
+        // own isNot() flag -- the thing this test actually proves.
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.aid = a.id)");
+        assertEquals(JoinType.ANTI, query.joins().get(0).type());
+    }
+
+    @Test
+    void existsSubquery_withNoCorrelationAtAll_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.active = 'Y')"));
+        assertTrue(thrown.getMessage().contains("correlation"), thrown.getMessage());
+    }
+
+    @Test
+    void existsSubquery_nonEqualityConditionOnly_treatedAsOwnFilterNotCorrelation_thenRejectedForNoCorrelation() {
+        // b.x > a.y is not a plain equality -- splitSubqueryWhere must not
+        // mistake it for a correlation key; with nothing else, this EXISTS
+        // ends up with zero correlation keys and must hit the same
+        // key-less rejection as a wholly uncorrelated EXISTS.
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.x > a.y)"));
+        assertTrue(thrown.getMessage().contains("correlation"), thrown.getMessage());
+    }
+
+    @Test
+    void inSubquery_selectingMoreThanOneColumn_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a WHERE a.y IN (SELECT b.z, b.w FROM b)"));
+        assertTrue(thrown.getMessage().contains("exactly one"), thrown.getMessage());
+    }
+
+    @Test
+    void existsSubquery_withItsOwnJoinInside_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM b JOIN c ON b.id = c.id WHERE b.aid = a.id)"));
+        assertTrue(thrown.getMessage().contains("JOIN"), thrown.getMessage());
+    }
+
+    @Test
+    void scalarSubqueryAsComparisonOperand_rejectedWithDedicatedError_notUnsupportedLiteral() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate("SELECT a.x FROM a WHERE a.y = (SELECT b.z FROM b)"));
+        assertTrue(thrown.getMessage().contains("Scalar subquer"), thrown.getMessage());
+    }
+
+    @Test
+    void existsSubquery_afterAnExplicitJoin_canCorrelateAgainstTheExplicitJoinsOwnTable() {
+        // The subquery step must append AFTER the explicit join, so "c" (the
+        // explicit join's own alias) is already in scope for correlation.
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a JOIN c ON a.id = c.aid "
+                        + "WHERE EXISTS (SELECT 1 FROM b WHERE b.cid = c.id)");
+
+        assertEquals(2, query.joins().size());
+        assertEquals(JoinType.INNER, query.joins().get(0).type());
+        SqlQuery.JoinStep subqueryStep = query.joins().get(1);
+        assertEquals(JoinType.SEMI, subqueryStep.type());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("c", "id", "cid")), subqueryStep.keys());
+    }
+
+    @Test
+    void subqueryAlias_collidingWithAnOuterTable_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate(
+                        "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM a WHERE a.y = a.z)"));
+        assertTrue(thrown.getMessage().contains("alias"), thrown.getMessage());
+    }
 }

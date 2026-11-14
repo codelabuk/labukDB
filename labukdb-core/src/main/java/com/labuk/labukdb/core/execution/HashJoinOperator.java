@@ -21,11 +21,20 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Hash-based equi-join — {@code INNER}, {@code LEFT}, {@code RIGHT}, and
- * {@code FULL} — both sides already fully decoded into memory (a join
- * inherently needs to see every row of at least the build side, the same
- * assumption {@code GROUP BY}/{@code ORDER BY} already make via {@code
- * CombinedQueryExecutor}).
+ * Hash-based equi-join — {@code INNER}, {@code LEFT}, {@code RIGHT},
+ * {@code FULL}, {@code SEMI}, and {@code ANTI} — both sides already
+ * fully decoded into memory (a join inherently needs to see every row
+ * of at least the build side, the same assumption {@code GROUP BY}/
+ * {@code ORDER BY} already make via {@code CombinedQueryExecutor}).
+ *
+ * <b>{@code SEMI}/{@code ANTI}</b> — how SQL engine Phase 4's decorrelated
+ * {@code IN}/{@code EXISTS}/{@code NOT IN}/{@code NOT EXISTS} subqueries
+ * execute (see {@code core.query.SqlQueryTranslator}). Neither ever
+ * fans out, and neither includes the build (subquery) side's columns in
+ * the output at all — the build index is still the same one every other
+ * type uses, but the probe loop emits the probe row at most once
+ * ({@code SEMI}: if it has any match; {@code ANTI}: if it has none),
+ * via {@link #emitProbeOnly}, not {@link #emitMatchedPair}.
  *
  * <b>{@code RIGHT} is not a real algorithm here</b> — {@code RIGHT(left,
  * right)} is exactly {@code LEFT(right, left)} with every argument
@@ -133,12 +142,19 @@ public final class HashJoinOperator {
             }
         }
 
+        boolean semiOrAnti = type == JoinType.SEMI || type == JoinType.ANTI;
+
         List<Field> outputFields = new ArrayList<>();
         for (Field field : left.getSchema().getFields()) {
             outputFields.add(leftAlias == null ? field : renamed(field, leftAlias));
         }
-        for (Field field : right.getSchema().getFields()) {
-            outputFields.add(rightAlias == null ? field : renamed(field, rightAlias));
+        if (!semiOrAnti) {
+            // SEMI/ANTI only ever assert "does a match exist" -- the build
+            // (subquery) side's own columns never appear in the output,
+            // unlike every other join type.
+            for (Field field : right.getSchema().getFields()) {
+                outputFields.add(rightAlias == null ? field : renamed(field, rightAlias));
+            }
         }
         VectorSchemaRoot result = VectorSchemaRoot.create(new Schema(outputFields), allocator);
         result.allocateNew();
@@ -164,14 +180,30 @@ public final class HashJoinOperator {
             }
 
             if (matches == null) {
-                if (type == JoinType.INNER) {
-                    continue; // dropped, standard inner-join semantics
+                if (type == JoinType.INNER || type == JoinType.SEMI) {
+                    continue; // dropped -- INNER's standard semantics; SEMI asserts "a match exists," and none did
+                }
+                if (type == JoinType.ANTI) {
+                    // ANTI asserts "no match exists" -- this probe row qualifies, emit it once, own columns only.
+                    outRow = emitProbeOnly(p, leftAllVectors, result, outRow);
+                    continue;
                 }
                 // LEFT/FULL: buildIsRight is always true here (see above),
                 // so the probe side is always "left" -- preserve it,
                 // null-pad the right side.
                 outRow = emitProbeOnlyNullPadded(p, leftAllVectors, rightFieldCount, result, outRow);
                 continue;
+            }
+
+            if (type == JoinType.SEMI) {
+                // A match exists -- emit this probe row once, regardless of
+                // how many build-side rows matched (no fan-out: SEMI only
+                // ever asserts existence, never multiplies rows).
+                outRow = emitProbeOnly(p, leftAllVectors, result, outRow);
+                continue;
+            }
+            if (type == JoinType.ANTI) {
+                continue; // a match exists -- ANTI's condition fails, drop this probe row
             }
 
             for (int buildMatchRow : matches) {
@@ -207,6 +239,15 @@ public final class HashJoinOperator {
         }
         for (FieldVector v : rightAllVectors) {
             copyValue(v, rightRow, result.getVector(col++), outRow);
+        }
+        return outRow + 1;
+    }
+
+    /** SEMI/ANTI: the probe row's own columns only -- no right-side columns exist in this output schema at all. */
+    private static int emitProbeOnly(int leftRow, List<FieldVector> leftAllVectors, VectorSchemaRoot result, int outRow) {
+        int col = 0;
+        for (FieldVector v : leftAllVectors) {
+            copyValue(v, leftRow, result.getVector(col++), outRow);
         }
         return outRow + 1;
     }

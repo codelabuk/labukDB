@@ -231,15 +231,28 @@ FROM <table>
   must be table-qualified (`a.service`, not `service`) once a `JOIN` is
   present. `GROUP BY`/aggregates/`ORDER BY`/`LIMIT` all combine with a
   `JOIN` normally, applied to the joined result.
+- `IN (SELECT ...)`, `NOT IN (SELECT ...)`, `EXISTS (SELECT ...)`,
+  `NOT EXISTS (SELECT ...)` — decorrelated internally into a join (same
+  "every column must be table-qualified" rule as above kicks in once one
+  of these is present, even with no explicit `JOIN` keyword at all). The
+  subquery itself must be a single plain table (no `JOIN`/`GROUP BY`/
+  `ORDER BY`/`LIMIT` inside it, no further nested subquery), and
+  correlation to an outer table must be a plain `AND`-combined
+  `inner.col = outer.col` equality. A wholly uncorrelated `EXISTS`/
+  `NOT EXISTS` (no shared column with any outer table at all) isn't
+  supported yet. `NOT IN (SELECT ...)` doesn't replicate standard SQL's
+  NULL-poisoning rule for a nullable subquery result column — a stated,
+  known gap, not silently assumed correct.
 
 **Rejected with a specific error, not silently mishandled:**
 
 | Construct | Why |
 |---|---|
-| `NOT`, `NOT IN`, `NOT LIKE` | `Predicate` has no generic negation — see its javadoc |
+| `NOT`, `NOT LIKE`, `NOT IN (<literal list>)` | `Predicate` has no generic negation — see its javadoc. `NOT IN (SELECT ...)` *is* supported (see above); only the literal-list form is rejected. |
 | `IS NULL` | not a supported predicate shape |
-| Subqueries | not implemented yet |
-| `CROSS`/`NATURAL`/`SEMI` join, non-equi `ON` conditions | not implemented yet |
+| A scalar subquery as a comparison operand (`WHERE x = (SELECT ...)`) | needs different machinery than `IN`/`EXISTS`; not implemented yet |
+| A derived table in `FROM` (`FROM (SELECT ...) AS t`) | not implemented yet |
+| `CROSS`/`NATURAL` join, non-equi `ON` conditions | not implemented yet |
 | A `WHERE` condition on the non-preserved side of `LEFT`/`RIGHT`, or on either side of `FULL` | pre-filtering it before the join would silently change which rows get null-padded — a condition on the preserved side is fine |
 | `COUNT(*)` | matches `AggregateOperator`'s pre-existing `COUNT(column)`-only semantics (non-null values of a named column) |
 | `IN` combined with `AND`/`OR` **without parentheses** | see below |
