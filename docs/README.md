@@ -5,8 +5,11 @@ diagrams embedded directly in each `.md` file below.
 
 ## Current diagrams
 
+Start with `full-architecture.md` for the single whole-system picture; everything else here zooms into one slice of it.
+
 | File | Covers |
 |---|---|
+| [`full-architecture.md`](diagrams/full-architecture.md) | **The whole system, one diagram** — every layer (entry points, SQL engine, format abstraction, both write engines, planner/pruning, decode/encode, execution operators, storage) tied together, write path and read/query path both. |
 | [`module-overview.md`](diagrams/module-overview.md) | The five Maven modules, their dependency direction, and the one-way `core` ↛ `format-iceberg` rule that shapes where format detection vs. format construction live. |
 | [`delta-write-path.md`](diagrams/delta-write-path.md) | `log/`'s write path — `TableCreator`/`CommitWriter`/`TableMerger`/`Compactor`/`Vacuum`, the confirmed-broken-without-lock finding, and `DynamoDbLockProvider`'s fix. |
 | [`iceberg-write-path.md`](diagrams/iceberg-write-path.md) | `labukdb-format-iceberg`'s write path — same shape as Delta's, plus the REST catalog + real MinIO full data round-trip proof and the two live-only issues found fixing it. |
