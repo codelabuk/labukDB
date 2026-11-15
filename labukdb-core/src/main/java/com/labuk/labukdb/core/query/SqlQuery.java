@@ -78,9 +78,20 @@ public record SqlQuery(String table, String baseAlias, List<String> columns, Pre
      * LEFT} implementation with every argument swapped) — see that
      * class's own javadoc for why keeping the tree's left/right shape a
      * simple, unambiguous invariant was worth not canonicalizing earlier.
+     *
+     * {@code scalarSubqueries} is a scalar subquery found inside THIS
+     * step's own subquery filter — only possible for a {@code SEMI}/
+     * {@code ANTI} step built from {@code IN}/{@code EXISTS} (see {@code
+     * SqlQueryTranslator#splitSubqueryWhere}), e.g. {@code EXISTS (SELECT
+     * 1 FROM b WHERE b.id = a.id AND b.x = (SELECT MAX(c.y) FROM c))} —
+     * scoped to {@code rightAlias} as its own "outer" table. Always empty
+     * for an explicit {@code JOIN} step, and always empty by the time
+     * anything downstream of {@code core.cli.QueryCommand.resolveScalarSubqueries}
+     * sees this record, same convention as {@link SqlQuery#scalarSubqueries()}.
      */
     public record JoinStep(JoinType type, String rightTable, String rightAlias,
-                            List<JoinKeyPair> keys, Predicate rightPredicate) {
+                            List<JoinKeyPair> keys, Predicate rightPredicate,
+                            List<ScalarSubquery> scalarSubqueries) {
     }
 
     /**

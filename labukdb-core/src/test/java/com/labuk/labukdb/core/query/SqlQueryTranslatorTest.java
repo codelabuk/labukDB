@@ -346,10 +346,13 @@ class SqlQueryTranslatorTest {
     }
 
     @Test
-    void negatedInSubquery_decorrelatesIntoAnAntiStep() {
+    void negatedInSubquery_decorrelatesIntoANotInStep() {
+        // NOT IN gets its own JoinType (not ANTI) -- see JoinType's own
+        // javadoc for why its NULL-poisoning rule genuinely differs from
+        // NOT EXISTS's plain ANTI semantics.
         SqlQuery query = SqlQueryTranslator.translate(
                 "SELECT a.x FROM a WHERE a.y NOT IN (SELECT b.z FROM b)");
-        assertEquals(JoinType.ANTI, query.joins().get(0).type());
+        assertEquals(JoinType.NOT_IN, query.joins().get(0).type());
     }
 
     @Test
@@ -481,6 +484,39 @@ class SqlQueryTranslatorTest {
         SqlQuery.JoinStep subqueryStep = query.joins().get(1);
         assertEquals(JoinType.SEMI, subqueryStep.type());
         assertEquals(List.of(new SqlQuery.JoinKeyPair("c", "id", "cid")), subqueryStep.keys());
+    }
+
+    @Test
+    void existsSubquery_withAScalarSubqueryInsideItsOwnFilter_parsesIntoTheJoinStepsOwnScalarSubqueries() {
+        // Named gap, now fixed: a scalar subquery nested inside an IN/EXISTS
+        // subquery's own filter -- scoped to the subquery's own alias ("b"),
+        // not the top-level outer query's.
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.id = a.id "
+                        + "AND b.y = (SELECT MAX(c.z) AS m FROM c))");
+
+        assertEquals(1, query.joins().size());
+        SqlQuery.JoinStep subqueryStep = query.joins().get(0);
+        assertEquals(JoinType.SEMI, subqueryStep.type());
+        assertEquals(List.of(new SqlQuery.JoinKeyPair("a", "id", "id")), subqueryStep.keys());
+        assertEquals(1, subqueryStep.scalarSubqueries().size());
+        SqlQuery.ScalarSubquery nested = subqueryStep.scalarSubqueries().get(0);
+        assertEquals("b", nested.outerTableAlias());
+        assertEquals("y", nested.outerColumn());
+        assertEquals("c", nested.innerQuery().table());
+    }
+
+    @Test
+    void inSubquery_withAScalarSubqueryInsideItsOwnFilter_parsesIntoTheJoinStepsOwnScalarSubqueries() {
+        SqlQuery query = SqlQueryTranslator.translate(
+                "SELECT a.x FROM a WHERE a.id IN "
+                        + "(SELECT b.id FROM b WHERE b.y = (SELECT MAX(c.z) AS m FROM c))");
+
+        assertEquals(1, query.joins().size());
+        SqlQuery.JoinStep subqueryStep = query.joins().get(0);
+        assertEquals(JoinType.SEMI, subqueryStep.type());
+        assertEquals(1, subqueryStep.scalarSubqueries().size());
+        assertEquals("b", subqueryStep.scalarSubqueries().get(0).outerTableAlias());
     }
 
     @Test

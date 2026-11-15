@@ -326,4 +326,51 @@ class HashJoinOperatorTest {
             }
         }
     }
+
+    // --- SQL engine Phase 4: NOT_IN (NOT IN (SELECT ...) -- NULL-poisoning, distinct from ANTI) ---
+
+    @Test
+    void notInJoin_noMatchAndNoNullInBuildSide_behavesExactlyLikeAnti() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {999}, new String[] {"orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.NOT_IN,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(1, result.getRowCount(), "no match, no NULL in the subquery result -- same as ANTI");
+            }
+        }
+    }
+
+    @Test
+    void notInJoin_matchExists_dropsTheProbeRowRegardlessOfOtherNulls() {
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {1}, new String[] {"auth-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1, 1}, new String[] {"us-east", "us-west"})) {
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.NOT_IN,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(0, result.getRowCount(), "a match exists -- NOT IN's condition fails for this row");
+            }
+        }
+    }
+
+    @Test
+    void notInJoin_noMatchButSubqueryResultHasANull_suppressesTheProbeRow() {
+        // Standard SQL: x NOT IN (SELECT y FROM b) is NOT (x=y1 OR x=y2 OR
+        // ...) -- if b's result column has even one NULL, the whole
+        // comparison is UNKNOWN (excluded) for every outer row that doesn't
+        // match a non-null value, not TRUE. customer_id=999 matches
+        // nothing, but customers.id has a NULL -- the row must be
+        // suppressed, unlike plain ANTI (see notInJoin_noMatchAndNoNullInBuildSide...
+        // and antiJoin_noMatch_emitsTheProbeRowOnce above, same shape, no NULL).
+        try (VectorSchemaRoot orders = ordersBatch(new long[] {999}, new String[] {"orphan-svc"});
+             VectorSchemaRoot customers = customersBatch(new long[] {1}, new String[] {"us-east"})) {
+            ((BigIntVector) customers.getVector("id")).setNull(0);
+
+            try (VectorSchemaRoot result = new HashJoinOperator().join(JoinType.NOT_IN,
+                    orders, List.of("customer_id"), "a", customers, List.of("id"), "b", false, allocator)) {
+                assertEquals(0, result.getRowCount(),
+                        "a NULL in the subquery's result column poisons NOT IN to UNKNOWN for every non-matching row");
+            }
+        }
+    }
 }

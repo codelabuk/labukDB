@@ -11,7 +11,7 @@ package com.labuk.labukdb.core.execution;
  * fresh table") regardless of join type.
  *
  * {@code SEMI}/{@code ANTI} are how SQL engine Phase 4's {@code IN}/
- * {@code EXISTS}/{@code NOT IN}/{@code NOT EXISTS} subqueries execute —
+ * {@code EXISTS}/{@code NOT EXISTS} subqueries execute —
  * {@code SqlQueryTranslator} decorrelates a subquery (simple equality
  * correlation only, same shape discipline a real {@code JOIN ... ON}
  * already enforces) into an ordinary {@code Join} step using one of
@@ -21,10 +21,23 @@ package com.labuk.labukdb.core.execution;
  * none — neither ever fans out on a duplicate build-side key, and
  * neither side's output includes the build (subquery) side's columns.
  *
+ * {@code NOT_IN} is {@code ANTI} plus standard SQL's {@code NOT IN}
+ * NULL-poisoning rule — a dedicated type rather than a flag, because
+ * {@code NOT EXISTS} (plain {@code ANTI}) and {@code NOT IN} genuinely
+ * differ here: {@code x NOT IN (SELECT y FROM b)} is {@code NOT (x = y1
+ * OR x = y2 OR ...)}, so if {@code x} matches no non-null {@code y} but
+ * {@code b}'s result column contains even one {@code NULL}, standard
+ * SQL's three-valued logic makes the whole comparison {@code UNKNOWN}
+ * (excluded), not {@code TRUE} (included) — {@code NOT EXISTS} has no
+ * such case, since a {@code NULL} correlation column just makes that
+ * one candidate row's own condition {@code UNKNOWN} (not a "match"),
+ * never poisons the outer existence check itself. See {@link
+ * HashJoinOperator}'s own javadoc for exactly where this is checked.
+ *
  * {@code CROSS} joins, non-equi conditions, and {@code NATURAL} joins
  * are rejected at parse time ({@code SqlQueryTranslator}) — there is no
  * value for them here, by design, not an oversight.
  */
 public enum JoinType {
-    INNER, LEFT, RIGHT, FULL, SEMI, ANTI
+    INNER, LEFT, RIGHT, FULL, SEMI, ANTI, NOT_IN
 }

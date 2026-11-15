@@ -163,4 +163,38 @@ class QueryCommandSqlScalarSubqueryMinioIntegrationTest {
                 .takeWhile(l -> !l.isBlank()).toList();
         assertEquals(List.of("3"), dataLines, "id=3 has amount=200, the max, from real MinIO: " + output);
     }
+
+    /** empty_orders (Delta, remote): id(long), amount(long). Created, but no rows ever written -- zero files in the log. */
+    private void buildEmptyOrders(String uri) throws Exception {
+        Field id = new Field("id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Schema schema = new Schema(List.of(id, amount));
+        new TableCreator().createTable(TableLocation.forRemote(uri, conf), schema, List.of(), null);
+    }
+
+    /**
+     * Named gap, now fixed, against real MinIO: a group-by-less aggregate
+     * scalar subquery over zero matching files. {@code COUNT} of zero
+     * rows is {@code 0}, not {@code NULL} -- a real, non-null value, so
+     * {@code !=} against it is true for every order's {@code id} (1,2,3),
+     * distinguishing a correct "0" from an incorrect NULL-short-circuit
+     * (which would silently produce "0 row(s)" here instead).
+     */
+    @Test
+    void countScalarSubquery_overZeroMatchingFiles_realMinioBackedDeltaTables_resolvesToZeroNotNull() throws Exception {
+        String ordersUri = testRootUri + "/orders";
+        String emptyOrdersUri = testRootUri + "/empty_orders";
+        buildOrders(ordersUri);
+        buildEmptyOrders(emptyOrdersUri);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersUri);
+        TableCatalog.atDefaultLocation().register("empty_orders", emptyOrdersUri);
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT o.id FROM orders o WHERE o.id != (SELECT COUNT(e.amount) AS c FROM empty_orders e)"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("3 row(s)"),
+                "COUNT of zero rows is 0, not NULL -- every id (1,2,3) != 0, from real MinIO: " + output);
+    }
 }

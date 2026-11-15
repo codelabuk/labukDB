@@ -24,7 +24,6 @@ import com.labuk.labukdb.core.logical.LogicalPlanExecutor;
 import com.labuk.labukdb.core.logical.JoinExecution;
 import com.labuk.labukdb.core.logical.ResolvedScan;
 import com.labuk.labukdb.core.logical.RuleBasedOptimizer;
-import com.labuk.labukdb.core.planner.ComparisonOp;
 import com.labuk.labukdb.core.planner.NormalizedScanPlan;
 import com.labuk.labukdb.core.planner.PartitionValueSubstituter;
 import com.labuk.labukdb.core.planner.Predicate;
@@ -233,10 +232,13 @@ final class QueryCommand {
      * a {@code NULL} value -- {@code x OP NULL} is never {@code true} for
      * any comparison operator, so the whole outer query is unconditionally
      * zero rows regardless of which subquery produced it.
+     *
+     * Also resolves each JoinStep's own scalarSubqueries() -- a scalar
+     * subquery nested inside an IN/EXISTS subquery's own filter.
      */
     private static Optional<SqlQuery> resolveScalarSubqueries(SqlQuery query, TableCatalog catalog, CliArgs parsed,
                                                                  BufferAllocator allocator) throws Exception {
-        if (query.scalarSubqueries().isEmpty()) {
+        if (query.scalarSubqueries().isEmpty() && query.joins().stream().allMatch(s -> s.scalarSubqueries().isEmpty())) {
             return Optional.of(query);
         }
 
@@ -248,6 +250,22 @@ final class QueryCommand {
             }
             Predicate cmp = Predicate.compare(sub.outerColumn(), sub.op(), value);
             extraPerAlias.merge(sub.outerTableAlias(), cmp, Predicate::and);
+        }
+        // A scalar subquery nested inside an IN/EXISTS subquery's own filter
+        // (e.g. EXISTS (SELECT 1 FROM b WHERE b.id = a.id AND b.x = (SELECT
+        // MAX(c.y) FROM c))) -- its outerTableAlias() is always that step's
+        // own rightAlias(), so it merges into this same map and the per-step
+        // distribution below (keyed by rightAlias()) already routes it
+        // correctly, with zero extra logic needed.
+        for (SqlQuery.JoinStep step : query.joins()) {
+            for (SqlQuery.ScalarSubquery sub : step.scalarSubqueries()) {
+                Comparable<?> value = resolveScalarSubqueryValue(sub.innerQuery(), catalog, parsed, allocator);
+                if (value == null) {
+                    return Optional.empty();
+                }
+                Predicate cmp = Predicate.compare(sub.outerColumn(), sub.op(), value);
+                extraPerAlias.merge(sub.outerTableAlias(), cmp, Predicate::and);
+            }
         }
 
         Predicate newBasePredicate = query.predicate();
@@ -261,7 +279,8 @@ final class QueryCommand {
             Predicate stepExtra = extraPerAlias.remove(step.rightAlias());
             Predicate newRightPredicate = stepExtra == null ? step.rightPredicate()
                     : step.rightPredicate() == null ? stepExtra : Predicate.and(step.rightPredicate(), stepExtra);
-            newSteps.add(new SqlQuery.JoinStep(step.type(), step.rightTable(), step.rightAlias(), step.keys(), newRightPredicate));
+            newSteps.add(new SqlQuery.JoinStep(step.type(), step.rightTable(), step.rightAlias(), step.keys(),
+                    newRightPredicate, List.of()));
         }
 
         if (!extraPerAlias.isEmpty()) {
@@ -359,17 +378,11 @@ final class QueryCommand {
 
         if (resolved.files().isEmpty()) {
             if (singleAggregate) {
-                // Per SQL, a group-by-less aggregate over zero matching rows
-                // still produces exactly one row with a NULL/zero result
-                // (SUM->NULL, COUNT->0) -- not "zero rows". CombinedQueryExecutor.execute([])
-                // returns null for zero files (confirmed earlier this session), so
-                // there's no file to materialize that correct single row from here.
-                // Named plainly rather than silently treated as "zero rows", which
-                // would be wrong for this specific case (though correct for the
-                // plain-column case just below).
-                throw new IllegalArgumentException("A scalar subquery using an aggregate with no matching "
-                        + "files/rows isn't supported yet (would need its NULL/zero aggregate result, not "
-                        + "treated as 'no rows' the way a plain-column scalar subquery correctly is): " + innerQuery.table());
+                return switch (innerQuery.aggregates().get(0).function()) {
+                    case SUM -> 0.0;
+                    case COUNT -> 0L;
+                    case AVG, MIN, MAX -> null;
+                };
             }
             return null;
         }

@@ -278,18 +278,35 @@ needs to represent it specially).
 
 `IN (SELECT ...)`, `NOT IN (SELECT ...)`, `EXISTS (SELECT ...)`, and
 `NOT EXISTS (SELECT ...)` are decorrelated at translation time into an
-ordinary `JoinType.SEMI`/`ANTI` step, appended after every explicit
-`JOIN` — the same left-deep chain machinery runs it, no new execution
-concept. `SEMI` emits a probe row at most once if it has any match;
-`ANTI` emits it at most once if it has none; neither ever fans out on a
-duplicate build-side key, and neither includes the build (subquery)
-side's columns in the output. A subquery must be a single plain table
+ordinary `JoinType.SEMI`/`ANTI`/`NOT_IN` step, appended after every
+explicit `JOIN` — the same left-deep chain machinery runs it, no new
+execution concept. `SEMI` emits a probe row at most once if it has any
+match; `ANTI`/`NOT_IN` emit it at most once if it has none; neither
+ever fans out on a duplicate build-side key, and neither includes the
+build (subquery) side's columns in the output. `NOT_IN` is `ANTI` plus
+standard SQL's `NOT IN` NULL-poisoning rule: if the subquery's result
+column contains even one `NULL`, a probe row that matches nothing is
+suppressed rather than emitted, since `x NOT IN (...)` is `UNKNOWN`
+(excluded), not `TRUE`, in that case — a dedicated type rather than a
+flag on `ANTI`, because `NOT EXISTS` genuinely has no such rule (a
+`NULL` correlation column just makes that one candidate row's own
+condition `UNKNOWN`, never poisons the outer existence check). A
+subquery must be a single plain table
 (no `JOIN`/`GROUP BY`/`ORDER BY`/`LIMIT` inside it, no further nested
-subquery); correlation to an outer table must be a plain `AND`-combined
-`inner.col = outer.col` equality, the same shape discipline a real
-`JOIN ... ON` already enforces. Once any such subquery is present,
-every column in the query must be table-qualified, same as a real
-`JOIN` already requires — one consistency rule, not two.
+`IN`/`EXISTS`); correlation to an outer table must be a plain
+`AND`-combined `inner.col = outer.col` equality, the same shape
+discipline a real `JOIN ... ON` already enforces. Once any such
+subquery is present, every column in the query must be
+table-qualified, same as a real `JOIN` already requires — one
+consistency rule, not two. A scalar subquery *is* allowed inside this
+same filter (e.g. `EXISTS (SELECT 1 FROM b WHERE b.id = a.id AND b.x =
+(SELECT MAX(c.y) FROM c))`) — `JoinStep` carries its own
+`scalarSubqueries` list, found by the same filter-splitting walk that
+extracts correlation keys, scoped to the subquery's own alias only
+(not the top-level outer query's — a doubly-correlated subquery two
+levels up isn't supported). `QueryCommand.resolveScalarSubqueries`
+resolves a step's own list exactly like a top-level one, since its
+`outerTableAlias()` is already that step's `rightAlias()`.
 
 A scalar subquery used as a comparison operand (`WHERE x OP (SELECT
 ...)`) runs once, before the outer plan is built, and its single value
@@ -305,7 +322,16 @@ way: a scalar subquery's own inner query is itself resolved
 recursively before its plan is built. A subquery resolving to zero
 rows, or whose one cell is `NULL`, makes the whole outer query zero
 rows (`x OP NULL` is never `true`, for any operator); more than one row
-is a genuine runtime error, not resolved by taking the first.
+is a genuine runtime error, not resolved by taking the first. A
+group-by-less aggregate scalar subquery over zero matching files
+(e.g. `(SELECT SUM(y) FROM b)` when `b` has no data) resolves without
+ever touching `CombinedQueryExecutor` (which can't materialize a
+schema-less empty result) — the zero-row result is a pure function of
+the aggregate function alone, matching `AggregateOperator.Accumulator`'s
+own existing zero-row convention: `SUM` is `0.0` (this engine's
+convention, not SQL-standard `NULL`), `COUNT` is `0`, `AVG`/`MIN`/`MAX`
+are `NULL` and correctly short-circuit the outer query to zero rows via
+the same path any other `NULL` scalar subquery result already uses.
 
 **Not supported**, stated as current scope boundaries: `CROSS`/
 `NATURAL` joins, non-equi join conditions, cost-based join *order*
@@ -318,33 +344,22 @@ get null-padded; a condition on the preserved side works normally), a
 derived table in `FROM`, a wholly uncorrelated `EXISTS`/`NOT EXISTS`
 with no shared column to any outer table at all (`HashJoinOperator`
 always needs at least one key), a scalar subquery with its own `JOIN`
-or `GROUP BY` inside it, a group-by-less aggregate scalar subquery over
-zero matching files (would need a real `NULL`/zero aggregate result —
-`SUM`/`COUNT` of nothing — which `CombinedQueryExecutor` can't produce
-without at least one file to read a schema from; rejected with a clear
-error rather than silently treated as "zero rows," which is only
-correct for a *plain-column* scalar subquery's zero-files case), a
-scalar subquery nested inside an `IN`/`EXISTS` subquery's own filter
-(that filter is translated through a narrower path that doesn't share
-this detection pass — a real, named gap, not a silent one), computed
+or `GROUP BY` inside it, computed
 `SELECT` expressions (every item must be a bare column or one of the
 five aggregate functions — no `a + b`, no `CASE`, no scalar functions),
 window functions, `UNION`, and generic `NOT`/`IS NULL` (`Predicate` has
 no generic negation by design). `COUNT(*)` specifically is rejected in
 favor of `COUNT(column)` (non-null values of that column), matching
 the aggregate operator's own semantics rather than introducing a
-second meaning for `COUNT`. **Known, stated gap:** `NOT IN (SELECT
-...)` does not replicate standard SQL's NULL-poisoning rule (a `NULL`
-in the subquery's result column should make the whole `NOT IN`
-unknown for every outer row) — this implementation's `ANTI` join
-instead just treats a `NULL` subquery row as absent, which can differ
-from standard SQL when the subquery's result column actually contains
-one. `LEFT`/`FULL` and 3+-way chains (including a Delta→Delta→Iceberg
+second meaning for `COUNT`. `LEFT`/`FULL` and 3+-way chains (including a Delta→Delta→Iceberg
 mixed-format chain, keying a later step off an earlier step's table
 rather than the base table) are live-verified against real MinIO, same
 as `INNER`; `IN`/`EXISTS`/`NOT IN`/`NOT EXISTS` subqueries are
 live-verified against real MinIO too (correlated `EXISTS`/
-`NOT EXISTS`, uncorrelated `IN`), same standard.
+`NOT EXISTS`, uncorrelated `IN`, a scalar subquery nested inside an
+`EXISTS` subquery's own filter, `NOT IN`'s NULL-poisoning rule, and a
+group-by-less aggregate scalar subquery over zero matching files),
+same standard.
 
 ## Type system
 

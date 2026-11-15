@@ -240,9 +240,11 @@ FROM <table>
   correlation to an outer table must be a plain `AND`-combined
   `inner.col = outer.col` equality. A wholly uncorrelated `EXISTS`/
   `NOT EXISTS` (no shared column with any outer table at all) isn't
-  supported yet. `NOT IN (SELECT ...)` doesn't replicate standard SQL's
-  NULL-poisoning rule for a nullable subquery result column — a stated,
-  known gap, not silently assumed correct.
+  supported yet. `NOT IN (SELECT ...)` correctly replicates standard
+  SQL's NULL-poisoning rule: if the subquery's result column contains
+  even one `NULL`, every outer row that doesn't match a non-null value
+  is excluded (not included) — a dedicated `NOT_IN` join type, distinct
+  from `NOT EXISTS`'s plain `ANTI` (which has no such rule).
 - `WHERE x OP (SELECT ...)` (a scalar subquery used as a comparison
   operand) — runs once, before the rest of the query, substituting its
   single value. The inner query can be anything a top-level query can
@@ -251,7 +253,22 @@ FROM <table>
   Correlation to the outer query isn't supported (rejected as a side
   effect of translating the inner query independently). A subquery
   returning zero rows, or whose one value is `NULL`, makes the whole
-  query return zero rows; more than one row is a runtime error.
+  query return zero rows; more than one row is a runtime error. A scalar
+  subquery nested inside an `IN`/`EXISTS` subquery's own filter (e.g.
+  `EXISTS (SELECT 1 FROM b WHERE b.id = a.id AND b.x = (SELECT MAX(c.y)
+  FROM c))`) is also supported, scoped to the subquery's own alias only
+  (not the top-level outer query's — a doubly-correlated subquery two
+  levels up isn't supported).
+
+A group-by-less aggregate scalar subquery over zero matching files
+(e.g. `(SELECT SUM(y) FROM b)` when `b` has no data at all) now
+resolves correctly instead of erroring — the zero-row result is a pure
+function of the aggregate function alone (no file needed to compute
+it), matching `AggregateOperator`'s own existing zero-row convention
+exactly: `SUM` is `0.0` (this engine's convention, not SQL-standard
+`NULL`), `COUNT` is `0`, `AVG`/`MIN`/`MAX` are `NULL` (and correctly
+short-circuit the whole outer query to zero rows, same as any other
+`NULL` scalar subquery result).
 
 **Rejected with a specific error, not silently mishandled:**
 
@@ -260,8 +277,6 @@ FROM <table>
 | `NOT`, `NOT LIKE`, `NOT IN (<literal list>)` | `Predicate` has no generic negation — see its javadoc. `NOT IN (SELECT ...)` *is* supported (see above); only the literal-list form is rejected. |
 | `IS NULL` | not a supported predicate shape |
 | A scalar subquery with its own `JOIN` or `GROUP BY` inside it | not implemented yet |
-| A group-by-less aggregate scalar subquery over zero matching files | would need a real `NULL`/zero aggregate result, which can't be produced without a file to read a schema from |
-| A scalar subquery nested inside an `IN`/`EXISTS` subquery's own filter | that filter uses a narrower translation path that doesn't share this detection pass |
 | A derived table in `FROM` (`FROM (SELECT ...) AS t`) | not implemented yet |
 | `CROSS`/`NATURAL` join, non-equi `ON` conditions | not implemented yet |
 | A `WHERE` condition on the non-preserved side of `LEFT`/`RIGHT`, or on either side of `FULL` | pre-filtering it before the join would silently change which rows get null-padded — a condition on the preserved side is fine |

@@ -27,14 +27,29 @@ import java.util.Map;
  * of at least the build side, the same assumption {@code GROUP BY}/
  * {@code ORDER BY} already make via {@code CombinedQueryExecutor}).
  *
- * <b>{@code SEMI}/{@code ANTI}</b> — how SQL engine Phase 4's decorrelated
- * {@code IN}/{@code EXISTS}/{@code NOT IN}/{@code NOT EXISTS} subqueries
- * execute (see {@code core.query.SqlQueryTranslator}). Neither ever
- * fans out, and neither includes the build (subquery) side's columns in
- * the output at all — the build index is still the same one every other
- * type uses, but the probe loop emits the probe row at most once
- * ({@code SEMI}: if it has any match; {@code ANTI}: if it has none),
- * via {@link #emitProbeOnly}, not {@link #emitMatchedPair}.
+ * <b>{@code SEMI}/{@code ANTI}/{@code NOT_IN}</b> — how SQL engine Phase
+ * 4's decorrelated {@code IN}/{@code EXISTS}/{@code NOT IN}/{@code NOT
+ * EXISTS} subqueries execute (see {@code core.query.SqlQueryTranslator}).
+ * None of the three ever fan out, and none include the build (subquery)
+ * side's columns in the output at all — the build index is still the
+ * same one every other type uses, but the probe loop emits the probe
+ * row at most once ({@code SEMI}: if it has any match; {@code ANTI}: if
+ * it has none; {@code NOT_IN}: if it has none AND the build side had no
+ * {@code NULL} key at all), via {@link #emitProbeOnly}, not {@link
+ * #emitMatchedPair}.
+ *
+ * <b>{@code NOT_IN}'s one difference from {@code ANTI}:</b> standard
+ * SQL's {@code NOT IN} NULL-poisoning rule — {@code buildHasNullKey}
+ * tracks whether any build-side row was skipped for having a {@code
+ * NULL} key while the build index was constructed (every other type
+ * already skips these rows the same way; only {@code NOT_IN} needs to
+ * remember that it happened). If so, a probe row with no match is
+ * suppressed instead of emitted — the subquery's result column having
+ * even one {@code NULL} makes {@code x NOT IN (...)} {@code UNKNOWN}
+ * (excluded), not {@code TRUE}, for every outer row that doesn't match
+ * a non-null value, per standard three-valued logic. See {@link
+ * com.labuk.labukdb.core.execution.JoinType}'s own javadoc for why this
+ * needs a dedicated type rather than a flag on {@code ANTI}.
  *
  * <b>{@code RIGHT} is not a real algorithm here</b> — {@code RIGHT(left,
  * right)} is exactly {@code LEFT(right, left)} with every argument
@@ -120,6 +135,12 @@ public final class HashJoinOperator {
                 && isLongEncodable(buildKeyVectors.get(0))
                 && buildKeyVectors.get(0).getClass() == probeKeyVectors.get(0).getClass();
 
+        // NOT_IN only: whether any build-side row was skipped below for
+        // having a NULL key -- see this class's own javadoc for why that
+        // fact (not just "did the probe row match") decides NOT_IN's
+        // no-match outcome.
+        boolean buildHasNullKey = false;
+
         Map<Long, List<Integer>> longIndex = null;
         Map<List<Object>, List<Integer>> boxedIndex = null;
         if (fastPath) {
@@ -127,7 +148,8 @@ public final class HashJoinOperator {
             longIndex = new LinkedHashMap<>();
             for (int row = 0; row < buildRoot.getRowCount(); row++) {
                 if (buildKey.isNull(row)) {
-                    continue; // a null key component never matches -- standard SQL join semantics
+                    buildHasNullKey = true; // a null key component never matches -- standard SQL join semantics
+                    continue;
                 }
                 longIndex.computeIfAbsent(encodeLong(buildKey, row), k -> new ArrayList<>()).add(row);
             }
@@ -136,13 +158,14 @@ public final class HashJoinOperator {
             for (int row = 0; row < buildRoot.getRowCount(); row++) {
                 List<Object> key = keyTuple(buildKeyVectors, row);
                 if (key == null) {
+                    buildHasNullKey = true;
                     continue;
                 }
                 boxedIndex.computeIfAbsent(key, k -> new ArrayList<>()).add(row);
             }
         }
 
-        boolean semiOrAnti = type == JoinType.SEMI || type == JoinType.ANTI;
+        boolean semiOrAnti = type == JoinType.SEMI || type == JoinType.ANTI || type == JoinType.NOT_IN;
 
         List<Field> outputFields = new ArrayList<>();
         for (Field field : left.getSchema().getFields()) {
@@ -188,6 +211,16 @@ public final class HashJoinOperator {
                     outRow = emitProbeOnly(p, leftAllVectors, result, outRow);
                     continue;
                 }
+                if (type == JoinType.NOT_IN) {
+                    // Same as ANTI, UNLESS the subquery's own result column
+                    // had a NULL anywhere -- then "no match" is UNKNOWN, not
+                    // TRUE, so this probe row is suppressed instead of
+                    // emitted (standard SQL NULL-poisoning, see javadoc).
+                    if (!buildHasNullKey) {
+                        outRow = emitProbeOnly(p, leftAllVectors, result, outRow);
+                    }
+                    continue;
+                }
                 // LEFT/FULL: buildIsRight is always true here (see above),
                 // so the probe side is always "left" -- preserve it,
                 // null-pad the right side.
@@ -202,8 +235,8 @@ public final class HashJoinOperator {
                 outRow = emitProbeOnly(p, leftAllVectors, result, outRow);
                 continue;
             }
-            if (type == JoinType.ANTI) {
-                continue; // a match exists -- ANTI's condition fails, drop this probe row
+            if (type == JoinType.ANTI || type == JoinType.NOT_IN) {
+                continue; // a match exists -- the condition fails either way, drop this probe row
             }
 
             for (int buildMatchRow : matches) {

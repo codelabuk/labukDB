@@ -197,4 +197,83 @@ class QueryCommandSqlSubqueryMinioIntegrationTest {
         assertFalse(output.contains("payments-svc"), output);
         assertTrue(output.contains("1 row(s)"), output);
     }
+
+    /** customers_with_null (Delta, remote): id(long), region(string). id 1, then a row with a NULL id. */
+    private void buildCustomersWithNullId(String uri) throws Exception {
+        Field id = new Field("id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field region = new Field("region", FieldType.nullable(ArrowType.Utf8.INSTANCE), null);
+        Schema schema = new Schema(List.of(id, region));
+        TableLocation location = TableLocation.forRemote(uri, conf);
+        new TableCreator().createTable(location, schema, List.of(), null);
+
+        try (VectorSchemaRoot batch = VectorSchemaRoot.create(schema, allocator)) {
+            batch.allocateNew();
+            BigIntVector idVector = (BigIntVector) batch.getVector("id");
+            VarCharVector regionVector = (VarCharVector) batch.getVector("region");
+            idVector.setSafe(0, 1L);
+            regionVector.setSafe(0, "us-east".getBytes(StandardCharsets.UTF_8));
+            idVector.setNull(1);
+            regionVector.setSafe(1, "unknown".getBytes(StandardCharsets.UTF_8));
+            batch.setRowCount(2);
+            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+        }
+    }
+
+    /**
+     * Named gap, now fixed, against real MinIO: a scalar subquery nested
+     * inside an {@code EXISTS} subquery's own filter. The correlation
+     * ({@code b.id = a.customer_id}) and the nested scalar condition
+     * ({@code b.id = (SELECT MAX(c.id) FROM customers c)}, which evaluates
+     * to 2) are both top-level {@code AND}-combined conjuncts inside the
+     * same subquery {@code WHERE} -- only {@code customer_id=2}'s row
+     * satisfies both.
+     */
+    @Test
+    void existsSubquery_withAScalarSubqueryInsideItsOwnFilter_realMinioBackedDeltaTables_resolvesCorrectly() throws Exception {
+        String ordersUri = testRootUri + "/orders";
+        String customersUri = testRootUri + "/customers";
+        buildOrders(ordersUri);
+        buildCustomers(customersUri);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersUri);
+        TableCatalog.atDefaultLocation().register("customers", customersUri);
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT a.service FROM orders a WHERE EXISTS "
+                        + "(SELECT 1 FROM customers b WHERE b.id = a.customer_id "
+                        + "AND b.id = (SELECT MAX(c.id) AS m FROM customers c))"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("payments-svc"), output);
+        assertFalse(output.contains("auth-svc"), output);
+        assertFalse(output.contains("orphan-svc"), output);
+        assertTrue(output.contains("1 row(s)"), output);
+    }
+
+    /**
+     * Named gap, now fixed, against real MinIO: standard SQL's {@code
+     * NOT IN} NULL-poisoning rule. Every order's {@code customer_id}
+     * (1, 2, 999) either matches {@code customers_with_null}'s real
+     * {@code id=1} (excluded normally) or matches nothing, but that
+     * table's result column contains a {@code NULL} -- the correct
+     * result is zero rows, not the "orphan-svc" row a plain {@code ANTI}
+     * join would incorrectly have kept.
+     */
+    @Test
+    void notInSubquery_withANullInTheSubqueryResult_realMinioBackedDeltaTables_excludesEveryRow() throws Exception {
+        String ordersUri = testRootUri + "/orders";
+        String customersWithNullUri = testRootUri + "/customers_with_null";
+        buildOrders(ordersUri);
+        buildCustomersWithNullId(customersWithNullUri);
+
+        TableCatalog.atDefaultLocation().register("orders", ordersUri);
+        TableCatalog.atDefaultLocation().register("customers_with_null", customersWithNullUri);
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT a.service FROM orders a WHERE a.customer_id NOT IN (SELECT b.id FROM customers_with_null b)"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("0 row(s)"),
+                "a NULL in the subquery's result column poisons NOT IN for every non-matching row, from real MinIO: " + output);
+    }
 }

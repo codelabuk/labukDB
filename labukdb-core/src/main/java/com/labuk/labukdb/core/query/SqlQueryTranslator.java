@@ -100,14 +100,16 @@ import java.util.Set;
  *
  * <b>{@code IN}/{@code NOT IN}/{@code EXISTS}/{@code NOT EXISTS}
  * subqueries, SQL engine Phase 4 increment 1:</b> decorrelated into an
- * ordinary {@code JoinType.SEMI}/{@code ANTI} step appended after every
- * explicit {@code JOIN} — see {@link #extractSubqueryConditions},
- * {@link #buildInSubqueryStep}, {@link #buildExistsSubqueryStep}. The
- * subquery itself must be a single plain table (no {@code JOIN},
- * {@code GROUP BY}, {@code ORDER BY}, or {@code LIMIT} inside it, no
- * further nested subquery); correlation to an outer table must be a
- * plain {@code AND}-combined {@code inner.col = outer.col} equality,
- * same shape discipline a real {@code JOIN ... ON} already enforces — a
+ * ordinary {@code JoinType.SEMI}/{@code ANTI}/{@code NOT_IN} step
+ * appended after every explicit {@code JOIN} — see {@link
+ * #extractSubqueryConditions}, {@link #buildInSubqueryStep}, {@link
+ * #buildExistsSubqueryStep}. The subquery itself must be a single plain
+ * table (no {@code JOIN}, {@code GROUP BY}, {@code ORDER BY}, or
+ * {@code LIMIT} inside it, no further nested {@code IN}/{@code EXISTS}
+ * — a scalar subquery inside its own filter *is* supported, see {@link
+ * #splitSubqueryWhere}); correlation to an outer table must be a plain
+ * {@code AND}-combined {@code inner.col = outer.col} equality, same
+ * shape discipline a real {@code JOIN ... ON} already enforces — a
  * non-equality correlation, or one inside an {@code OR}, falls through
  * to this class's ordinary (generic) rejection. A key-less, wholly
  * uncorrelated {@code EXISTS}/{@code NOT EXISTS} (no shared column with
@@ -118,15 +120,13 @@ import java.util.Set;
  * explicit {@code JOIN}) is present, every column anywhere in the query
  * must be table-qualified, same as a real multi-table join already
  * requires — a deliberate consistency choice, not a new restriction
- * specific to subqueries. <b>Known, stated gap:</b> {@code NOT IN
- * (SELECT ...)} does not replicate standard SQL's NULL-poisoning rule
- * (a {@code NULL} in the subquery's result column should make the
- * whole {@code NOT IN} unknown for every outer row); this
- * implementation's {@code ANTI} join instead just treats a {@code NULL}
- * subquery row as absent, which can differ from standard SQL when the
- * subquery's result column is nullable and actually contains a
- * {@code NULL} — not fixed here, named plainly rather than silently
- * shipped as correct.
+ * specific to subqueries. {@code NOT IN (SELECT ...)} correctly
+ * replicates standard SQL's NULL-poisoning rule (a {@code NULL} in the
+ * subquery's result column makes the whole {@code NOT IN} unknown —
+ * excluded, not included — for every outer row that matches nothing
+ * else) via the dedicated {@code JoinType.NOT_IN} — see that enum's own
+ * javadoc and {@code HashJoinOperator}'s for exactly where this is
+ * checked.
  *
  * <b>{@code JOIN}, SQL engine Phase 3 — {@code INNER}/{@code LEFT}/
  * {@code RIGHT}/{@code FULL}, any number of tables:</b> {@code ON} must
@@ -378,7 +378,7 @@ public final class SqlQueryTranslator {
             Set<String> priorAliases = new LinkedHashSet<>(aliasesInOrder.subList(0, i + 1));
             List<SqlQuery.JoinKeyPair> keys = toJoinKeys(joins.get(i).getOnExpression(), priorAliases, rightAlias);
             steps.add(new SqlQuery.JoinStep(types.get(i), rightTables.get(i).getName(), rightAlias, keys,
-                    perTablePredicate.get(rightAlias)));
+                    perTablePredicate.get(rightAlias), List.of()));
         }
 
         // Every subquery-derived step's own alias must be distinct, both from
@@ -749,7 +749,7 @@ public final class SqlQueryTranslator {
 
     /**
      * {@code outer.col IN (SELECT inner.resultCol FROM inner [WHERE ...])} →
-     * a {@code JoinType.SEMI} step ({@code ANTI} for {@code NOT IN}) whose
+     * a {@code JoinType.SEMI} step ({@code NOT_IN} for {@code NOT IN}) whose
      * keys are the {@code IN}'s own column match plus any correlation
      * equalities found inside the subquery's own {@code WHERE} (see {@link
      * #splitSubqueryWhere}). The {@code IN}'s own match is always present,
@@ -790,12 +790,17 @@ public final class SqlQueryTranslator {
         keys.add(new SqlQuery.JoinKeyPair(outerAlias, outerColumn.getColumnName(), resultColumn.getColumnName()));
 
         List<Expression> ownFilterConjuncts = new ArrayList<>();
+        List<SqlQuery.ScalarSubquery> ownScalarSubqueries = new ArrayList<>();
         if (inner.getWhere() != null) {
-            splitSubqueryWhere(inner.getWhere(), innerAlias, outerAliases, keys, ownFilterConjuncts);
+            splitSubqueryWhere(inner.getWhere(), innerAlias, outerAliases, keys, ownFilterConjuncts, ownScalarSubqueries);
         }
 
-        JoinType type = in.isNot() ? JoinType.ANTI : JoinType.SEMI;
-        return new SqlQuery.JoinStep(type, innerTable.getName(), innerAlias, keys, buildConjunctionPredicate(ownFilterConjuncts));
+        // NOT IN gets its own JoinType (not ANTI) -- see JoinType's own
+        // javadoc for why NOT IN's NULL-poisoning rule genuinely differs
+        // from NOT EXISTS's plain ANTI semantics.
+        JoinType type = in.isNot() ? JoinType.NOT_IN : JoinType.SEMI;
+        return new SqlQuery.JoinStep(type, innerTable.getName(), innerAlias, keys,
+                buildConjunctionPredicate(ownFilterConjuncts), ownScalarSubqueries);
     }
 
     /**
@@ -824,8 +829,9 @@ public final class SqlQueryTranslator {
 
         List<SqlQuery.JoinKeyPair> keys = new ArrayList<>();
         List<Expression> ownFilterConjuncts = new ArrayList<>();
+        List<SqlQuery.ScalarSubquery> ownScalarSubqueries = new ArrayList<>();
         if (inner.getWhere() != null) {
-            splitSubqueryWhere(inner.getWhere(), innerAlias, outerAliases, keys, ownFilterConjuncts);
+            splitSubqueryWhere(inner.getWhere(), innerAlias, outerAliases, keys, ownFilterConjuncts, ownScalarSubqueries);
         }
         if (keys.isEmpty()) {
             throw new IllegalArgumentException("EXISTS (SELECT ...) with no correlation to an outer table is not "
@@ -833,7 +839,8 @@ public final class SqlQueryTranslator {
         }
 
         JoinType type = negated ? JoinType.ANTI : JoinType.SEMI;
-        return new SqlQuery.JoinStep(type, innerTable.getName(), innerAlias, keys, buildConjunctionPredicate(ownFilterConjuncts));
+        return new SqlQuery.JoinStep(type, innerTable.getName(), innerAlias, keys,
+                buildConjunctionPredicate(ownFilterConjuncts), ownScalarSubqueries);
     }
 
     /**
@@ -849,16 +856,31 @@ public final class SqlQueryTranslator {
      * subquery's own filter, not an error here -- e.g. {@code inner.z = 5}
      * is exactly as valid inside a subquery as it would be in a real
      * table's own {@code WHERE}.
+     *
+     * <b>A scalar subquery inside this same filter</b> (e.g. {@code
+     * inner.z = (SELECT MAX(c.y) FROM c)}) is peeled off into {@code
+     * outScalars} instead of {@code ownFilterConjuncts} -- the same
+     * {@code ComparisonOperator}-with-{@code Select}-operand detection
+     * {@link #extractSubqueryConditions} uses at the top level, reused via
+     * {@link #buildScalarSubquery} with {@code innerAlias} as the only
+     * valid "outer" alias: it may reference the {@code IN}/{@code EXISTS}
+     * subquery's own table, but not the top-level outer query's tables (a
+     * doubly-correlated subquery two levels up) -- a deliberate, narrower
+     * scope than the top-level case, not attempted here. {@code
+     * core.cli.QueryCommand.resolveScalarSubqueries} resolves it the same
+     * way it resolves a top-level one, merging the result into this
+     * step's own {@code rightPredicate}.
      */
     private static void splitSubqueryWhere(Expression expr, String innerAlias, Set<String> outerAliases,
-                                            List<SqlQuery.JoinKeyPair> correlationKeys, List<Expression> ownFilterConjuncts) {
+                                            List<SqlQuery.JoinKeyPair> correlationKeys, List<Expression> ownFilterConjuncts,
+                                            List<SqlQuery.ScalarSubquery> outScalars) {
         if (expr instanceof ParenthesedExpressionList<?> grouped && grouped.size() == 1) {
-            splitSubqueryWhere(grouped.get(0), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts);
+            splitSubqueryWhere(grouped.get(0), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts, outScalars);
             return;
         }
         if (expr instanceof AndExpression and) {
-            splitSubqueryWhere(and.getLeftExpression(), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts);
-            splitSubqueryWhere(and.getRightExpression(), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts);
+            splitSubqueryWhere(and.getLeftExpression(), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts, outScalars);
+            splitSubqueryWhere(and.getRightExpression(), innerAlias, outerAliases, correlationKeys, ownFilterConjuncts, outScalars);
             return;
         }
         if (expr instanceof EqualsTo eq
@@ -873,6 +895,11 @@ public final class SqlQueryTranslator {
                 correlationKeys.add(new SqlQuery.JoinKeyPair(leftColTable, leftCol.getColumnName(), rightCol.getColumnName()));
                 return;
             }
+        }
+        if (expr instanceof ComparisonOperator cmp
+                && (cmp.getLeftExpression() instanceof Select || cmp.getRightExpression() instanceof Select)) {
+            outScalars.add(buildScalarSubquery(cmp, Set.of(innerAlias)));
+            return;
         }
         ownFilterConjuncts.add(expr);
     }

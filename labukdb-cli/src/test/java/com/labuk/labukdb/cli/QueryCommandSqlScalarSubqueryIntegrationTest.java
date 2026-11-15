@@ -99,11 +99,21 @@ class QueryCommandSqlScalarSubqueryIntegrationTest {
         }
     }
 
+    /** empty_orders: id(long), amount(long). Created, but no rows ever written -- zero files in the log. */
+    private void buildEmptyOrders(Path tableRoot) throws Exception {
+        Field id = new Field("id", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Field amount = new Field("amount", FieldType.nullable(new ArrowType.Int(64, true)), null);
+        Schema schema = new Schema(List.of(id, amount));
+        new TableCreator().createTable(TableLocation.forLocal(tableRoot), schema, List.of(), null);
+    }
+
     private void registerTables(Path root) throws Exception {
         buildOrders(root.resolve("orders"));
         buildLimits(root.resolve("limits"));
+        buildEmptyOrders(root.resolve("empty_orders"));
         TableCatalog.atDefaultLocation().register("orders", root.resolve("orders").toAbsolutePath().toString());
         TableCatalog.atDefaultLocation().register("limits", root.resolve("limits").toAbsolutePath().toString());
+        TableCatalog.atDefaultLocation().register("empty_orders", root.resolve("empty_orders").toAbsolutePath().toString());
     }
 
     @Test
@@ -192,5 +202,62 @@ class QueryCommandSqlScalarSubqueryIntegrationTest {
         List<String> dataLines = output.lines().dropWhile(l -> !l.startsWith("---")).skip(1)
                 .takeWhile(l -> !l.isBlank()).toList();
         assertEquals(List.of("3"), dataLines, output);
+    }
+
+    /**
+     * Named gap, now fixed: a group-by-less aggregate scalar subquery over
+     * zero matching <em>files</em> (not just zero matching rows within an
+     * existing file) used to throw, since {@code CombinedQueryExecutor}
+     * can't materialize a schema-less empty result. {@code COUNT} of zero
+     * rows is {@code 0} (not {@code NULL}) -- a real, non-null value, so
+     * {@code !=} against it is true for every order's {@code id} (1,2,3),
+     * distinguishing a correct "0" from an incorrect NULL-short-circuit
+     * (which would silently produce "0 row(s)" here instead).
+     */
+    @Test
+    void countScalarSubquery_overZeroMatchingFiles_resolvesToZeroNotNull(@TempDir Path root) throws Exception {
+        registerTables(root);
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT o.id FROM orders o WHERE o.id != (SELECT COUNT(e.amount) AS c FROM empty_orders e)"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("3 row(s)"), "COUNT of zero rows is 0, not NULL -- every id (1,2,3) != 0: " + output);
+    }
+
+    /**
+     * Same gap, {@code SUM} side: this engine's own established zero-row
+     * convention ({@code AggregateOperator.Accumulator}) is {@code 0.0}
+     * for {@code SUM}, not SQL-standard {@code NULL} -- matched here
+     * exactly rather than inventing a different convention for the
+     * zero-files case specifically.
+     */
+    @Test
+    void sumScalarSubquery_overZeroMatchingFiles_resolvesToZeroNotNull(@TempDir Path root) throws Exception {
+        registerTables(root);
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT o.id FROM orders o WHERE o.amount != (SELECT SUM(e.amount) AS s FROM empty_orders e)"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("3 row(s)"), "SUM of zero rows is 0.0 in this engine's convention: " + output);
+    }
+
+    /**
+     * {@code AVG}/{@code MIN}/{@code MAX} of zero rows is genuinely
+     * {@code NULL} (matching {@code Accumulator.result}'s own existing
+     * convention) -- correctly short-circuits the whole outer query to
+     * zero rows via the same {@code x OP NULL} path a zero-row plain-column
+     * subquery already uses, not an exception.
+     */
+    @Test
+    void avgScalarSubquery_overZeroMatchingFiles_shortCircuitsToZeroRows(@TempDir Path root) throws Exception {
+        registerTables(root);
+
+        QueryCommand.run(new String[] {"--sql",
+                "SELECT o.id FROM orders o WHERE o.amount = (SELECT AVG(e.amount) AS a FROM empty_orders e)"});
+
+        String output = capturedOut.toString(StandardCharsets.UTF_8);
+        assertTrue(output.contains("0 row(s)"), output);
     }
 }
