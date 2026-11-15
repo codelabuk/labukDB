@@ -42,6 +42,27 @@ interface LogStorage {
     org.apache.parquet.io.InputFile openParquetInputFile(String fileName) throws IOException;
 
     /**
+     * For {@link CheckpointWriter} — parquet-mr's {@code ParquetWriter} takes
+     * a Hadoop {@code Path} + {@code Configuration} directly (there's no
+     * {@code OutputFile}-level abstraction the way reads have {@code
+     * InputFile}), so this hands those two out uniformly instead of adding a
+     * parallel write-side wrapper type. Resolves {@code fileName} against
+     * this storage's own log directory, same as every other method here.
+     */
+    org.apache.hadoop.fs.Path hadoopPath(String fileName);
+
+    /** Paired with {@link #hadoopPath} for {@link CheckpointWriter}'s {@code ParquetWriter} construction. */
+    org.apache.hadoop.conf.Configuration hadoopConf();
+
+    /**
+     * Overwrites (not atomically-create-only, unlike {@link #createCommitFile})
+     * a small text file — specifically {@code _last_checkpoint}, which a new
+     * checkpoint always replaces in place, by design (it only ever needs to
+     * point at the newest checkpoint, never at history).
+     */
+    void writeTextFileOverwriting(String fileName, String content) throws IOException;
+
+    /**
      * Atomically creates a new commit file with the given content — must
      * fail (not silently overwrite) if a file with this name already
      * exists. This is the primitive {@link CommitWriter}'s single-writer

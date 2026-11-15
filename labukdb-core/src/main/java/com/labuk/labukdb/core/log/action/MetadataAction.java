@@ -29,6 +29,16 @@ public class MetadataAction {
     @JsonProperty("description")
     private String description;
 
+    // Defaulted, not left null -- confirmed via a real Spark 3.5.3 + Delta
+    // 3.0.0 read that this is a REQUIRED field, not an optional extra:
+    // Spark's own DeltaLog.buildHadoopFsRelationWithFileIndex NPEs
+    // (Metadata.format() returning null) against a metaData action that
+    // omits it, whether that action came from a JSON commit or a
+    // checkpoint's Parquet row. This project only ever writes Parquet data
+    // files, so "parquet"/no options is always correct, never configurable.
+    @JsonProperty("format")
+    private Format format = new Format("parquet", Map.of());
+
     @JsonProperty("schemaString")
     private String schemaString;
 
@@ -71,5 +81,42 @@ public class MetadataAction {
 
     public Long getCreatedTime() {
         return createdTime;
+    }
+
+    public Format getFormat() {
+        return format == null ? new Format("parquet", Map.of()) : format;
+    }
+
+    /** Used by {@code CheckpointReader} to carry forward whatever a checkpoint row's own {@code format} struct actually said, rather than always assuming this project's own default. */
+    public void setFormat(Format format) {
+        this.format = format;
+    }
+
+    /** Delta protocol's {@code metaData.format} struct — {@code provider} + arbitrary {@code options}. This project only ever sets {@code provider="parquet"}. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static final class Format {
+
+        @JsonProperty("provider")
+        private String provider;
+
+        @JsonProperty("options")
+        private Map<String, String> options;
+
+        /** No-arg — used by Jackson for JSON deserialization. */
+        public Format() {
+        }
+
+        public Format(String provider, Map<String, String> options) {
+            this.provider = provider;
+            this.options = options;
+        }
+
+        public String getProvider() {
+            return provider == null ? "parquet" : provider;
+        }
+
+        public Map<String, String> getOptions() {
+            return options == null ? Map.of() : options;
+        }
     }
 }

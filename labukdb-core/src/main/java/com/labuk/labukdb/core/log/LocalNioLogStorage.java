@@ -57,6 +57,21 @@ final class LocalNioLogStorage implements LogStorage {
     }
 
     @Override
+    public org.apache.hadoop.fs.Path hadoopPath(String fileName) {
+        return new org.apache.hadoop.fs.Path(logDir.resolve(fileName).toString());
+    }
+
+    @Override
+    public org.apache.hadoop.conf.Configuration hadoopConf() {
+        return new org.apache.hadoop.conf.Configuration();
+    }
+
+    @Override
+    public void writeTextFileOverwriting(String fileName, String content) throws IOException {
+        Files.writeString(logDir.resolve(fileName), content);
+    }
+
+    @Override
     public String describe() {
         return logDir.toString();
     }

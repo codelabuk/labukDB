@@ -34,8 +34,16 @@ final class CommitFileNames {
     private CommitFileNames() {
     }
 
+    /** The {@code _last_checkpoint} pointer file's fixed name — never version-numbered, always overwritten in place. */
+    static final String LAST_CHECKPOINT = "_last_checkpoint";
+
     static String jsonFileName(long version) {
         return String.format("%0" + VERSION_WIDTH + "d.json", version);
+    }
+
+    /** Single-part only — {@link CheckpointWriter} never produces a multi-part checkpoint (see its own javadoc for why). */
+    static String checkpointFileName(long version) {
+        return String.format("%0" + VERSION_WIDTH + "d.checkpoint.parquet", version);
     }
 
     static boolean isCommitJson(String fileName) {

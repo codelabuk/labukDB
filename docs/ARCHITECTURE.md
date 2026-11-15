@@ -396,10 +396,25 @@ prioritized backlog:
 - **Single process, single node.** No distributed query execution, no
   distributed ingestion fleet. Everything in this codebase runs on one
   machine.
-- **Checkpoint reading only, and only against a self-built fixture** —
-  not yet proven against a real Spark-produced checkpoint, which makes
-  it the highest-risk, least-verified code in the project. Checkpoint
-  *writing* doesn't exist.
+- **Checkpoint reading and writing, both live-verified against real
+  Spark** — `CheckpointReader` is confirmed correct against a genuine
+  local Spark 3.5.3 + Delta 3.0.0-produced checkpoint (copied in as a
+  permanent fixture, `CheckpointReaderRealSparkFixtureTest`), and
+  `CheckpointWriter`/`Checkpointer` (new) write a checkpoint real Spark
+  reads back correctly in turn — confirmed by a direct round trip: a
+  table built entirely by this project's own `TableCreator`/`CommitWriter`,
+  checkpointed by `Checkpointer`, opened by a real local Spark session,
+  same row count and values. That round trip surfaced and fixed a real
+  gap: `MetadataAction` was missing the Delta protocol's required
+  `metaData.format` struct (`{"provider":"parquet","options":{}}`) —
+  Spark's own Delta reader throws a `NullPointerException` without it,
+  on *any* labukDB-written table, checkpointed or not (the same class
+  backs JSON commits too). Not yet verified: multi-part checkpoints
+  (`CheckpointWriter` always writes single-part; reading multi-part was
+  already supported and remains fixture-only) and an automatic
+  checkpoint cadence (checkpointing is an explicit, callable operation —
+  same convention as `Vacuum`/`Compactor` — not wired into `CommitWriter`
+  on any schedule).
 - **No SQL-over-Flight** — a Flight client builds the JSON query shape
   directly; SQL text is a CLI-only entry point today.
 - **No authentication or access control** on the Flight server.

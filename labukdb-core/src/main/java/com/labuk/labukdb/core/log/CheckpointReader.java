@@ -114,7 +114,14 @@ final class CheckpointReader {
         List<String> partitionColumns = readStringList(metaData, "partitionColumns");
         Map<String, String> configuration = readStringMap(metaData, "configuration");
         Long createdTime = has(metaData, "createdTime") ? metaData.getLong("createdTime", 0) : null;
-        return new MetadataAction(id, schemaString, partitionColumns, configuration, createdTime);
+        MetadataAction action = new MetadataAction(id, schemaString, partitionColumns, configuration, createdTime);
+        if (has(metaData, "format")) {
+            Group format = metaData.getGroup("format", 0);
+            String provider = getString(format, "provider");
+            Map<String, String> options = readStringMap(format, "options");
+            action.setFormat(new MetadataAction.Format(provider, options));
+        }
+        return action;
     }
 
     private ProtocolAction readProtocol(Group protocol) {
@@ -159,8 +166,21 @@ final class CheckpointReader {
 
     // --- small helpers so every optional-field check reads the same way ---
 
+    /**
+     * {@code getFieldRepetitionCount} throws {@code InvalidRecordException}
+     * if {@code fieldName} isn't part of this group's schema AT ALL (a
+     * field this file's writer never declared — a genuinely older
+     * checkpoint, or a hand-built test fixture missing it), as opposed to
+     * being declared but simply absent from this one row (which it
+     * reports as a repetition count of 0, safely). {@code containsField}
+     * is checked first so both cases mean "not present" here, rather than
+     * the schema-level case throwing — confirmed by a real regression this
+     * exact distinction caused once {@link #readMetaData} started looking
+     * for {@code format}, which an older/hand-built schema may never have
+     * declared at all.
+     */
     private static boolean has(Group group, String fieldName) {
-        return group.getFieldRepetitionCount(fieldName) > 0;
+        return group.getType().containsField(fieldName) && group.getFieldRepetitionCount(fieldName) > 0;
     }
 
     private static String getString(Group group, String fieldName) {

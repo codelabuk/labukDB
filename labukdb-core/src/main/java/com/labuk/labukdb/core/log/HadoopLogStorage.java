@@ -142,6 +142,23 @@ final class HadoopLogStorage implements LogStorage {
     }
 
     @Override
+    public Path hadoopPath(String fileName) {
+        return new Path(logDir, fileName);
+    }
+
+    @Override
+    public Configuration hadoopConf() {
+        return fileSystem.getConf();
+    }
+
+    @Override
+    public void writeTextFileOverwriting(String fileName, String content) throws IOException {
+        try (FSDataOutputStream out = fileSystem.create(new Path(logDir, fileName), true)) {
+            out.write(content.getBytes(StandardCharsets.UTF_8));
+        }
+    }
+
+    @Override
     public String describe() {
         return logDir.toString();
     }
