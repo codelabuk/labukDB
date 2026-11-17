@@ -100,7 +100,17 @@ never materialized into an Arrow vector at all. Handles nested types
 
 **`encode/`** — the write-side mirror of `decode/`: Arrow to Parquet, and
 an Arrow `Schema` to each format's own schema representation
-(`ArrowToDeltaSchema`, `ArrowToIcebergSchema`).
+(`ArrowToDeltaSchema`, `ArrowToIcebergSchema`). `FileStatsCollector`
+computes the `numRecords`/`minValues`/`maxValues`/`nullCount` stats every
+`AddFile` carries — real Delta's own shape, confirmed against a genuine
+Spark-produced commit, not guessed — which is what `planner/`'s file-stats
+pruning above actually prunes on for a table this project itself wrote.
+Min/max is collected for the primitive types `HashJoinOperator`/
+`AggregateOperator` already handle elsewhere (`Int`/`BigInt`/`Float4`/
+`Float8`/`Bit`/`VarChar`/`TimeStampMicro`); `DECIMAL` and nested
+(`LIST`/`MAP`/`STRUCT`) columns get no min/max — a named gap, not a silent
+one, and already safe: a column with no min/max is treated exactly like a
+file with no stats at all, "can't prune, keep it."
 
 **`execution/`** — the operators that run once a query needs more than a
 plain filtered scan: `AggregateOperator` (`GROUP BY` plus `SUM`/`COUNT`/

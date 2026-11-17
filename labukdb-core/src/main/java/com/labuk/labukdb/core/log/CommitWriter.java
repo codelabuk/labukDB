@@ -2,6 +2,7 @@ package com.labuk.labukdb.core.log;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.labuk.labukdb.core.encode.ArrowToParquetWriter;
+import com.labuk.labukdb.core.encode.FileStatsCollector;
 import com.labuk.labukdb.core.log.action.AddFile;
 import com.labuk.labukdb.core.log.action.RemoveFile;
 import com.labuk.labukdb.core.log.action.SingleAction;
@@ -45,10 +46,15 @@ import java.util.stream.Collectors;
  * re-checks its removed files on every attempt (it isn't safe to retry
  * blindly once something it depends on has changed).
  *
- * {@code AddFile.stats} is left {@code null} on every file this writes —
- * the existing fail-open pruning design already treats missing stats as
- * "keep the file," so this is a safe simplification, not a correctness
- * gap. Real stats collection is a later refinement.
+ * {@code AddFile.stats} is now real, computed once per batch via {@link
+ * FileStatsCollector} right before encoding — {@code numRecords}/{@code
+ * minValues}/{@code maxValues}/{@code nullCount}, matching real Delta's
+ * own stats shape. A column type that collector doesn't support (see its
+ * own javadoc) simply has no min/max — {@link
+ * com.labuk.labukdb.core.planner.FileStatsPruner}'s existing fail-open
+ * design already treats that the same as a file with no stats at all, so
+ * this was always a safe degradation, not a correctness gap, even before
+ * stats collection existed.
  */
 public final class CommitWriter {
 
@@ -431,7 +437,7 @@ public final class CommitWriter {
                 fileSize(dataFileLocation),
                 System.currentTimeMillis(),
                 dataChange,
-                null);
+                FileStatsCollector.collect(batch));
     }
 
     private long fileSize(TableLocation location) throws IOException {

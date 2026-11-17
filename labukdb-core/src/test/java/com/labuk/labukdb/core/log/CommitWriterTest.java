@@ -118,7 +118,12 @@ class CommitWriterTest {
             assertEquals("ERROR", written.getPartitionValues().get("level"));
             assertTrue(written.getPath().startsWith("level=ERROR/"), "file lands under its partition folder: " + written.getPath());
             assertTrue(written.getPath().endsWith(".snappy.parquet"));
-            assertNull(written.getStats(), "stats intentionally left null for this build-order step");
+            // Real stats now, computed by FileStatsCollector -- "auth-svc" <
+            // "gateway" < "payments-svc" lexicographically, and amount 1..3.
+            assertNotNull(written.getStats());
+            assertTrue(written.getStats().contains("\"numRecords\":3"), written.getStats());
+            assertTrue(written.getStats().contains("\"auth-svc\""), written.getStats());
+            assertTrue(written.getStats().contains("\"payments-svc\""), written.getStats());
 
             // The actual "read it back correctly" proof.
             File dataFile = tableRoot.resolve(written.getPath()).toFile();

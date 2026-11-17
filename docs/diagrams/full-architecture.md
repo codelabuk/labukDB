@@ -86,7 +86,7 @@ flowchart TB
 
     subgraph DECODEENC["decode/ + encode/ — the only place a Parquet file is actually opened"]
         PAR["ParquetToArrowReader<br/>(+ RowGroupPruner, GroupPredicateEvaluator,<br/>NestedTypeDecoder, DecimalCodec)"]:::decodeNode
-        ATP["ArrowToParquetWriter"]:::decodeNode
+        ATP["ArrowToParquetWriter<br/>+ FileStatsCollector"]:::decodeNode
     end
 
     PVS --> PAR
