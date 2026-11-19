@@ -57,7 +57,7 @@ flowchart TB
         SM["SnapshotManager<br/>(log replay + checkpoint reading)"]:::deltaNode
         CW["CommitWriter<br/>(appendBatch / replaceFiles,<br/>OCC retry)"]:::deltaNode
         WB["WriteBuffer<br/>(WAL-backed batching)"]:::deltaNode
-        COMPACT["Compactor / Vacuum /<br/>TableMerger / Checkpointer"]:::deltaNode
+        COMPACT["Compactor / Vacuum /<br/>TableMerger / Checkpointer /<br/>OrphanFileCleaner"]:::deltaNode
         LOCK["LockProvider<br/>(DynamoDbLockProvider,<br/>opt-in for unsafe backends)"]:::deltaNode
     end
 

@@ -79,9 +79,15 @@ need a full replay on every query. On the write side: `CommitWriter`
 [Concurrent writes](#concurrent-writes)), `TableCreator` (writes a
 brand-new table's version-0 commit), `TableMerger` (upsert/MERGE by key),
 `Compactor` (bin-packs a partition's small files into one, as a
-non-data-changing commit), and `Vacuum` (deletes the bytes of files a
+non-data-changing commit), `Vacuum` (deletes the bytes of files a
 past commit already removed, once they're past a retention window —
-7 days by default, matching real Delta's own).
+7 days by default, matching real Delta's own), and `OrphanFileCleaner`
+(deletes real Parquet files the log never mentioned at all, not even
+as a `remove` tombstone — the realistic cause is a writer that wrote
+its data file, per every write path's own write-then-commit order, and
+then never successfully committed; same retention-window safety as
+`Vacuum`, so a genuinely in-flight writer's not-yet-committed file is
+never mistaken for an orphan).
 
 **`planner/`** — decides which files can be skipped without opening
 them: partition pruning (exact match on partition values already in the
