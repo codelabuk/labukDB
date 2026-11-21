@@ -130,7 +130,7 @@ class FlightRemoteAggregationMinioIntegrationTest {
                 amountVector.setSafe(i, (long) (start + i));
             }
             batch.setRowCount(count);
-            CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", level));
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of("level", level));
         }
     }
 

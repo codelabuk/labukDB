@@ -103,7 +103,13 @@ public final class WriteBuffer implements AutoCloseable {
                         BufferAllocator allocator) throws IOException {
         this(partitionValues, maxBufferedRows, maxBufferedBytes, allocator,
                 walRoot.resolve(sanitizeLocationKey(location)).resolve(sanitizePartitionKey(partitionValues)),
-                CommitWriter.forLocation(location));
+                // This constructor has no LockProvider parameter of its own, so a
+                // remote table here was always documented single-writer-only
+                // (see this class's own javadoc) -- the single-writer-only entry
+                // point just states that explicitly now that CommitWriter fails
+                // closed by default for the confirmed-unsafe (custom endpoint)
+                // remote shape.
+                CommitWriter.forLocationSingleWriterOnly(location));
     }
 
     private WriteBuffer(Map<String, String> partitionValues, long maxBufferedRows, long maxBufferedBytes,

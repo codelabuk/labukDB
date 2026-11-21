@@ -118,7 +118,7 @@ class QueryCommandSqlJoinMinioIntegrationTest {
                 serviceVector.setSafe(i, services[i].getBytes(StandardCharsets.UTF_8));
             }
             batch.setRowCount(ids.length);
-            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of());
         }
     }
 
@@ -141,7 +141,7 @@ class QueryCommandSqlJoinMinioIntegrationTest {
                 regionVector.setSafe(i, regions[i].getBytes(StandardCharsets.UTF_8));
             }
             batch.setRowCount(ids.length);
-            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of());
         }
     }
 
@@ -164,7 +164,7 @@ class QueryCommandSqlJoinMinioIntegrationTest {
                 regionVector.setSafe(i, regions[i].getBytes(StandardCharsets.UTF_8));
             }
             batch.setRowCount(ids.length);
-            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of());
         }
     }
 

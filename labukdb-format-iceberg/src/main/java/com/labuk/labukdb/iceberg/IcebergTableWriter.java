@@ -88,15 +88,38 @@ public final class IcebergTableWriter {
      * for the full root cause. {@link IcebergLockManagerConfig
      * #applyIfConfigured} opts this table into a real, cross-process
      * {@link DynamoDbLockManager} when {@code ICEBERG_LOCK_DYNAMODB_TABLE}
-     * is set; a no-op otherwise, so the default behavior (single-writer
-     * safe, confirmed-broken for concurrent writers) is unchanged.
+     * is set.
+     *
+     * <b>Fails closed otherwise</b>, for the one confirmed-unsafe shape
+     * (explicit S3-compatible custom endpoint, no lock configured): throws
+     * {@link com.labuk.labukdb.core.storage.UnsafeRemoteWriteException}
+     * rather than silently allowing it. Use {@link
+     * #forLocationSingleWriterOnly(TableLocation)} if this table will only
+     * ever have one writer. Local tables, and any other remote location,
+     * are unaffected.
      */
     public IcebergTableWriter(TableLocation location) {
+        this(location, false);
+    }
+
+    private IcebergTableWriter(TableLocation location, boolean acknowledgedSingleWriterRisk) {
         this.tableLocation = location;
         Configuration conf = location.isRemote() ? location.hadoopConf() : new Configuration();
         boolean lockConfigured = IcebergLockManagerConfig.applyIfConfigured(conf);
-        RemoteWriteSafetyWarning.warnIfUnsafe(location, lockConfigured, "Iceberg");
+        RemoteWriteSafetyWarning.enforce(location, lockConfigured, acknowledgedSingleWriterRisk, "Iceberg");
         this.table = new HadoopTables(conf).load(location.raw());
+    }
+
+    /**
+     * Explicit escape hatch for {@link #IcebergTableWriter(TableLocation)}'s
+     * fail-closed check: states out loud that {@code location} will only
+     * ever have one writer. Behaves identically to
+     * {@link #IcebergTableWriter(TableLocation)} in every other respect —
+     * including for local tables and non-confirmed-unsafe remote tables,
+     * where this call is a no-op safety-wise.
+     */
+    public static IcebergTableWriter forLocationSingleWriterOnly(TableLocation location) {
+        return new IcebergTableWriter(location, true);
     }
 
     /**

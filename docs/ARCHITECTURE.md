@@ -229,8 +229,25 @@ writes — this project rediscovered exactly why, on a real third-party
 S3-compatible store. The mitigation is an **opt-in external lock**
 (`LockProvider`, with `DynamoDbLockProvider` as the shipped
 implementation), engaged via `CommitWriter.forLocation(location,
-lockProvider)` — the no-lock `CommitWriter.forLocation(location)` is
-unchanged and stays the default. The lock's recovery algorithm mirrors
+lockProvider)`.
+
+**Fails closed by default for the confirmed-unsafe shape.** Constructing
+a `CommitWriter`/`IcebergTableWriter` against a remote location with an
+explicit custom S3-compatible endpoint (the exact MinIO-style deployment
+above, found broken) and no lock now throws `UnsafeRemoteWriteException`
+instead of silently proceeding — this used to only log a warning
+(`RemoteWriteSafetyWarning`), which meant a deliberate, documented
+single-writer deployment and an accidental multi-writer one looked
+identical. A caller now picks one of two explicit paths: engage a real
+lock, or call `CommitWriter.forLocationSingleWriterOnly(location)` /
+`IcebergTableWriter.forLocationSingleWriterOnly(location)` to state out
+loud that this table will only ever have one writer (this project still
+has no way to *detect* an actual concurrent writer — only the
+configuration shape that's confirmed risky — so the single-writer
+promise is still on the caller, same as before, just no longer a silent
+default). Local tables, and remote tables on the default AWS/ADLS
+credential chain (not confirmed unsafe by this project — see the table
+above), are unaffected either way. The lock's recovery algorithm mirrors
 real Delta's own `BaseExternalLogStore` approach: a commit claims an
 incomplete lock entry before writing, writes the file, then marks the
 entry complete; the next writer recovers any stuck entry for the version

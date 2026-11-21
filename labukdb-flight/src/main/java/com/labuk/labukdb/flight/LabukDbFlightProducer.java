@@ -625,7 +625,8 @@ public class LabukDbFlightProducer extends NoOpFlightProducer {
 
                 TableLocation tableRoot = locationFromRaw(raw);
                 if (DetectedFormat.detect(tableRoot) == DetectedFormat.ICEBERG) {
-                    acceptPutIceberg(new IcebergTableWriter(tableRoot), request.getPartitionValues(), flightStream);
+                    acceptPutIceberg(IcebergTableWriter.forLocationSingleWriterOnly(tableRoot),
+                            request.getPartitionValues(), flightStream);
                     ackStream.onNext(PutResult.empty());
                     ackStream.onCompleted();
                     return;

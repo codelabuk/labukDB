@@ -106,7 +106,7 @@ class QueryCommandSqlScalarSubqueryMinioIntegrationTest {
                 amountVector.setSafe(i, amounts[i]);
             }
             batch.setRowCount(ids.length);
-            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of());
         }
     }
 
@@ -123,7 +123,7 @@ class QueryCommandSqlScalarSubqueryMinioIntegrationTest {
             ((BigIntVector) batch.getVector("id")).setSafe(0, 1L);
             ((BigIntVector) batch.getVector("max_amount")).setSafe(0, 150L);
             batch.setRowCount(1);
-            CommitWriter.forLocation(location).appendBatch(batch, Map.of());
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of());
         }
     }
 

@@ -99,7 +99,7 @@ class OrphanFileCleanerMinioIntegrationTest {
     @Test
     void uncommittedFileOnRealMinio_cleanedUp_activeFileNeverTouched() throws Exception {
         try (VectorSchemaRoot committed = buildBatch("auth-svc")) {
-            CommitWriter.forLocation(location).appendBatch(committed, Map.of());
+            CommitWriter.forLocationSingleWriterOnly(location).appendBatch(committed, Map.of());
         }
 
         Snapshot snapshot = SnapshotManager.forLocation(location).latest();

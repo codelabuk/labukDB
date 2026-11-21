@@ -98,7 +98,7 @@ class RemoteWriteMinioIntegrationTest {
             ((BigIntVector) batch.getVector("amount")).setSafe(0, 99L);
             batch.setRowCount(1);
 
-            long version = CommitWriter.forLocation(location).appendBatch(batch, Map.of("level", "ERROR"));
+            long version = CommitWriter.forLocationSingleWriterOnly(location).appendBatch(batch, Map.of("level", "ERROR"));
             assertEquals(1, version);
         }
 

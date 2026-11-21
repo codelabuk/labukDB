@@ -46,7 +46,7 @@ public final class IcebergConcurrentWriterWorker {
         Configuration conf = MinioConfiguration.forMinio(endpoint, accessKey, secretKey);
 
         try {
-            IcebergTableWriter writer = new IcebergTableWriter(TableLocation.forRemote(tableUri, conf));
+            IcebergTableWriter writer = IcebergTableWriter.forLocationSingleWriterOnly(TableLocation.forRemote(tableUri, conf));
             try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
                  VectorSchemaRoot batch = buildBatch(allocator, "writer-" + writerId, Long.parseLong(writerId))) {
                 writer.appendBatch(batch, Map.of());

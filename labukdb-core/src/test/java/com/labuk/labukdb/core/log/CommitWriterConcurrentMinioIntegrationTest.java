@@ -124,7 +124,7 @@ class CommitWriterConcurrentMinioIntegrationTest {
             int id = i;
             futures.add(pool.submit(() -> {
                 startGate.await();
-                CommitWriter writer = CommitWriter.forLocation(location);
+                CommitWriter writer = CommitWriter.forLocationSingleWriterOnly(location);
                 try (VectorSchemaRoot batch = buildBatch(allocator, "writer-" + id, id)) {
                     return writer.appendBatch(batch, Map.of());
                 }

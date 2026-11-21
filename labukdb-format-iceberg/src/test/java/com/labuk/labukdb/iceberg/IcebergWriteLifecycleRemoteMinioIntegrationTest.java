@@ -128,7 +128,7 @@ class IcebergWriteLifecycleRemoteMinioIntegrationTest {
         assertEquals(0, afterCreate.getFiles().size(), "a freshly created table has no data files yet");
 
         // 2. APPEND (x2, separate files -- gives compaction something real to do later)
-        IcebergTableWriter writer = new IcebergTableWriter(location);
+        IcebergTableWriter writer = IcebergTableWriter.forLocationSingleWriterOnly(location);
         try (VectorSchemaRoot b1 = buildBatch(allocator, 1, "auth-svc")) {
             writer.appendBatch(b1, Map.of());
         }

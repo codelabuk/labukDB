@@ -93,7 +93,7 @@ public final class Compactor {
             }
 
             CommitWriter commitWriter = lockProvider == null
-                    ? CommitWriter.forLocation(location)
+                    ? CommitWriter.forLocationSingleWriterOnly(location)
                     : CommitWriter.forLocation(location, lockProvider);
             // Bin-packing doesn't change the table's logical data, only
             // which physical file holds it — dataChange=false, same as

@@ -115,7 +115,7 @@ class IcebergWriterRemoteMinioIntegrationTest {
         new HadoopTables(conf).create(ICEBERG_SCHEMA, PARTITIONED_SPEC, SortOrder.unsorted(), Map.of(), testRootUri);
 
         try (VectorSchemaRoot batch = buildBatch(allocator, new String[] {"auth-svc", "gateway"}, new long[] {1, 2})) {
-            new IcebergTableWriter(TableLocation.forRemote(testRootUri, conf))
+            IcebergTableWriter.forLocationSingleWriterOnly(TableLocation.forRemote(testRootUri, conf))
                     .appendBatch(batch, Map.of("level", "ERROR"));
         }
 
@@ -140,7 +140,7 @@ class IcebergWriterRemoteMinioIntegrationTest {
     void appendBatch_calledTwiceAgainstMinio_bothCommitsVisibleInLatest() throws Exception {
         new HadoopTables(conf).create(ICEBERG_SCHEMA, PARTITIONED_SPEC, SortOrder.unsorted(), Map.of(), testRootUri);
 
-        IcebergTableWriter writer = new IcebergTableWriter(TableLocation.forRemote(testRootUri, conf));
+        IcebergTableWriter writer = IcebergTableWriter.forLocationSingleWriterOnly(TableLocation.forRemote(testRootUri, conf));
         try (VectorSchemaRoot errorBatch = buildBatch(allocator, new String[] {"auth-svc"}, new long[] {1});
              VectorSchemaRoot infoBatch = buildBatch(allocator, new String[] {"gateway"}, new long[] {2})) {
             writer.appendBatch(errorBatch, Map.of("level", "ERROR"));

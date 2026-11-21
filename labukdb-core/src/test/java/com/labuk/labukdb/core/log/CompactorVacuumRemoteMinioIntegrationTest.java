@@ -96,7 +96,7 @@ class CompactorVacuumRemoteMinioIntegrationTest {
 
     @Test
     void compactThenVacuum_realMinioBackedTable_bytesActuallyDeletedFromMinio() throws Exception {
-        CommitWriter writer = CommitWriter.forLocation(location);
+        CommitWriter writer = CommitWriter.forLocationSingleWriterOnly(location);
         try (VectorSchemaRoot b1 = buildBatch("svc-1")) {
             writer.appendBatch(b1, Map.of());
         }

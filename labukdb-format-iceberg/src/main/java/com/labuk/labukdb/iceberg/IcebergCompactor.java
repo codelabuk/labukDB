@@ -58,7 +58,10 @@ public final class IcebergCompactor {
     public long compact(TableLocation location, Map<String, String> partitionValues, BufferAllocator allocator) throws IOException {
         Configuration conf = location.isRemote() ? location.hadoopConf() : new Configuration();
         boolean lockConfigured = IcebergLockManagerConfig.applyIfConfigured(conf);
-        RemoteWriteSafetyWarning.warnIfUnsafe(location, lockConfigured, "Iceberg");
+        // No lock-provider pass-through on this path (unlike Delta's Compactor) --
+        // single-writer-only is this method's whole documented contract when no
+        // lock env var is set, same as IcebergTableWriter's own path-based ctor.
+        RemoteWriteSafetyWarning.enforce(location, lockConfigured, true, "Iceberg");
         Table table = new HadoopTables(conf).load(location.raw());
         return compactAgainstTable(table, location, partitionValues, allocator);
     }

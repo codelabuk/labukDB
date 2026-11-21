@@ -31,7 +31,7 @@ flowchart TB
     ITW -- "commit via iceberg-core<br/>(Table.newAppend)" --> IT
     ITW -- "appendBatch() delegates<br/>write+build-DataFile step" --> IDFW
     ITW -. "construction —<br/>applyIfConfigured(conf)" .-> ILMC
-    ITW -. "construction —<br/>warns if remote + no lock" .-> RWSW
+    ITW -. "construction —<br/>fails closed if remote,<br/>no lock, not acknowledged" .-> RWSW
 
     ITMRG -- "write new merged file<br/>+ build DataFile" --> IDFW
     ITMRG -- "reuses core's exact<br/>same merge-by-key semantics" --> PRM
@@ -49,6 +49,18 @@ flowchart TB
 **`IcebergTableWriter` — confirmed broken** under genuine concurrent writers on real MinIO, root cause traced into `iceberg-core`'s own `HadoopTableOperations.renameToFinal`: the default `LockManager` (`InMemoryLockManager`) is a plain `HashMap` per-JVM — zero protection across separate processes — then `fs.rename()` (copy+delete on S3A, not atomic) lets every racing writer "succeed" with no conflict detected. MERGE confirmed separately broken too (4 of 8 concurrent inserts lost).
 
 With lock (`DynamoDbLockManager`): **done, live-verified** — append *and* MERGE both pass with it engaged. Full write lifecycle (create → append → merge → compact → vacuum) proven end-to-end against real MinIO.
+
+**Fails closed by default, now** (new): constructing an `IcebergTableWriter`
+against the confirmed-broken shape above (remote, custom S3-compatible
+endpoint, no lock configured) throws `UnsafeRemoteWriteException` instead
+of silently proceeding — previously `RemoteWriteSafetyWarning` only logged.
+`IcebergTableWriter.forLocationSingleWriterOnly(location)` is the explicit
+escape hatch; `IcebergCompactor`/`IcebergTableMerger`/`IcebergVacuum`'s own
+path-based methods (no lock-provider pass-through of their own) always use
+it, matching their existing documented single-writer-only contract when no
+`ICEBERG_LOCK_DYNAMODB_TABLE` is set. `IcebergConcurrentWriterWorker` (the
+standing proof-test worker below) also uses it deliberately, to still
+reach and document the real race it demonstrates.
 
 **`DynamoDbLockManager`**: the same `ResourceInUseException` bootstrap race fixed here as Delta's `DynamoDbLockProvider` — found via *this* class's own 8-separate-process test first, then confirmed Delta's lock had the identical unprotected `createTable` call. Scope deliberately smaller than Delta's lock: a lease-based steal, not a crash-recovery system — Iceberg's own `SnapshotProducer.commit()` retry loop already handles everything else.
 

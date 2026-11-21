@@ -107,7 +107,7 @@ public final class TableMerger {
 
         SnapshotManager snapshotManager = SnapshotManager.forLocation(location);
         CommitWriter commitWriter = lockProvider == null
-                ? CommitWriter.forLocation(location)
+                ? CommitWriter.forLocationSingleWriterOnly(location)
                 : CommitWriter.forLocation(location, lockProvider);
 
         for (int attempt = 0; attempt < MAX_RETRIES; attempt++) {

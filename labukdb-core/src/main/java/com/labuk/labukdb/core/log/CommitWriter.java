@@ -67,33 +67,37 @@ public final class CommitWriter {
 
     /** Local disk — unchanged behavior from before {@link TableLocation} existed. */
     public CommitWriter(Path tableRoot) throws IOException {
-        this(TableLocation.forLocal(tableRoot), null);
+        this(TableLocation.forLocal(tableRoot), null, false);
     }
 
-    private CommitWriter(TableLocation location, LockProvider lockProvider) throws IOException {
+    private CommitWriter(TableLocation location, LockProvider lockProvider,
+                          boolean acknowledgedSingleWriterRisk) throws IOException {
         this.tableLocation = location;
         this.storage = LogStorage.forLocation(location);
         this.snapshotManager = SnapshotManager.forLocation(location);
         this.lockProvider = lockProvider;
-        RemoteWriteSafetyWarning.warnIfUnsafe(location, lockProvider != null, "Delta");
+        RemoteWriteSafetyWarning.enforce(location, lockProvider != null, acknowledgedSingleWriterRisk, "Delta");
     }
 
     /**
      * Dispatches on the location — local or remote (S3/MinIO/ADLS) — the
      * same {@link TableLocation}-based entry point {@link SnapshotManager}
-     * and {@code decode/ParquetToArrowReader} already use for reads. This
-     * is what {@code WriteBuffer}/{@code LabukDbFlightProducer} use so a
-     * {@code DoPut} against a remote table works the same way a local one
-     * always has.
+     * and {@code decode/ParquetToArrowReader} already use for reads.
      *
-     * <b>No external lock</b> — safe for a single remote writer only (see
+     * <b>Fails closed for the one confirmed-unsafe shape</b> (an explicit
+     * S3-compatible custom endpoint — e.g. MinIO — with no lock): throws
+     * {@link com.labuk.labukdb.core.storage.UnsafeRemoteWriteException}
+     * rather than silently allowing a configuration this project has
+     * confirmed loses commits under genuine concurrent writers. Use
      * {@link #forLocation(TableLocation, LockProvider)} for genuine
-     * multi-writer safety on object storage whose conditional-create isn't
-     * trustworthy under concurrency, confirmed broken on at least one real
-     * deployment; see {@link LockProvider}'s javadoc).
+     * multi-writer safety, or {@link #forLocationSingleWriterOnly(TableLocation)}
+     * if this table will only ever have one writer. Local tables, and any
+     * other remote location (default AWS/ADLS credential chains — not
+     * confirmed unsafe by this project), are unaffected and behave exactly
+     * as before.
      */
     public static CommitWriter forLocation(TableLocation location) throws IOException {
-        return new CommitWriter(location, null);
+        return new CommitWriter(location, null, false);
     }
 
     /**
@@ -106,7 +110,21 @@ public final class CommitWriter {
      * writer bypassing it defeats the scheme for that table.
      */
     public static CommitWriter forLocation(TableLocation location, LockProvider lockProvider) throws IOException {
-        return new CommitWriter(location, lockProvider);
+        return new CommitWriter(location, lockProvider, false);
+    }
+
+    /**
+     * Explicit escape hatch for {@link #forLocation(TableLocation)}'s
+     * fail-closed check: states out loud that {@code location} will only
+     * ever have one writer, so the confirmed-unsafe-under-concurrency
+     * configuration (remote, custom S3-compatible endpoint, no lock) is an
+     * accepted risk rather than an accidental one. Behaves identically to
+     * {@link #forLocation(TableLocation)} in every other respect —
+     * including for local tables and non-confirmed-unsafe remote tables,
+     * where this call is a no-op safety-wise.
+     */
+    public static CommitWriter forLocationSingleWriterOnly(TableLocation location) throws IOException {
+        return new CommitWriter(location, null, true);
     }
 
     /**

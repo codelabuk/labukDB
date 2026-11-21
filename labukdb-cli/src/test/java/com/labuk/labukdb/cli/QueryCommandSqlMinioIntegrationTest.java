@@ -106,7 +106,7 @@ class QueryCommandSqlMinioIntegrationTest {
         Schema schema = new Schema(List.of(amount, message));
         new TableCreator().createTable(location, schema, List.of("level"), null);
 
-        CommitWriter writer = CommitWriter.forLocation(location);
+        CommitWriter writer = CommitWriter.forLocationSingleWriterOnly(location);
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
             try (VectorSchemaRoot errorBatch = buildBatch(allocator, schema, 1, 5, "error")) {
                 writer.appendBatch(errorBatch, Map.of("level", "ERROR"));

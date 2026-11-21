@@ -48,6 +48,16 @@ Remote, **with** lock (`DynamoDbLockProvider`): **done, live-verified** — the 
 
 Local disk: safe unconditionally, lock never needed (real atomic filesystem ops).
 
+**Fails closed by default, now** (new): constructing a `CommitWriter` against
+the confirmed-broken shape above (remote, custom S3-compatible endpoint, no
+lock) throws `UnsafeRemoteWriteException` instead of silently proceeding —
+previously this only logged a warning, so an intentional single-writer
+deployment and an accidental multi-writer one were indistinguishable at
+construction time. `CommitWriter.forLocationSingleWriterOnly(location)` is
+the explicit escape hatch for the former; `CommitWriterConcurrentMinioIntegrationTest`
+(the standing proof test below) uses it deliberately, to still reach and
+document the real race it demonstrates.
+
 **`DynamoDbLockProvider` — root cause** (not the lock's design, the thing it mitigates): S3-compatible storage's conditional PUT isn't always honored under concurrency the way local disk's `CREATE_NEW` is. DynamoDB's own conditional `PutItem` *is* proven atomic (8-thread test: 1 success, 7 clean conflicts) — chosen because it mirrors real Delta Lake OSS's own `S3DynamoDBLogStore` pattern, not invented.
 
 Real regression fixed: 8 processes racing `ensureTableExists()` against a brand-new lock table all hit `ResourceNotFoundException` then raced `createTable` — 6 of 8 got an uncaught `ResourceInUseException`. Fixed by catching it and falling through to the existing poll-until-ACTIVE loop.

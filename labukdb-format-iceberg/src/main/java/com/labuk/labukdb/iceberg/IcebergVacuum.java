@@ -76,7 +76,10 @@ public final class IcebergVacuum {
     public List<String> vacuum(TableLocation location, Duration retentionPeriod) throws IOException {
         Configuration conf = location.isRemote() ? location.hadoopConf() : new Configuration();
         boolean lockConfigured = IcebergLockManagerConfig.applyIfConfigured(conf);
-        RemoteWriteSafetyWarning.warnIfUnsafe(location, lockConfigured, "Iceberg");
+        // Vacuum only deletes files an earlier commit already tombstoned --
+        // single-writer-only is this path's documented contract, same as
+        // IcebergTableWriter's own path-based ctor, when no lock env var is set.
+        RemoteWriteSafetyWarning.enforce(location, lockConfigured, true, "Iceberg");
         Table table = new HadoopTables(conf).load(location.raw());
         return vacuumAgainstTable(table, location, retentionPeriod);
     }
