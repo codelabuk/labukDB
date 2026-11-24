@@ -526,4 +526,101 @@ class SqlQueryTranslatorTest {
                         "SELECT a.x FROM a WHERE EXISTS (SELECT 1 FROM a WHERE a.y = a.z)"));
         assertTrue(thrown.getMessage().contains("alias"), thrown.getMessage());
     }
+
+    // -- UNION / UNION ALL (translateAny) --
+
+    @Test
+    void translate_stillRejectsUnion_unchanged() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translate("SELECT a FROM x UNION SELECT a FROM y"));
+        assertTrue(thrown.getMessage().contains("UNION"), thrown.getMessage());
+    }
+
+    @Test
+    void translateAny_plainSelect_returnsSingle() {
+        SqlStatement statement = SqlQueryTranslator.translateAny("SELECT service FROM logs");
+        assertInstanceOf(SqlStatement.Single.class, statement);
+        assertEquals("logs", ((SqlStatement.Single) statement).query().table());
+    }
+
+    @Test
+    void translateAny_unionAll_twoBranches_parsesEachIndependently() {
+        SqlStatement statement = SqlQueryTranslator.translateAny(
+                "SELECT service, amount FROM errors UNION ALL SELECT service, amount FROM infos");
+        assertInstanceOf(SqlStatement.Union.class, statement);
+        SqlStatement.Union union = (SqlStatement.Union) statement;
+        assertTrue(union.all());
+        assertEquals(2, union.branches().size());
+        assertEquals("errors", union.branches().get(0).table());
+        assertEquals("infos", union.branches().get(1).table());
+        assertEquals(List.of("service", "amount"), union.branches().get(0).columns());
+    }
+
+    @Test
+    void translateAny_plainUnion_notAll() {
+        SqlStatement.Union union = (SqlStatement.Union) SqlQueryTranslator.translateAny(
+                "SELECT service FROM errors UNION SELECT service FROM infos");
+        assertFalse(union.all());
+    }
+
+    @Test
+    void translateAny_threeWayUnion_flattensIntoThreeBranches() {
+        SqlStatement.Union union = (SqlStatement.Union) SqlQueryTranslator.translateAny(
+                "SELECT service FROM a UNION ALL SELECT service FROM b UNION ALL SELECT service FROM c");
+        assertEquals(3, union.branches().size());
+        assertEquals(List.of("a", "b", "c"),
+                union.branches().stream().map(SqlQuery::table).toList());
+    }
+
+    @Test
+    void translateAny_eachBranchKeepsItsOwnWhereAndCanBeAJoin() {
+        SqlStatement.Union union = (SqlStatement.Union) SqlQueryTranslator.translateAny(
+                "SELECT service FROM errors WHERE amount > 5 "
+                        + "UNION ALL "
+                        + "SELECT a.service FROM infos a JOIN extra b ON a.id = b.id");
+        SqlQuery first = union.branches().get(0);
+        assertNotNull(first.predicate());
+        SqlQuery second = union.branches().get(1);
+        assertEquals(1, second.joins().size());
+    }
+
+    @Test
+    void translateAny_mixedUnionAndUnionAll_rejected() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translateAny(
+                        "SELECT a FROM x UNION SELECT a FROM y UNION ALL SELECT a FROM z"));
+        assertTrue(thrown.getMessage().contains("mix"), thrown.getMessage());
+    }
+
+    @Test
+    void translateAny_intersect_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translateAny("SELECT a FROM x INTERSECT SELECT a FROM y"));
+        assertTrue(thrown.getMessage().contains("INTERSECT") || thrown.getMessage().contains("UNION"),
+                thrown.getMessage());
+    }
+
+    @Test
+    void translateAny_orderByOnTheCombinedUnion_rejected() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translateAny(
+                        "SELECT a FROM x UNION SELECT a FROM y ORDER BY a"));
+        assertTrue(thrown.getMessage().contains("ORDER BY"), thrown.getMessage());
+    }
+
+    @Test
+    void translateAny_perBranchOrderByAndLimit_stillAllowed() {
+        SqlStatement.Union union = (SqlStatement.Union) SqlQueryTranslator.translateAny(
+                "(SELECT a FROM x ORDER BY a LIMIT 5) UNION ALL (SELECT a FROM y)");
+        assertEquals(2, union.branches().size());
+        assertEquals(5, union.branches().get(0).limit());
+    }
+
+    @Test
+    void translateAny_nestedUnionAsABranch_rejectedWithClearError() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> SqlQueryTranslator.translateAny(
+                        "SELECT a FROM x UNION ((SELECT a FROM y) UNION (SELECT a FROM z))"));
+        assertNotNull(thrown.getMessage());
+    }
 }

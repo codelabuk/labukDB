@@ -8,6 +8,7 @@ import com.labuk.labukdb.core.execution.CombinedQueryExecutor;
 import com.labuk.labukdb.core.execution.FileScan;
 import com.labuk.labukdb.core.execution.HashJoinOperator;
 import com.labuk.labukdb.core.execution.JoinType;
+import com.labuk.labukdb.core.execution.RowDeduplicator;
 import com.labuk.labukdb.core.execution.SortKey;
 import com.labuk.labukdb.core.execution.SortLimitOperator;
 import com.labuk.labukdb.core.format.DataFileRef;
@@ -31,6 +32,7 @@ import com.labuk.labukdb.core.planner.QueryPlanner;
 import com.labuk.labukdb.core.planner.ScanPlan;
 import com.labuk.labukdb.core.query.SqlQuery;
 import com.labuk.labukdb.core.query.SqlQueryTranslator;
+import com.labuk.labukdb.core.query.SqlStatement;
 import com.labuk.labukdb.core.storage.TableLocation;
 import com.labuk.labukdb.iceberg.IcebergRestConfiguration;
 import com.labuk.labukdb.iceberg.IcebergRestLocation;
@@ -40,6 +42,8 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.types.pojo.Field;
+import org.apache.arrow.vector.types.pojo.Schema;
+import org.apache.arrow.vector.util.VectorSchemaRootAppender;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 
@@ -134,10 +138,15 @@ final class QueryCommand {
      * would misrepresent the result.
      */
     private static void runSql(CliArgs parsed) throws Exception {
-        SqlQuery rawQuery = SqlQueryTranslator.translate(parsed.sql);
+        SqlStatement statement = SqlQueryTranslator.translateAny(parsed.sql);
         TableCatalog catalog = TableCatalog.atDefaultLocation();
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+            if (statement instanceof SqlStatement.Union union) {
+                runSqlUnion(union, catalog, parsed, allocator);
+                return;
+            }
+            SqlQuery rawQuery = ((SqlStatement.Single) statement).query();
             Optional<SqlQuery> resolvedQuery = resolveScalarSubqueries(rawQuery, catalog, parsed, allocator);
             if (resolvedQuery.isEmpty()) {
                 // SQL engine Phase 4 increment 2: a scalar subquery resolved
@@ -573,6 +582,211 @@ final class QueryCommand {
         } finally {
             current.close();
         }
+    }
+
+    /**
+     * {@code UNION}/{@code UNION ALL}: materializes each branch
+     * independently via {@link #materializeForUnion} -- reusing exactly
+     * the same single-table/join resolution {@link #runSql} itself uses,
+     * just without its streaming fast paths or inline printing, since a
+     * UNION branch's result has to be held in memory to concatenate with
+     * its siblings anyway -- concatenates them with {@link
+     * VectorSchemaRootAppender} (the same concatenation primitive {@link
+     * CombinedQueryExecutor}/{@code core.log.Compactor} already use), and
+     * for plain {@code UNION} (not {@code ALL}) removes duplicate rows via
+     * {@link RowDeduplicator}. Prints once, over the combined (deduplicated,
+     * if applicable) result -- or "0 row(s)" with no header at all if every
+     * branch came back empty, same convention {@link #runSql}'s own
+     * zero-files early-out already uses.
+     */
+    private static void runSqlUnion(SqlStatement.Union union, TableCatalog catalog, CliArgs parsed,
+                                      BufferAllocator allocator) throws Exception {
+        List<VectorSchemaRoot> branchResults = new ArrayList<>();
+        try {
+            for (SqlQuery branch : union.branches()) {
+                materializeForUnion(branch, catalog, parsed, allocator).ifPresent(branchResults::add);
+            }
+
+            if (branchResults.isEmpty()) {
+                System.out.println("0 row(s)");
+                return;
+            }
+
+            VectorSchemaRoot combined = VectorSchemaRoot.create(branchResults.get(0).getSchema(), allocator);
+            combined.allocateNew();
+            try {
+                for (VectorSchemaRoot branchResult : branchResults) {
+                    if (branchResult.getSchema().getFields().size() != combined.getSchema().getFields().size()) {
+                        throw new IllegalArgumentException("Every UNION branch must select the same number of "
+                                + "columns: expected " + combined.getSchema().getFields().size() + ", found "
+                                + branchResult.getSchema().getFields().size());
+                    }
+                    VectorSchemaRootAppender.append(combined, branchResult);
+                }
+
+                VectorSchemaRoot result = union.all() ? combined : new RowDeduplicator().deduplicate(combined, allocator);
+                try {
+                    printHeader(result);
+                    printRows(result, result.getRowCount());
+                    System.out.println();
+                    System.out.println(result.getRowCount() + " row(s)");
+                } finally {
+                    if (result != combined) {
+                        result.close();
+                    }
+                }
+            } finally {
+                combined.close();
+            }
+        } finally {
+            for (VectorSchemaRoot branchResult : branchResults) {
+                branchResult.close();
+            }
+        }
+    }
+
+    /**
+     * Resolves and fully materializes one UNION branch into a single
+     * {@link VectorSchemaRoot} -- reusing the exact single-table/join
+     * resolution {@link #runSql}/{@link #runSqlJoin} themselves use, just
+     * without the printing and without either streaming fast path (a bare
+     * scan or a bare-LIMIT scan): a UNION branch's result has to be fully
+     * held in memory to concatenate with its siblings regardless, so there
+     * is no streaming benefit to preserve here. Returns {@link
+     * Optional#empty()} for zero matching rows (a scalar subquery
+     * resolving to zero rows/NULL, or a resolved scan/join with no files
+     * at all) -- same "zero rows" convention {@link #resolveScalarSubqueries}
+     * and {@link #runSql} itself already use.
+     */
+    private static Optional<VectorSchemaRoot> materializeForUnion(SqlQuery rawQuery, TableCatalog catalog,
+                                                                     CliArgs parsed, BufferAllocator allocator) throws Exception {
+        Optional<SqlQuery> resolvedQuery = resolveScalarSubqueries(rawQuery, catalog, parsed, allocator);
+        if (resolvedQuery.isEmpty()) {
+            return Optional.empty();
+        }
+        SqlQuery query = resolvedQuery.get();
+        LogicalPlan plan = RuleBasedOptimizer.DEFAULT.optimize(LogicalPlanBuilder.build(query));
+
+        if (!query.joins().isEmpty()) {
+            return materializeJoinForUnion(query, plan, catalog, parsed, allocator);
+        }
+
+        ResolvedTable resolvedTable = resolveTableFormat(query.table(), catalog);
+        ResolvedScan resolved = new LogicalPlanExecutor().resolve(plan, resolvedTable.format(),
+                resolvedTable.dataFileRoot(), parsed.version, parsed.asOf);
+
+        if (resolved.files().isEmpty()) {
+            return Optional.empty();
+        }
+
+        List<String> groupByColumns = resolved.aggregate() != null ? resolved.aggregate().groupByColumns() : List.of();
+        List<AggregateSpec> aggregates = resolved.aggregate() != null ? resolved.aggregate().aggregates() : List.of();
+        List<SortKey> sortKeys = resolved.sort() != null ? resolved.sort().sortKeys() : List.of();
+        long limitValue = resolved.limit() != null ? resolved.limit().limit() : -1;
+
+        VectorSchemaRoot result = new CombinedQueryExecutor().execute(resolved.files(), resolved.columns(),
+                groupByColumns, aggregates, sortKeys, limitValue, allocator);
+        return result == null ? Optional.empty() : Optional.of(result);
+    }
+
+    /** {@link #materializeForUnion}'s join-chain counterpart -- same resolution {@link #runSqlJoin} uses, minus printing; see that method's own javadoc for the join-folding shape. */
+    private static Optional<VectorSchemaRoot> materializeJoinForUnion(SqlQuery query, LogicalPlan plan, TableCatalog catalog,
+                                                                         CliArgs parsed, BufferAllocator allocator) throws Exception {
+        List<ResolvedTable> tables = new ArrayList<>();
+        tables.add(resolveTableFormat(query.table(), catalog));
+        for (SqlQuery.JoinStep step : query.joins()) {
+            tables.add(resolveTableFormat(step.rightTable(), catalog));
+        }
+
+        JoinExecution execution = new LogicalPlanExecutor().resolveJoin(plan,
+                tables.stream().map(ResolvedTable::format).toList(),
+                tables.stream().map(ResolvedTable::dataFileRoot).toList(),
+                parsed.version, parsed.asOf);
+
+        boolean anyEmpty = execution.base().files().isEmpty()
+                || execution.steps().stream().anyMatch(s -> s.table().files().isEmpty());
+        if (anyEmpty) {
+            return Optional.empty();
+        }
+
+        VectorSchemaRoot current = new CombinedQueryExecutor().execute(execution.base().files(),
+                execution.base().columns(), List.of(), List.of(), List.of(), -1, allocator);
+        try {
+            String currentAlias = query.baseAlias();
+            long accumulatedBytes = execution.base().totalBytes();
+
+            for (int i = 0; i < execution.steps().size(); i++) {
+                JoinExecution.Step step = execution.steps().get(i);
+                SqlQuery.JoinStep sqlStep = query.joins().get(i);
+
+                try (VectorSchemaRoot newTableRoot = new CombinedQueryExecutor().execute(step.table().files(),
+                        step.table().columns(), List.of(), List.of(), List.of(), -1, allocator)) {
+
+                    boolean buildFromLeft = step.type() == JoinType.INNER && accumulatedBytes <= step.table().totalBytes();
+
+                    VectorSchemaRoot joined = new HashJoinOperator().join(step.type(),
+                            current, step.leftKeys(), currentAlias,
+                            newTableRoot, step.rightKeys(), sqlStep.rightAlias(),
+                            buildFromLeft, allocator);
+                    current.close();
+                    current = joined;
+                    currentAlias = null;
+                    accumulatedBytes += step.table().totalBytes();
+                }
+            }
+
+            if (execution.aggregate() != null) {
+                VectorSchemaRoot aggregated = new AggregateOperator().aggregate(
+                        List.of(current), execution.aggregate().groupByColumns(),
+                        execution.aggregate().aggregates(), allocator);
+                current.close();
+                current = aggregated;
+            }
+            if (execution.sort() != null || execution.limit() != null) {
+                List<SortKey> sortKeys = execution.sort() != null ? execution.sort().sortKeys() : List.of();
+                long limitValue = execution.limit() != null ? execution.limit().limit() : -1;
+                VectorSchemaRoot sorted = new SortLimitOperator().sortAndLimit(current, sortKeys, limitValue, allocator);
+                current.close();
+                current = sorted;
+            }
+
+            if (execution.aggregate() == null) {
+                // Unlike runSqlJoin (which prints synchronously, then closes
+                // current exactly once, in one place), this method hands its
+                // result to a caller that holds it open independently and
+                // closes it later -- a zero-copy view sharing current's
+                // vectors would leave current's *other*, unselected columns
+                // (e.g. join keys not in the SELECT list) with no owner left
+                // to close them. A genuine copy keeps the two lifetimes
+                // fully separate instead.
+                return Optional.of(projectColumns(current, query.columns(), allocator));
+            }
+            VectorSchemaRoot result = current;
+            current = null; // ownership transferred to the caller -- finally below must not close it
+            return Optional.of(result);
+        } finally {
+            if (current != null) {
+                current.close();
+            }
+        }
+    }
+
+    /** An independent copy of {@code columnNames} from {@code source} -- see {@link #materializeJoinForUnion}'s own javadoc for why this can't be a zero-copy view there. */
+    private static VectorSchemaRoot projectColumns(VectorSchemaRoot source, List<String> columnNames, BufferAllocator allocator) {
+        List<Field> fields = columnNames.stream().map(name -> source.getVector(name).getField()).toList();
+        VectorSchemaRoot result = VectorSchemaRoot.create(new Schema(fields), allocator);
+        result.allocateNew();
+        int rowCount = source.getRowCount();
+        List<FieldVector> resultVectors = result.getFieldVectors();
+        for (int c = 0; c < columnNames.size(); c++) {
+            FieldVector sourceVector = source.getVector(columnNames.get(c));
+            FieldVector resultVector = resultVectors.get(c);
+            for (int r = 0; r < rowCount; r++) {
+                resultVector.copyFromSafe(r, r, sourceVector);
+            }
+        }
+        result.setRowCount(rowCount);
+        return result;
     }
 
     private static void printResolvedSummary(String displayName, String versionLabel, ResolvedScan resolved) {

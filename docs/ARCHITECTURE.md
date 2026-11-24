@@ -380,7 +380,7 @@ always needs at least one key), a scalar subquery with its own `JOIN`
 or `GROUP BY` inside it, computed
 `SELECT` expressions (every item must be a bare column or one of the
 five aggregate functions — no `a + b`, no `CASE`, no scalar functions),
-window functions, `UNION`, and generic `NOT`/`IS NULL` (`Predicate` has
+window functions, and generic `NOT`/`IS NULL` (`Predicate` has
 no generic negation by design). `COUNT(*)` specifically is rejected in
 favor of `COUNT(column)` (non-null values of that column), matching
 the aggregate operator's own semantics rather than introducing a
@@ -393,6 +393,25 @@ live-verified against real MinIO too (correlated `EXISTS`/
 `EXISTS` subquery's own filter, `NOT IN`'s NULL-poisoning rule, and a
 group-by-less aggregate scalar subquery over zero matching files),
 same standard.
+
+**`UNION`/`UNION ALL`**: done, live-verified against real MinIO.
+`SqlQueryTranslator.translateAny` is the dedicated UNION-aware entry
+point (`translate` itself still rejects it) — each branch is an
+ordinary, independently-translated `SqlQuery` (own table or join chain,
+own `WHERE`/`GROUP BY`/aggregates/`ORDER BY`/`LIMIT`, own subqueries),
+so a branch may itself be a cross-format Delta↔Iceberg join with zero
+new code. `QueryCommand` resolves and fully materializes each branch
+independently (no streaming fast path — a branch's result has to be
+held in memory to concatenate with its siblings regardless) and
+concatenates them via `VectorSchemaRootAppender`; plain `UNION` (not
+`ALL`) additionally runs a new whole-row `RowDeduplicator` pass over the
+combined result. Not supported yet, named plainly: an `ORDER BY`
+trailing the whole chain (applying to the combined result, outside any
+one branch's own parentheses — a per-branch `ORDER BY` is unaffected),
+and `INTERSECT`/`EXCEPT` (jsqlparser parses all four set operations into
+the same shape; only `UNION` is implemented). A mixed `UNION`/
+`UNION ALL` chain is rejected — every operation in one chain must be
+the same kind.
 
 ## Type system
 

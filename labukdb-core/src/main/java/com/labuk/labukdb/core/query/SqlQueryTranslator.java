@@ -39,6 +39,9 @@ import net.sf.jsqlparser.statement.select.ParenthesedSelect;
 import net.sf.jsqlparser.statement.select.PlainSelect;
 import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.statement.select.SelectItem;
+import net.sf.jsqlparser.statement.select.SetOperation;
+import net.sf.jsqlparser.statement.select.SetOperationList;
+import net.sf.jsqlparser.statement.select.UnionOp;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -167,6 +170,28 @@ import java.util.Set;
  * e.g. {@code level IN ('a') OR x LIKE 'b'} does not parse the way it
  * reads. This is rejected with a specific error naming the fix (wrap the
  * {@code IN} predicate in parentheses) rather than silently misinterpreted.
+ *
+ * <b>{@code UNION}/{@code UNION ALL}:</b> {@link #translate(String)} itself
+ * still rejects it, unchanged -- {@link #translateAny} is the dedicated
+ * UNION-aware entry point ({@code core.cli.QueryCommand} is its only
+ * caller), returning a {@link SqlStatement} rather than a bare
+ * {@link SqlQuery}. Each branch is translated independently via {@link
+ * #translateStatement} -- the exact same single-query validation a
+ * top-level {@code SELECT} gets, so a branch may itself be a join, have
+ * its own {@code WHERE}/{@code GROUP BY}/aggregates/{@code ORDER BY}/
+ * {@code LIMIT}, or its own scalar/{@code IN}/{@code EXISTS} subqueries,
+ * all for free, with zero new validation here. Every operation in the
+ * chain must be the same kind -- all {@code UNION}, or all
+ * {@code UNION ALL}, not mixed -- and must be {@code UNION} specifically,
+ * not {@code INTERSECT}/{@code EXCEPT} (jsqlparser parses all four into
+ * the identical {@code SetOperationList} shape, so these are rejected
+ * explicitly, not silently misinterpreted as {@code UNION}). An
+ * {@code ORDER BY} trailing the whole chain (applying to the combined
+ * result, outside any one branch's own parentheses) is rejected too --
+ * a named boundary, not attempted incorrectly; a per-branch
+ * {@code ORDER BY}/{@code LIMIT} inside one branch's own parentheses is
+ * unaffected, since that's just an ordinary part of that branch's own
+ * {@link SqlQuery}.
  */
 public final class SqlQueryTranslator {
 
@@ -174,17 +199,74 @@ public final class SqlQueryTranslator {
     }
 
     public static SqlQuery translate(String sql) {
-        Statement statement;
-        try {
-            statement = CCJSqlParserUtil.parse(sql);
-        } catch (JSQLParserException e) {
-            throw new IllegalArgumentException("Could not parse SQL: " + e.getMessage(), e);
-        }
+        Statement statement = parse(sql);
         if (!(statement instanceof PlainSelect plainSelect)) {
             throw new IllegalArgumentException(
                     "Only a plain SELECT statement is supported (no UNION, INSERT, UPDATE, etc.): " + sql);
         }
         return translateStatement(plainSelect);
+    }
+
+    /** UNION-aware counterpart of {@link #translate(String)} -- see this class's own javadoc. */
+    public static SqlStatement translateAny(String sql) {
+        Statement statement = parse(sql);
+        if (statement instanceof SetOperationList setOps) {
+            return translateUnion(setOps, sql);
+        }
+        if (!(statement instanceof PlainSelect plainSelect)) {
+            throw new IllegalArgumentException(
+                    "Only a plain SELECT statement, or SELECTs combined with UNION/UNION ALL, is supported: " + sql);
+        }
+        return new SqlStatement.Single(translateStatement(plainSelect));
+    }
+
+    private static Statement parse(String sql) {
+        try {
+            return CCJSqlParserUtil.parse(sql);
+        } catch (JSQLParserException e) {
+            throw new IllegalArgumentException("Could not parse SQL: " + e.getMessage(), e);
+        }
+    }
+
+    private static SqlStatement.Union translateUnion(SetOperationList setOps, String sql) {
+        if (!emptyOrNull(setOps.getOrderByElements())) {
+            throw new IllegalArgumentException("ORDER BY on the combined result of a UNION is not supported yet "
+                    + "(a per-branch ORDER BY inside its own SELECT is fine): " + sql);
+        }
+
+        Boolean all = null;
+        for (SetOperation op : setOps.getOperations()) {
+            if (!(op instanceof UnionOp unionOp)) {
+                throw new IllegalArgumentException("Only UNION/UNION ALL is supported (no INTERSECT/EXCEPT): " + sql);
+            }
+            if (all == null) {
+                all = unionOp.isAll();
+            } else if (all != unionOp.isAll()) {
+                throw new IllegalArgumentException(
+                        "A single UNION chain must be all UNION or all UNION ALL, not a mix: " + sql);
+            }
+        }
+
+        List<SqlQuery> branches = new ArrayList<>();
+        for (Select select : setOps.getSelects()) {
+            branches.add(translateStatement(unionBranch(select, sql)));
+        }
+        return new SqlStatement.Union(branches, all != null && all);
+    }
+
+    /** Unwraps one UNION branch's {@code Select} into its {@code PlainSelect} -- a branch may or may not be its own {@code ParenthesedSelect}, confirmed via a real parse. */
+    private static PlainSelect unionBranch(Select select, String sql) {
+        if (select instanceof PlainSelect plain) {
+            return plain;
+        }
+        if (select instanceof ParenthesedSelect parenthesed) {
+            try {
+                return parenthesed.getPlainSelect();
+            } catch (ClassCastException e) {
+                throw new IllegalArgumentException("Each UNION branch must be a plain SELECT, not a nested UNION: " + sql);
+            }
+        }
+        throw new IllegalArgumentException("Each UNION branch must be a plain SELECT: " + sql);
     }
 
     /**
